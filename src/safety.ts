@@ -275,6 +275,7 @@ function diff(findings: readonly Finding[], base: Baseline): { fresh: Finding[];
 
 /** Show C0 and C1 control characters and DEL as \xNN. For terminal output only. */
 export function esc(s: string): string {
+  // oxlint-disable-next-line no-control-regex -- intentional: this escapes control characters
   return s.replace(/[\u0000-\u001f\u007f-\u009f]/gu, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`);
 }
 

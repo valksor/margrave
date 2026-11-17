@@ -17,6 +17,7 @@ test("cleanBlock keeps newlines and tabs", () => {
 
 test("find output is cleaned", () => {
   const text = formatFind([{ id: "s/\u001b[31mx\u001b[0m", name: "x", description: "bad \u0007desc\u001b[2J", score: 1.5 }]);
+  // oxlint-disable-next-line no-control-regex -- intentional: the test looks for control characters
   assert.equal(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/u.test(text.replace(/\n/gu, "")), false);
   assert.match(text, /^1\. s\/x {2}\(score 1\.500\)\n {3}bad desc\nload: margrave load s\/x$/u);
 });
@@ -40,6 +41,7 @@ test("load cleans the header but never changes the body", () => {
   const text = formatLoad(r);
   assert.ok(text.endsWith(`body:\n${body}`), "body is byte-for-byte unchanged");
   const header = text.slice(0, text.length - body.length);
+  // oxlint-disable-next-line no-control-regex -- intentional: the test looks for control characters
   assert.equal(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/u.test(header.replace(/\n/gu, "")), false);
   assert.match(header, /^skill: s\/name\nsource: s \(o\/r\)\ncommit: abc123\nbase: \/base\/dir\nfrontmatter:\n---\nname: x\n/u);
   assert.match(header, /files:\n- SKILL\.md\n- ref\.md\nbody:\n$/u);

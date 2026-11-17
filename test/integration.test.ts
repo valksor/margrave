@@ -655,9 +655,11 @@ test("atomic writes leave no temp file and a reader never sees a partial file", 
   await atomicWrite(file, big(0));
   let stop = false;
   const writer = (async () => {
+    // oxlint-disable-next-line no-unmodified-loop-condition -- `stop` is set by the reader below while the writer runs
     for (let i = 1; i <= 40 && !stop; i++) await atomicWrite(file, big(i));
   })();
   let reads = 0;
+  // oxlint-disable-next-line no-unmodified-loop-condition -- the reader leaves with break; `stop` is set after the loop, to stop the writer
   while (!stop) {
     const parsed = JSON.parse(await readFile(file, "utf8")) as { n: number };
     assert.equal(typeof parsed.n, "number");
