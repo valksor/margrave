@@ -1,0 +1,155 @@
+# margrave
+
+margrave keeps agent skills (folders with a `SKILL.md`) in one store. It does not install them into any agent. An agent asks for what it needs in plain words, gets ranked suggestions, and loads one skill from the store.
+
+- `margrave find "<task>"` returns ranked skills.
+- `margrave load <id>` prints one skill.
+- `margrave mcp` runs a stdio MCP server with the same functions, for agents that use MCP.
+
+Skills are not loaded into the agent by default, so 1000+ installed skills cost nothing per session.
+
+## 1. Install margrave itself
+
+Node 26 or newer. The repo pins `26.13.0` in `.nvmrc`.
+
+```sh
+nvm use && npm ci && npm run build && npm link
+```
+
+## 2. Install a skill source
+
+```sh
+margrave install vercel-labs/agent-skills     # GitHub repo (skills.sh format)
+margrave install ~/.agents/skills             # local directory
+margrave install https://example.com/team/skills.git --ref v2
+```
+
+`install` prints the source id and the skill ids it found. Skills live in `~/.margrave` (set `MARGRAVE_HOME` to move it).
+
+## 3. Connect an agent
+
+`margrave wrap <agent>` prints setup text and writes nothing. It uses absolute paths (`process.execPath` and the absolute `dist/cli.js`), so the agent's own PATH and nvm state do not matter. It passes `MARGRAVE_HOME` when that is set.
+
+```sh
+margrave wrap claude    # a `claude mcp add` command, then the instruction snippet
+margrave wrap codex     # a [mcp_servers.margrave] block for ~/.codex/config.toml, then the snippet
+margrave wrap bb        # the claude command line, with a note that bb runs the provider's MCP config
+margrave wrap generic   # the plain command line, then the snippet
+```
+
+Run the printed command yourself, and add the snippet to the agent's instructions.
+
+## 4. Check it
+
+```sh
+margrave find "react performance"
+margrave load <id from the result>
+```
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `margrave install <spec> [--ref R] [--allow-unsafe]` | Add a source. A git source is cloned into staging, scanned, indexed, then moved into the store. Any failure leaves the store and `sources.json` unchanged. A source with 0 valid skills is a failure. An id that already exists is an error. `--ref` is a branch or tag. It is not allowed with a local source. |
+| `margrave update [source] [--allow-unsafe]` | Git: fresh `git clone --depth 1` of the stored ref into staging, scan, then swap. Prints `old → new` commits and the skill ids added, changed (by `SKILL.md` hash), and removed. On any error the old copy stays untouched. Local: reindex only. With no argument it updates every source. |
+| `margrave remove <source>` | Git: deletes `sources/<id>` after checking it is a direct child of `sources/`. Local: unregisters only. It never deletes your directory. |
+| `margrave list [--skills] [--json]` | Sources with kind, ref, commit, and skill count. `--skills` adds every skill id and its description. |
+| `margrave find "<task>" [--limit N] [--json]` | BM25 top N (default 5, clamped to 1..25). Prints qualified id, score, and description, then `load: margrave load <id>`. With no match it exits 0 and prints `no match`. |
+| `margrave load <id> [--json]` | Prints a header and the `SKILL.md` body. The header has `skill:`, `source:`, `commit:`, `base:` (the absolute skill directory, so relative references such as `references/x.md` resolve), the raw frontmatter, and the file list. |
+| `margrave load <id> --file <rel>` | Prints one file in the skill directory. See "Path guard". |
+| `margrave reindex` | Rescan all sources and rebuild `index.json`. |
+| `margrave mcp` | stdio MCP server (see below). |
+| `margrave wrap <claude\|codex\|bb\|generic>` | Print setup text. |
+
+`<source>` is a source id or the original spec you installed it with.
+
+### Specs
+
+Checked in this order:
+
+1. `./`, `../`, `/`, `~`: a local path.
+2. `https://`, `git@`, `file://`: a git URL.
+3. `owner/repo[/sub/path]`: GitHub (`https://github.com/<owner>/<repo>.git`), even when a relative directory with that name exists.
+
+A spec or `--ref` that starts with `-` is refused. A `..` subpath segment is refused.
+
+### Ids
+
+- Source id: GitHub `owner__repo` (with `__sub__path` for a subpath), git URL `host__path`, local `local__<basename>-<6 hex of sha1(realpath)>`. Characters outside `[A-Za-z0-9._-]` become `-`.
+- Skill id: always `<source-id>/<name>`. Installing another source never renames an existing skill.
+- A bare `name` works as an alias only when exactly one source has it. An ambiguous name is an error that lists the qualified ids. `find` always prints qualified ids.
+
+### Skills
+
+A skill is a directory with a `SKILL.md` whose frontmatter (YAML) has `name` and `description`. A `SKILL.md` without both is skipped with a warning on stderr. The walk skips `.git` and `node_modules`.
+
+- Git sources follow no symlink. A symlinked skill directory or `SKILL.md` is skipped with a warning.
+- Local sources follow directory symlinks. A symlinked `SKILL.md` is skipped. A set of visited real paths stops cycles.
+
+### Path guard
+
+`load --file` and the MCP `read_skill_file` tool refuse absolute paths and any path whose real path does not start with the real path of the skill directory plus a path separator. A symlink out of the skill directory is refused.
+
+### Terminal output
+
+Names, descriptions, and the `load` header lose control characters and ANSI escapes in human output. `--json` output and `load` bodies are never changed.
+
+## Install scan and `--allow-unsafe`
+
+`install` and `update` scan the new content before it reaches the store, with ripwire:
+
+```sh
+ripwire security --scan-skills=<dir>
+```
+
+This syntax was checked against `ripwire --help` and against a clean directory (exit 0, `<skillscan files="1" findings="0" verdict="clean">`).
+
+| ripwire exit | margrave |
+|---|---|
+| 0 | continue |
+| 1 (WARN) | print the findings and continue |
+| 2 (CRITICAL), 3 (could not read), any other code, or ripwire not on `PATH` | refuse |
+
+`--allow-unsafe` overrides a refusal for that one `install` or `update` and prints what it overrode. Git sources are scanned in staging, so `update` never leaves an unscanned revision live. Local sources are scanned on `install`. `update` on a local source only reindexes.
+
+## MCP server
+
+`margrave mcp` is read-only. `install`, `update`, and `remove` are not exposed. It reads `index.json` on every call, so a new install shows up without a restart.
+
+| Tool | Input | Result |
+|---|---|---|
+| `find_skills` | `task`, `limit?` | Ranked skill ids with descriptions. No match is an empty result with a hint, not an error. |
+| `load_skill` | `id` | The same text as `margrave load`. |
+| `read_skill_file` | `id`, `path` | One file, with the same guard as `--file`. |
+
+## Ranking
+
+BM25F with k1 = 1.2 and b = 0.75. Field weights: name 3, description 2, headings 1, body 0.3. The first 2000 body tokens are indexed. Tokens are lowercased, split on non-alphanumerics, stripped of stopwords, and lightly stemmed. An exact match of the query to a name or id adds a fixed bonus. Ties break by id ascending.
+
+## Store
+
+```
+~/.margrave/
+  sources/<source-id>/   git clones
+  staging/               in-progress clones (deleted on success and on failure)
+  sources.json           [{id, kind, spec, url|path, subpath, ref, commit, installedAt}]
+  index.json             one entry per skill, plus BM25 corpus stats
+```
+
+A missing `sources.json` is an empty list. A malformed one is an error, and margrave writes nothing. A malformed `index.json` is an error that tells you to run `margrave reindex`. Both files are written atomically (temp file in the same directory, then rename).
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ok |
+| 1 | error (including a ripwire refusal) |
+| 2 | usage error |
+
+## Development
+
+```sh
+nvm use && npm ci
+npm run build   # tsc, then chmod +x dist/cli.js
+npm test        # node --test test/ (runs the .ts sources directly; no network, temp MARGRAVE_HOME)
+```
