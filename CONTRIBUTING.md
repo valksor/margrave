@@ -34,7 +34,7 @@ Thank you for your interest in contributing to margrave. Contributions are welco
 
 - `pnpm build` - Compile `src/` to `dist/` with tsrs, then make sure `vendor/ripwire/` holds the pinned ripwire
 - `pnpm test` - Run the tests under c8 (`node --test test/`; no network, temporary `MARGRAVE_HOME`). It fails when line, branch, function, or statement coverage of `src/` is below 100%. The coverage gate needs a non-root user, because the tests that need unreadable files skip as root
-- `pnpm lint` - Check the code with oxlint
+- `pnpm lint` - Check the code with oxlint, including type-aware rules and type errors in the linted files (via tsrs-lint)
 - `pnpm format` - Format all files with prettier
 - `pnpm format:check` - Check formatting without writing
 - `pnpm typecheck` - Type-check with `tsrs --noEmit`

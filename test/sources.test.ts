@@ -360,7 +360,7 @@ function failRename(fails: (from: string, to: string, nth: number) => boolean): 
   const real = fsp.rename;
   let nth = 0;
   mock.method(fsp, "rename", (from: string, to: string) =>
-    fails(String(from), String(to), ++nth) ? Promise.reject(new Error(`mock: cannot rename to ${to}`)) : real(from, to),
+    fails(from, to, ++nth) ? Promise.reject(new Error(`mock: cannot rename to ${to}`)) : real(from, to),
   );
   syncBuiltinESMExports();
 }
@@ -509,7 +509,7 @@ test("reindex: a rejection that is not an Error is logged as text and the source
     mock.restoreAll();
     const real = fsp.realpath;
     mock.method(fsp, "realpath", (p: string, ...rest: never[]) =>
-      String(p) === dir ? Promise.reject("boom, not an Error") : (real as (...a: unknown[]) => Promise<string>)(p, ...rest),
+      p === dir ? Promise.reject("boom, not an Error") : (real as (...a: unknown[]) => Promise<string>)(p, ...rest),
     );
     syncBuiltinESMExports();
     const logs: string[] = [];
@@ -528,7 +528,7 @@ test("reindex: control characters in a failure message are logged as text", asyn
     mock.restoreAll();
     const real = fsp.realpath;
     mock.method(fsp, "realpath", (p: string, ...rest: never[]) =>
-      String(p) === dir ? Promise.reject(new Error("bad \u001b[2J name")) : (real as (...a: unknown[]) => Promise<string>)(p, ...rest),
+      p === dir ? Promise.reject(new Error("bad \u001b[2J name")) : (real as (...a: unknown[]) => Promise<string>)(p, ...rest),
     );
     syncBuiltinESMExports();
     const logs: string[] = [];

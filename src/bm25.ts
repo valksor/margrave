@@ -93,9 +93,7 @@ const STOPWORDS = new Set([
 /** Lowercase, split on non-alphanumerics, drop stopwords, Porter-stem. Keeps duplicates. */
 export function tokenize(input: string): string[] {
   const out: string[] = [];
-  for (const raw of String(input)
-    .toLowerCase()
-    .split(/[^a-z0-9]+/u)) {
+  for (const raw of input.toLowerCase().split(/[^a-z0-9]+/u)) {
     if (raw.length < 2 || STOPWORDS.has(raw)) continue;
     const word = stemmer(raw);
     if (word.length < 2 || STOPWORDS.has(word)) continue;
@@ -181,7 +179,7 @@ export interface Ranked {
 /** BM25F over name, description, headings, and body. Ties break by id ascending. */
 export function rank(docs: readonly Doc[], stats: CorpusStats, query: string, limit: number): Ranked[] {
   const terms = [...new Set(tokenize(query))];
-  const q = String(query).trim().toLowerCase();
+  const q = query.trim().toLowerCase();
   const scored: Ranked[] = [];
   for (const d of docs) {
     let score = 0;

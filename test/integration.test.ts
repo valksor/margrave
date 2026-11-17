@@ -27,7 +27,7 @@ async function snapshot(home: string): Promise<{ sources: string | null; index: 
 }
 
 async function names(dir: string): Promise<string[]> {
-  return (await readdir(dir).catch(() => [])).sort();
+  return (await readdir(dir).catch((): string[] => [])).sort();
 }
 
 function sourceId(r: Run): string {
@@ -681,7 +681,7 @@ test("install scan warnings show control characters in a path as text", async ()
   assert.ok(!warnings.join("\n").includes("\u001b"), "no ESC byte in a warning");
   const forBad = warnings.filter((l) => l.includes("bad"));
   assert.equal(forBad.length, 1, warnings.join("\n"));
-  assert.ok(forBad[0]?.includes("\\x1b]0;T\\x07\\x0aINJECTED-LINE"), forBad[0]);
+  assert.ok(forBad[0]?.includes("\\x1b]0;T\\x07\\x0aINJECTED-LINE"), warnings.join("\n"));
   assert.ok(!lines.some((l) => l.startsWith("INJECTED-LINE")));
 });
 

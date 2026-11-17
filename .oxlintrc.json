@@ -5,5 +5,13 @@
     "correctness": "error",
     "suspicious": "error"
   },
+  "rules": {
+    "typescript/no-unsafe-type-assertion": "off",
+    "typescript/consistent-return": "off",
+    "typescript/no-floating-promises": [
+      "error",
+      { "allowForKnownSafeCalls": [{ "from": "package", "name": "test", "package": "node:test" }] }
+    ]
+  },
   "ignorePatterns": ["dist", "vendor", "node_modules"]
 }

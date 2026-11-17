@@ -132,7 +132,7 @@ function pathVersion(timeoutMs: number): Promise<PathVersion> {
         resolve({ status: "ran", version: VERSION_RE.exec(stdout.split(/\r?\n/u, 1)[0] as string)?.[1] ?? null });
         return;
       }
-      const e = err as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+      const e = err;
       if (e.code === "ENOENT") resolve({ status: "missing" });
       else if (e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") resolve({ status: "failed", why: "output too large" });
       else if (e.killed === true) resolve({ status: "failed", why: "timed out" });
