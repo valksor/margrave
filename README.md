@@ -183,6 +183,6 @@ A missing `sources.json` is an empty list. A malformed one is an error, and marg
 
 ```sh
 nvm use && npm ci
-npm run build   # tsc, then chmod +x dist/cli.js
+npm run build   # tsrs, then chmod +x dist/cli.js
 npm test        # node --test test/ (runs the .ts sources directly; no network, temp MARGRAVE_HOME)
 ```

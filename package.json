@@ -10,7 +10,7 @@
     "node": ">=26"
   },
   "scripts": {
-    "build": "tsc && chmod +x dist/cli.js",
+    "build": "tsrs && chmod +x dist/cli.js",
     "test": "node --test test/"
   },
   "dependencies": {
@@ -21,6 +21,6 @@
   },
   "devDependencies": {
     "@types/node": "26.6.6",
-    "typescript": "7.0.2"
+    "tsrs": "0.25.0-ts7.1.0-beta"
   }
 }
