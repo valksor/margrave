@@ -9,6 +9,8 @@ import type { CorpusStats, FieldTokens } from "./bm25.ts";
 export class MargraveError extends Error {}
 /** A usage error. The CLI prints it and exits 2. */
 export class UsageError extends Error {}
+/** An error caused by the caller's input. Its message holds no server path, so a remote client may see it. */
+export class RequestError extends MargraveError {}
 
 export type SourceKind = "git" | "local";
 

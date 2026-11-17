@@ -8,6 +8,7 @@ margrave keeps agent skills (folders with a `SKILL.md`) in one store. It does no
 - `margrave find "<task>"` returns ranked skills.
 - `margrave load <id>` prints one skill.
 - `margrave mcp` runs a stdio MCP server with the same functions, for agents that use MCP.
+- `margrave/hosted` exports the same MCP tools over HTTP, for a server that hosts its own skill store.
 
 Skills are not loaded into the agent by default, so 1000+ installed skills cost nothing per session.
 
@@ -194,6 +195,33 @@ Limit: the baseline compares the flagged line, not the lines around it. A known 
 | `find_skills`     | `task`, `limit?` | Ranked skill ids with descriptions. No match is an empty result with a hint, not an error. |
 | `load_skill`      | `id`             | The same text as `margrave load`.                                                          |
 | `read_skill_file` | `id`, `path`     | One file, with the same guard as `--file`.                                                 |
+
+### Hosted MCP
+
+`import { handleHostedMcp } from "margrave/hosted"` gives a `(Request) => Promise<Response>` handler for MCP Streamable HTTP. margrave starts no server. The host app mounts the handler on one route.
+
+It has the same three tools and the same inputs as `margrave mcp`. It reads the store in `MARGRAVE_HOME` of the host process on every call. It is stateless and POST-only. Other methods get 405.
+
+A remote client sees these differences:
+
+- `load_skill` has no `base:` line and no install spec on the `source:` line, and the tool descriptions point to the file list.
+- `find_skills` hints name tools, not CLI commands.
+- With no skills installed, the text is `no skills are installed on this server`.
+- An error caused by the client's input (unknown id, bad path) keeps its text. Any other error returns `the skill store on this server is not available; the server log has details`, and the full error goes to `console.error`.
+
+The handler serves every skill in the store, including any installed with `--allow-unsafe`.
+
+margrave does no auth, TLS, CORS, Host/Origin checks, or rate limiting. The host app must do them. Do not expose the handler without auth.
+
+Example (Bun):
+
+```ts
+import { handleHostedMcp } from "margrave/hosted";
+Bun.serve({
+  port: 8080,
+  fetch: (req) => (new URL(req.url).pathname === "/mcp" ? handleHostedMcp(req) : new Response("not found", { status: 404 })),
+});
+```
 
 ## Ranking
 

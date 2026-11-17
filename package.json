@@ -15,6 +15,12 @@
   "bin": {
     "margrave": "dist/cli.js"
   },
+  "exports": {
+    "./hosted": {
+      "types": "./dist/hosted.d.ts",
+      "default": "./dist/hosted.js"
+    }
+  },
   "files": [
     "dist",
     "scripts/ensure-ripwire.mjs",

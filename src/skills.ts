@@ -3,7 +3,7 @@ import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { clampLimit, rank } from "./bm25.ts";
 import { splitSkillMd } from "./scan.ts";
-import { MargraveError, readIndex, readSources } from "./store.ts";
+import { MargraveError, RequestError, readIndex, readSources } from "./store.ts";
 import type { IndexEntry, IndexFile, SourceRecord } from "./store.ts";
 
 export const NO_SOURCES_MESSAGE = "no skill sources installed; run: margrave install <owner/repo|path>";
@@ -56,9 +56,9 @@ export function resolveSkill(index: IndexFile, input: string): IndexEntry {
       .map((s) => `  ${clean(s.id)}`)
       .sort()
       .join("\n");
-    throw new MargraveError(`"${clean(input)}" is ambiguous; use one of these ids:\n${ids}`);
+    throw new RequestError(`"${clean(input)}" is ambiguous; use one of these ids:\n${ids}`);
   }
-  throw new MargraveError(`no skill "${clean(input)}"; run: margrave find "<task>" or margrave list --skills`);
+  throw new RequestError(`no skill "${clean(input)}"; run: margrave find "<task>" or margrave list --skills`);
 }
 
 export interface FindHit {
@@ -79,17 +79,27 @@ export function findSkills(index: IndexFile, task: string, limit: unknown): Find
   return hits;
 }
 
-export function formatFind(hits: readonly FindHit[]): string {
-  if (hits.length === 0) {
-    return "no match\ntry other words, or list everything with: margrave list --skills";
-  }
+export interface FindText {
+  /** Last line under the hits. */
+  loadHint: (id: string) => string;
+  /** Full text when there is no hit. */
+  noMatch: string;
+}
+
+const CLI_FIND_TEXT: FindText = {
+  loadHint: (id) => `load: margrave load ${shellQuote(id)}`,
+  noMatch: "no match\ntry other words, or list everything with: margrave list --skills",
+};
+
+export function formatFind(hits: readonly FindHit[], text: FindText = CLI_FIND_TEXT): string {
+  if (hits.length === 0) return text.noMatch;
   const lines: string[] = [];
   hits.forEach((h, i) => {
     lines.push(`${i + 1}. ${clean(h.id)}  (score ${h.score.toFixed(3)})`);
     lines.push(`   ${clean(h.description)}`);
   });
   const top = hits[0];
-  if (top !== undefined) lines.push(`load: margrave load ${shellQuote(clean(top.id))}`);
+  if (top !== undefined) lines.push(text.loadHint(clean(top.id)));
   return lines.join("\n");
 }
 
@@ -124,8 +134,8 @@ export async function listFiles(dir: string): Promise<string[]> {
  * realpath(dir) plus a separator. Refuses absolute paths and anything that escapes.
  */
 export async function readSkillFile(dir: string, rel: string): Promise<string> {
-  if (rel === "") throw new MargraveError("path is empty");
-  if (path.isAbsolute(rel)) throw new MargraveError("path must be relative to the skill directory");
+  if (rel === "") throw new RequestError("path is empty");
+  if (path.isAbsolute(rel)) throw new RequestError("path must be relative to the skill directory");
   let realDir: string;
   try {
     realDir = await realpath(dir);
@@ -135,18 +145,18 @@ export async function readSkillFile(dir: string, rel: string): Promise<string> {
   const prefix = realDir.endsWith(path.sep) ? realDir : realDir + path.sep;
   const joined = path.resolve(realDir, rel);
   // Lexical check first, so a path outside the directory never reveals whether it exists.
-  if (!joined.startsWith(prefix)) throw new MargraveError(`path ${clean(rel)} is outside the skill directory`);
+  if (!joined.startsWith(prefix)) throw new RequestError(`path ${clean(rel)} is outside the skill directory`);
   let realFile: string;
   try {
     realFile = await realpath(joined);
   } catch {
-    throw new MargraveError(`no such file in the skill directory: ${clean(rel)}`);
+    throw new RequestError(`no such file in the skill directory: ${clean(rel)}`);
   }
   if (!realFile.startsWith(prefix)) {
-    throw new MargraveError(`path ${clean(rel)} is outside the skill directory`);
+    throw new RequestError(`path ${clean(rel)} is outside the skill directory`);
   }
   const st = await stat(realFile);
-  if (!st.isFile()) throw new MargraveError(`not a file: ${clean(rel)}`);
+  if (!st.isFile()) throw new RequestError(`not a file: ${clean(rel)}`);
   return readFile(realFile, "utf8");
 }
 
@@ -180,14 +190,14 @@ export async function loadSkill(entry: IndexEntry, sources: readonly SourceRecor
 }
 
 /** The load header is metadata, so it is cleaned. The body is the payload and stays unchanged. */
-export function formatLoad(r: LoadResult): string {
+export function formatLoad(r: LoadResult, opts: { hostPaths?: boolean } = {}): string {
   const shown = r.files.slice(0, MAX_LISTED_FILES).map((f) => `- ${clean(f)}`);
   if (r.files.length > MAX_LISTED_FILES) shown.push(`- ... ${r.files.length - MAX_LISTED_FILES} more`);
   const header = [
     `skill: ${clean(r.id)}`,
-    `source: ${clean(r.source)}${r.spec === "" ? "" : ` (${clean(r.spec)})`}`,
+    `source: ${clean(r.source)}${r.spec === "" || opts.hostPaths === false ? "" : ` (${clean(r.spec)})`}`,
     `commit: ${r.commit === null ? "none (local directory)" : clean(r.commit)}`,
-    `base: ${clean(r.base)}`,
+    ...(opts.hostPaths === false ? [] : [`base: ${clean(r.base)}`]),
     "frontmatter:",
     "---",
     cleanBlock(r.frontmatter),
