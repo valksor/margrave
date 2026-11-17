@@ -36,8 +36,11 @@ Bundle:
 gh release download --repo valksor/margrave --pattern 'margrave-v*-linux-x64.tar.gz'   # or curl -LO <asset URL>
 gh attestation verify margrave-v*-linux-x64.tar.gz --repo valksor/margrave
 tar -xzf margrave-v*-linux-x64.tar.gz
+mkdir -p ~/.local/bin
 ln -s "$PWD/margrave/dist/cli.js" ~/.local/bin/margrave
 ```
+
+`~/.local/bin` must be on `PATH`. If it is not, add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file and open a new shell.
 
 Package:
 
