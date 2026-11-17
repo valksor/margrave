@@ -3,7 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { MargraveError } from "../src/store.ts";
-import { loadSkill, readSkillFile } from "../src/skills.ts";
+import { listFiles, loadSkill, readSkillFile } from "../src/skills.ts";
 import type { IndexEntry } from "../src/store.ts";
 import { link, tmp, writeSkill } from "./helpers.ts";
 
@@ -81,4 +81,41 @@ test("load reports a missing directory and says to run reindex", async () => {
     fieldTokens: { name: {}, description: {}, headings: {}, body: {} },
   };
   await assert.rejects(loadSkill(entry, []), /margrave reindex/u);
+});
+
+test("readSkillFile reports a missing skill directory, a directory path, and works from a root directory", async () => {
+  const gone = path.join(await tmp(), "does-not-exist");
+  await assert.rejects(readSkillFile(gone, "SKILL.md"), /is gone; run: margrave reindex/u);
+
+  const dir = await writeSkill(await tmp(), "dir-path", "a skill");
+  await mkdir(path.join(dir, "references"));
+  await assert.rejects(readSkillFile(dir, "references"), /not a file: references/u);
+
+  // The filesystem root already ends with a separator, so no second one is added to the prefix.
+  await assert.rejects(readSkillFile("/", `margrave-no-such-file-${process.pid}`), /no such file in the skill directory/u);
+});
+
+test("listFiles of a directory that cannot be read is an empty list", async () => {
+  assert.deepEqual(await listFiles(path.join(await tmp(), "does-not-exist")), []);
+});
+
+test("load of a SKILL.md without frontmatter returns an empty frontmatter and the whole text as body", async () => {
+  const dir = await tmp();
+  await writeFile(path.join(dir, "SKILL.md"), "# plain\n\nno frontmatter here\n");
+  const entry: IndexEntry = {
+    id: "s/plain",
+    name: "plain",
+    description: "x",
+    source: "s",
+    dir,
+    hash: "h",
+    frontmatter: {},
+    headings: [],
+    fieldTokens: { name: {}, description: {}, headings: {}, body: {} },
+  };
+  const r = await loadSkill(entry, []);
+  assert.equal(r.frontmatter, "");
+  assert.equal(r.body, "# plain\n\nno frontmatter here\n");
+  assert.equal(r.spec, "");
+  assert.equal(r.commit, null);
 });

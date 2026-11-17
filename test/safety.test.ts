@@ -354,3 +354,150 @@ test("baseline: a flagged symlink is unreadable and counts as new, even as a war
   assert.equal(ok.code, 1);
   assert.match(logs.join("\n"), /; 0 new vs installed copy/u);
 });
+
+// ---- a scripted ripwire: fixed stdout, stderr, and exit code ----
+
+/** A directory with a `ripwire` that prints the given text and exits as told, or kills itself with a signal. */
+async function scriptedRipwire(spec: { code?: number; stdout?: string; stderr?: string; signal?: boolean }): Promise<string> {
+  const dir = await tmp("mg-scripted-");
+  await writeFile(path.join(dir, "out.txt"), spec.stdout ?? "");
+  await writeFile(path.join(dir, "err.txt"), spec.stderr ?? "");
+  const tail = spec.signal === true ? "kill -TERM $$" : `exit ${spec.code ?? 0}`;
+  const file = path.join(dir, "ripwire");
+  await writeFile(file, `#!/bin/sh\nd=$(dirname "$0")\ncat "$d/err.txt" >&2\ncat "$d/out.txt"\n${tail}\n`);
+  await chmod(file, 0o755);
+  return dir;
+}
+
+/** Run `fn` with the scripted ripwire first on PATH and a fresh MARGRAVE_HOME. */
+async function withScripted<T>(bin: string, fn: () => Promise<T>): Promise<T> {
+  const prevHome = process.env["MARGRAVE_HOME"];
+  process.env["MARGRAVE_HOME"] = await tmp("mg-home-");
+  try {
+    return await withPath(`${bin}:${process.env["PATH"] ?? ""}`, fn);
+  } finally {
+    if (prevHome === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prevHome;
+  }
+}
+
+test("parser reads single-quoted attributes and leaves a code point that does not exist as written", () => {
+  const out = parseScanXml(xml("findings='1' verdict='warn'", `<f p='/r/a&#1114112;&#x110000;.md:1' rule='R' sev='warn'/>`), 1);
+  assert.ok(out.ok);
+  assert.equal(out.rows[0]?.p, "/r/a&#1114112;&#x110000;.md:1");
+  assert.equal(out.rows[0]?.sev, "warn");
+});
+
+test("a ripwire killed by a signal has no exit code and refuses", async () => {
+  const bin = await scriptedRipwire({ signal: true });
+  const r = await withPath(`${bin}:${process.env["PATH"] ?? ""}`, () => runRipwire("/nonexistent", NO_VENDOR));
+  assert.equal(r.code, null);
+  assert.equal(r.missing, false);
+  const dir = await scanDir({ "a/SKILL.md": "x\n" });
+  await assert.rejects(
+    withScripted(bin, () => scanWithRipwire(dir, opts([]))),
+    /refused: ripwire failed \(exit null\)/u,
+  );
+});
+
+test("a scan root that cannot be resolved refuses, and --allow-unsafe overrides", async () => {
+  const gone = path.join(await tmp(), "does-not-exist");
+  const bin = await scriptedRipwire({});
+  await assert.rejects(
+    withScripted(bin, () => scanWithRipwire(gone, opts([]))),
+    /refused: cannot resolve the scan root/u,
+  );
+  const logs: string[] = [];
+  const r = await withScripted(bin, () => scanWithRipwire(gone, opts(logs, { allowUnsafe: true })));
+  assert.deepEqual(r, { code: null, overridden: true });
+});
+
+test("ripwire's own output is shown cut to 40 lines of 500 characters", async () => {
+  const stderr = `${"w".repeat(600)}\n${Array.from({ length: 49 }, (_, i) => `line ${i + 2}`).join("\n")}\n`;
+  const bin = await scriptedRipwire({ code: 4, stderr });
+  const dir = await scanDir({ "a/SKILL.md": "x\n" });
+  await assert.rejects(
+    withScripted(bin, () => scanWithRipwire(dir, opts([]))),
+    (err: unknown) => {
+      const m = err instanceof MargraveError ? err.message : "";
+      return (
+        m.includes(`refused: ripwire failed (exit 4)\n${"w".repeat(500)}…\nline 2\n`) &&
+        m.includes("line 40\n… 10 more line(s)\n") &&
+        !m.includes("line 41")
+      );
+    },
+  );
+});
+
+test("a finding row that does not point at a readable line of a file in the scan root counts as unreadable", async () => {
+  const dir = await scanDir({ "a/SKILL.md": "one line\n" });
+  const file = `${dir}/a/SKILL.md`;
+  const row = (p: string, rule: string): string => `<f p="${p}" rule="${rule}" sev="critical"/>`;
+  const rows = [
+    row(file, "no-colon"),
+    row("a/SKILL.md:1", "relative"),
+    row(`${file}:abc`, "not-a-number"),
+    row(`${file}:0`, "line-zero"),
+    row(`${file}:99`, "past-the-end"),
+    row("/etc/passwd:1", "outside"),
+    row(`${dir}:1`, "the-root-itself"),
+    row(`${dir}/..:1`, "the-parent"),
+    row(`${dir}/gone.md:1`, "missing-file"),
+    // eleven more distinct rules, all readable: more than 10 rules shows an ellipsis
+    ...Array.from({ length: 11 }, (_, i) => row(`${file}:1`, `readable-${String(i).padStart(2, "0")}`)),
+  ];
+  const total = rows.length;
+  const bin = await scriptedRipwire({
+    code: 2,
+    stdout: xml(`files="1" findings="${total}" skipped="0" verdict="critical"`, rows.join("")),
+  });
+  const clean = await scanDir({ "a/SKILL.md": "x\n" });
+  await assert.rejects(
+    withScripted(bin, () => scanWithRipwire(dir, opts([], { baselineDir: clean }))),
+    (err: unknown) => {
+      const m = err instanceof MargraveError ? err.message : "";
+      return (
+        m.includes(`${total} finding(s)`) &&
+        m.includes("new findings:\n") &&
+        m.includes("    /etc/passwd:1  outside  critical (unreadable)\n") &&
+        m.includes("    a/SKILL.md:NaN  not-a-number  critical (unreadable)\n") &&
+        m.includes("    a/SKILL.md:0  line-zero  critical (unreadable)\n") &&
+        m.includes("    a/SKILL.md:99  past-the-end  critical (unreadable)\n") &&
+        m.includes("    a/SKILL.md:1  relative  critical (unreadable)\n") &&
+        m.includes("    a/SKILL.md:0  no-colon  critical (unreadable)\n") &&
+        m.includes(`    ${dir}:1  the-root-itself  critical (unreadable)\n`) &&
+        m.includes(`    ${dir}/..:1  the-parent  critical (unreadable)\n`) &&
+        m.includes("    gone.md:1  missing-file  critical (unreadable)\n") &&
+        m.includes(" · …\n")
+      );
+    },
+  );
+});
+
+test("a finding row without p or rule attributes parses with empty strings", () => {
+  const out = parseScanXml(xml('findings="1" verdict="warn"', '<f sev="warn"/>'), 1);
+  assert.ok(out.ok);
+  assert.deepEqual(out.rows, [{ p: "", rule: "", sev: "warn" }]);
+});
+
+test("more than 20 new findings are cut with a count, and so are more than 10 known groups in changed files", async () => {
+  const e = await env();
+  const files = (n: number, text: string): Record<string, string> =>
+    Object.fromEntries(Array.from({ length: n }, (_, i) => [`a/f${String(i).padStart(2, "0")}.md`, text]));
+
+  const many = await scanDir(files(21, "x FAKE-CRIT EXFILTRATE:net-exfil\n"));
+  const clean = await scanDir({ "a/x.md": "x\n" });
+  await assert.rejects(
+    e.run(() => scanWithRipwire(many, opts([], { baselineDir: clean }))),
+    /new findings:\n(?: {4}a\/f\d\d\.md:1 {2}EXFILTRATE:net-exfil {2}critical\n){20} {4}… 1 more\n/u,
+  );
+
+  // The same warn finding in 11 files, each file changed since the installed copy: all known, 11 groups.
+  const base = await scanDir(files(11, "x FAKE-WARN INJECTION:eval\n"));
+  const next = await scanDir(files(11, "intro\nx FAKE-WARN INJECTION:eval\n"));
+  const logs: string[] = [];
+  const r = await e.run(() => scanWithRipwire(next, opts(logs, { baselineDir: base })));
+  assert.equal(r.code, 1);
+  assert.match(logs.join("\n"), /; 0 new vs installed copy/u);
+  assert.match(logs.join("\n"), /known findings in changed files:\n(?: {4}a\/f\d\d\.md · INJECTION:eval · 1\n){10} {4}… 1 more\n/u);
+});

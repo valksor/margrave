@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { chmod, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { atomicWrite } from "../src/store.ts";
 import { resolveScanRoot } from "../src/sources.ts";
-import { fakeRipwire, git, head, link, makeRepo, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
+import { CLI, fakeRipwire, git, head, link, makeRepo, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
 import type { Run } from "./helpers.ts";
 
 interface Env {
@@ -714,4 +716,309 @@ test("subpath resolution refuses .., a missing dir, a file, and a symlink out of
   await assert.rejects(resolveScanRoot(clone, "missing"), /does not exist/u);
   await assert.rejects(resolveScanRoot(clone, "afile"), /not a directory/u);
   await assert.rejects(resolveScanRoot(clone, "escape"), /outside the clone/u);
+});
+
+// ---- paths that the tests above do not reach ----
+
+const NO_SOURCES = "no skill sources installed; run: margrave install <owner/repo|path>";
+
+async function installLocalDir(env: Env, dir: string): Promise<string> {
+  const r = await mg(env, ["install", dir]);
+  assert.equal(r.code, 0, r.stderr);
+  return sourceId(r);
+}
+
+test("with no sources: update, find --json, and list --skills say so", async () => {
+  const env = await setup();
+  const upd = await mg(env, ["update"]);
+  assert.equal(upd.code, 0, upd.stderr);
+  assert.equal(upd.stdout.trim(), NO_SOURCES);
+  const find = await mg(env, ["find", "anything", "--json"]);
+  assert.equal(find.code, 0, find.stderr);
+  assert.deepEqual(JSON.parse(find.stdout), { task: "anything", results: [], message: NO_SOURCES });
+  assert.equal((await mg(env, ["list", "--skills"])).stdout.trim(), NO_SOURCES);
+  assert.deepEqual(JSON.parse((await mg(env, ["list", "--json", "--skills"])).stdout), { sources: [], skills: [] });
+});
+
+test("list shows a local source with no ref and no commit; --skills adds the skills; load --file prints the file as is", async () => {
+  const env = await setup();
+  const dir = await tmp("mg-localsrc-");
+  const skill = await writeSkill(dir, "terraform-modules", "Design reusable Terraform modules");
+  await mkdir(path.join(skill, "references"));
+  await writeFile(path.join(skill, "references", "x.md"), "reference text\n");
+  const other = await tmp("mg-localsrc2-");
+  await writeSkill(other, "ansible-roles", "Write Ansible roles");
+  const id = await installLocalDir(env, dir);
+  const otherId = await installLocalDir(env, other);
+
+  const list = await mg(env, ["list"]);
+  assert.equal(list.code, 0, list.stderr);
+  assert.ok(list.stdout.includes(`${id}  local  ref=-  commit=-  skills=1\n`), list.stdout);
+  const withSkills = await mg(env, ["list", "--skills"]);
+  assert.ok(
+    withSkills.stdout.includes(`${id}  local  ref=-  commit=-  skills=1\n  ${id}/terraform-modules: Design reusable Terraform modules\n`),
+  );
+  assert.ok(withSkills.stdout.includes(`  ${otherId}/ansible-roles: Write Ansible roles\n`));
+  const asJson = JSON.parse((await mg(env, ["list", "--json", "--skills"])).stdout) as { skills: { id: string }[] };
+  assert.deepEqual(asJson.skills.map((s) => s.id).sort(), [`${otherId}/ansible-roles`, `${id}/terraform-modules`].sort());
+
+  const file = await mg(env, ["load", `${id}/terraform-modules`, "--file", "references/x.md"]);
+  assert.equal(file.code, 0, file.stderr);
+  assert.equal(file.stdout, "reference text\n");
+  const fileJson = await mg(env, ["load", `${id}/terraform-modules`, "--file", "references/x.md", "--json"]);
+  assert.deepEqual(JSON.parse(fileJson.stdout), { id: `${id}/terraform-modules`, path: "references/x.md", content: "reference text\n" });
+});
+
+test("list still works when index.json is gone: the sources show with no skills", async () => {
+  const env = await setup();
+  const dir = await tmp("mg-localsrc-");
+  await writeSkill(dir, "alpha", "alpha skill");
+  const id = await installLocalDir(env, dir);
+  await rm(path.join(env.home, "index.json"));
+  const list = await mg(env, ["list", "--skills"]);
+  assert.equal(list.code, 0, list.stderr);
+  assert.equal(list.stdout, `${id}  local  ref=-  commit=-  skills=0\n`);
+  const asJson = JSON.parse((await mg(env, ["list", "--json", "--skills"])).stdout) as {
+    sources: { skillCount: number }[];
+    skills: unknown[];
+  };
+  assert.deepEqual(asJson.skills, []);
+  assert.equal(asJson.sources[0]?.skillCount, 0);
+});
+
+test("a missing index.json stops install, update, and remove, and says to run reindex", async () => {
+  const env = await setup();
+  const dir = await tmp("mg-localsrc-");
+  await writeSkill(dir, "alpha", "alpha skill");
+  const id = await installLocalDir(env, dir);
+  await rm(path.join(env.home, "index.json"));
+  const before = await snapshot(env.home);
+
+  const other = await tmp("mg-localsrc2-");
+  await writeSkill(other, "beta", "beta skill");
+  for (const args of [
+    ["install", other],
+    ["update", id],
+    ["remove", id],
+  ]) {
+    const r = await mg(env, args);
+    assert.equal(r.code, 1, args.join(" "));
+    assert.match(r.stderr, /index\.json is missing; run: margrave reindex/u, args.join(" "));
+  }
+  const all = await mg(env, ["update"]);
+  assert.equal(all.code, 1);
+  assert.match(all.stderr, new RegExp(`update ${id} failed: index\\.json is missing`, "u"));
+  assert.deepEqual(await snapshot(env.home), before);
+});
+
+test("install refuses a path that is a file and a directory with no valid skill", async () => {
+  const env = await setup();
+  const dir = await tmp("mg-localsrc-");
+  await writeFile(path.join(dir, "file.txt"), "text\n");
+  const file = await mg(env, ["install", path.join(dir, "file.txt")]);
+  assert.equal(file.code, 1);
+  assert.match(file.stderr, /is not a directory that exists/u);
+  const empty = await mg(env, ["install", dir]);
+  assert.equal(empty.code, 1);
+  assert.match(empty.stderr, /no valid skills \(SKILL\.md with name and description\) found in/u);
+  assert.deepEqual(await names(path.join(env.home, "reports")), []);
+});
+
+test("update of all sources reports the one that fails and still updates the rest", async () => {
+  const env = await setup();
+  const gone = await tmp("mg-gone-");
+  await writeSkill(gone, "alpha", "alpha skill");
+  const kept = await tmp("mg-kept-");
+  await writeSkill(kept, "beta", "beta skill");
+  const goneId = await installLocalDir(env, gone);
+  const keptId = await installLocalDir(env, kept);
+  await rm(gone, { recursive: true });
+
+  const all = await mg(env, ["update"]);
+  assert.equal(all.code, 1);
+  assert.ok(all.stdout.includes(`${keptId}: reindexed\n`), all.stdout);
+  assert.match(
+    all.stderr,
+    new RegExp(`margrave: update ${goneId} failed: ${gone} is not readable; remove the source or restore the directory\n$`, "u"),
+  );
+  const one = await mg(env, ["update", goneId]);
+  assert.equal(one.code, 1);
+  assert.match(one.stderr, /is not readable/u);
+
+  // reindex skips the source that cannot be read and keeps the rest
+  const re = await mg(env, ["reindex"]);
+  assert.equal(re.code, 0, re.stderr);
+  assert.equal(re.stdout.trim(), "reindexed 1 skills from 2 sources");
+  assert.match(re.stderr, new RegExp(`warning: ${goneId}: ${gone} is not readable[^\\n]*; skipped`, "u"));
+});
+
+test("git source: reindex rescans the stored copy, and skips it when the copy is gone", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const id = sourceId(await mg(env, ["install", repo.url]));
+  const re = await mg(env, ["reindex"]);
+  assert.equal(re.code, 0, re.stderr);
+  assert.equal(re.stdout.trim(), "reindexed 3 skills from 1 sources");
+
+  await rm(path.join(env.home, "sources", id), { recursive: true });
+  const gone = await mg(env, ["reindex"]);
+  assert.equal(gone.code, 0, gone.stderr);
+  assert.equal(gone.stdout.trim(), "reindexed 0 skills from 1 sources");
+  assert.match(gone.stderr, new RegExp(`warning: ${id}: .*; skipped`, "u"));
+});
+
+test("git source: update when the new revision has no skills keeps the old copy", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const id = sourceId(await mg(env, ["install", repo.url]));
+  const before = await snapshot(env.home);
+  const stored = await names(path.join(env.home, "sources", id, "skills"));
+  await git(repo.dir, "rm", "-r", "-q", "skills");
+  await git(repo.dir, "commit", "-q", "-m", "drop every skill");
+
+  const r = await mg(env, ["update", id]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, new RegExp(`no valid skills found in the new revision of ${id}; kept the old copy`, "u"));
+  assert.deepEqual(await snapshot(env.home), before);
+  assert.deepEqual(await names(path.join(env.home, "sources", id, "skills")), stored);
+});
+
+test("git source: update works when the stored copy is gone, or no longer holds the subpath", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const id = sourceId(await mg(env, ["install", repo.url]));
+
+  // The stored copy is gone: nothing to swap aside, and no baseline.
+  await rm(path.join(env.home, "sources", id), { recursive: true });
+  const first = await mg(env, ["update", id]);
+  assert.equal(first.code, 0, first.stderr);
+  assert.match(first.stdout, new RegExp(`^${id}: [0-9a-f]{7} → [0-9a-f]{7}\n`, "u"));
+  assert.equal((await stat(path.join(env.home, "sources", id, "skills", "react-perf", "SKILL.md"))).isFile(), true);
+
+  // The source record names a subpath that the stored copy does not have (a GitHub spec can; a file:// URL cannot).
+  const file = path.join(env.home, "sources.json");
+  const records = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>[];
+  await writeFile(file, JSON.stringify(records.map((r) => ({ ...r, subpath: "skills" }))));
+  await rm(path.join(env.home, "sources", id, "skills"), { recursive: true });
+  const second = await mg(env, ["update", id]);
+  assert.equal(second.code, 0, second.stderr);
+  assert.ok((await readFile(path.join(env.home, "index.json"), "utf8")).includes("react-perf"));
+});
+
+test("install of a git source without git on PATH, and with a git that fails silently", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const none = await mg(env, ["install", repo.url], { PATH: await tmp("mg-emptybin-") });
+  assert.equal(none.code, 1);
+  assert.match(none.stderr, /git was not found on PATH \(command: git clone /u);
+
+  // A git that exits 1 and says nothing: the message falls back to the error's own text, which ends in a newline.
+  const bin = await tmp("mg-fakegit-");
+  await writeFile(path.join(bin, "git"), "#!/bin/sh\nexit 1\n");
+  await chmod(path.join(bin, "git"), 0o755);
+  const silent = await mg(env, ["install", repo.url], { PATH: `${bin}:${process.env["PATH"] ?? ""}` });
+  assert.equal(silent.code, 1);
+  assert.match(silent.stderr, /^margrave: command failed: git clone [^\n]*\nCommand failed: git clone [^\n]*\n$/u);
+  assert.deepEqual(await names(path.join(env.home, "staging")), []);
+});
+
+test("wrap adds a build note on stderr when dist/cli.js does not exist", async () => {
+  const env = await setup();
+  const preload = `import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const real = fs.existsSync;
+fs.existsSync = (p) => (String(p).endsWith("dist/cli.js") ? false : real(p));
+syncBuiltinESMExports();`;
+  const r = await runCli(["wrap", "claude"], {
+    home: env.home,
+    nodeArgs: ["--import", `data:text/javascript,${encodeURIComponent(preload)}`],
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /^note: .*dist\/cli\.js does not exist yet; run: pnpm run build\n$/u);
+  assert.match(r.stdout, /claude mcp add margrave/u);
+});
+
+/** `--import` arguments that run `code` as an ES module before the CLI starts. */
+const preloadArgs = (code: string): string[] => ["--import", `data:text/javascript,${encodeURIComponent(code)}`];
+
+test("a closed stdout pipe is not an error: `margrave load` piped into a reader that quits exits 0", async () => {
+  const env = await setup();
+  const dir = await tmp("mg-localsrc-");
+  await writeSkill(dir, "big", "a big skill", `# big\n\n${"lorem ".repeat(500_000)}\n`);
+  const id = await installLocalDir(env, dir);
+
+  // The preload reports every stdout error code on stderr, so the test sees that EPIPE really happened.
+  const seen = preloadArgs(`process.stdout.prependListener("error", (e) => process.stderr.write("stdout error: " + e.code + ";"));`);
+  // 3 MB cannot fit in the pipe, so the child is still writing when the reader closes it.
+  const child = spawn(process.execPath, [...seen, CLI, "load", `${id}/big`], {
+    env: { ...process.env, MARGRAVE_HOME: env.home },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stderr = "";
+  let received = 0;
+  child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+  child.stdout.on("data", (d: Buffer) => {
+    received += d.length;
+    child.stdout.destroy();
+  });
+  const [code] = (await once(child, "close")) as [number | null];
+  assert.match(stderr, /^(stdout error: EPIPE;)+$/u);
+  assert.ok(received > 0 && received < 3_000_000, `the reader got ${received} bytes of more than 3 MB`);
+  assert.equal(code, 0);
+});
+
+test("a rejection that is not an Error is still printed as text, with exit 1", async () => {
+  const env = await setup();
+  const fail = preloadArgs(`import fsp from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const real = fsp.readFile;
+fsp.readFile = (p, ...rest) => (String(p).endsWith("sources.json") ? Promise.reject("boom, not an Error") : real(p, ...rest));
+syncBuiltinESMExports();`);
+  const r = await runCli(["list"], { home: env.home, nodeArgs: fail });
+  assert.equal(r.code, 1);
+  assert.equal(r.stderr, "margrave: boom, not an Error\n");
+  assert.equal(r.stdout, "");
+});
+
+test("a sources.json record with no url, no path, or an unknown kind stops every command that reads it", async () => {
+  const env = await setup();
+  const base = { spec: "x", subpath: "", ref: null, commit: null, installedAt: "now" };
+  const records: Record<string, unknown> = {
+    "a git record without url": { ...base, id: "bad__git", kind: "git" },
+    "a local record without path": { ...base, id: "bad__local", kind: "local" },
+    "a record of an unknown kind": { ...base, id: "bad__kind", kind: "svn", url: "u", path: "/p" },
+  };
+  const file = path.join(env.home, "sources.json");
+  for (const [why, record] of Object.entries(records)) {
+    const text = JSON.stringify([record]);
+    await writeFile(file, text);
+    const id = (record as { id: string }).id;
+    for (const args of [["update"], ["update", id], ["remove", id], ["reindex"], ["list"]]) {
+      const r = await mg(env, args);
+      assert.equal(r.code, 1, `${why}: ${args.join(" ")}`);
+      assert.match(r.stderr, /sources\.json is malformed/u, `${why}: ${args.join(" ")}`);
+    }
+    assert.equal(await readFile(file, "utf8"), text, `${why}: sources.json is unchanged`);
+  }
+});
+
+test("git source: updating one source leaves the record of another source as it was", async () => {
+  const env = await setup();
+  const repoA = await makeRepo();
+  const repoB = await makeRepo();
+  const idA = sourceId(await mg(env, ["install", repoA.url]));
+  const idB = sourceId(await mg(env, ["install", repoB.url]));
+  const recordOf = async (id: string): Promise<unknown> =>
+    (JSON.parse((await snapshot(env.home)).sources ?? "[]") as { id: string }[]).find((r) => r.id === id);
+  const beforeB = await recordOf(idB);
+  const beforeA = await recordOf(idA);
+
+  await writeSkill(path.join(repoA.dir, "skills"), "extra-skill", "A skill that arrives with the update");
+  await git(repoA.dir, "add", "-A");
+  await git(repoA.dir, "commit", "-q", "-m", "more");
+  const r = await mg(env, ["update", idA]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(r.stdout.includes(`added: ${idA}/extra-skill`));
+  assert.deepEqual(await recordOf(idB), beforeB);
+  assert.notDeepEqual(await recordOf(idA), beforeA);
 });

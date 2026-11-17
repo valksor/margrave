@@ -134,3 +134,27 @@ test("clampLimit defaults to 5 and clamps to 1..25", () => {
   assert.equal(clampLimit(10), 10);
   assert.equal(clampLimit("100"), 25);
 });
+
+test("a field whose corpus average is zero is not length-normalised", () => {
+  const docs = [doc("a", "react", "render fast")];
+  // Stats from another, empty corpus: the term is known, but every field average is 0.
+  const stats = { ...buildStats([]), docCount: 1, docFreq: { react: 1 } };
+  const r = rank(docs, stats, "react", 10);
+  assert.deepEqual(
+    r.map((x) => x.id),
+    ["a"],
+  );
+  assert.ok((r[0]?.score ?? 0) > 0);
+});
+
+test("equal scores sort by id ascending, in either input order, and a repeated id does not break the sort", () => {
+  const same = (id: string): Doc => doc(id, "x", "widget");
+  for (const order of [
+    ["a", "b", "c"],
+    ["c", "b", "a"],
+    ["b", "c", "a"],
+  ]) {
+    assert.deepEqual(ranked(order.map(same), "widget"), ["a", "b", "c"], order.join());
+  }
+  assert.deepEqual(ranked(["b", "a", "a"].map(same), "widget"), ["a", "a", "b"]);
+});

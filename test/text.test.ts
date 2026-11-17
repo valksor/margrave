@@ -52,3 +52,20 @@ test("shellQuote leaves safe text alone and quotes the rest", () => {
   assert.equal(shellQuote("a b"), "'a b'");
   assert.equal(shellQuote("it's"), "'it'\\''s'");
 });
+
+test("load omits the spec in parentheses when there is none, and caps the file list at 200", () => {
+  const r: LoadResult = {
+    id: "s/big",
+    source: "s",
+    spec: "",
+    commit: null,
+    base: "/base",
+    frontmatter: "name: big",
+    files: Array.from({ length: 205 }, (_, i) => `f${String(i).padStart(3, "0")}.md`),
+    body: "text\n",
+  };
+  const text = formatLoad(r);
+  assert.match(text, /^skill: s\/big\nsource: s\ncommit: none \(local directory\)\n/u);
+  assert.ok(text.includes("- f199.md\n- ... 5 more\nbody:\n"));
+  assert.ok(!text.includes("f200.md"));
+});

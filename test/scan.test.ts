@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, writeFile } from "node:fs/promises";
+import fsp, { chmod, mkdir, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
-import test from "node:test";
-import { extractHeadings, parseSkillMd, scanSource, splitSkillMd } from "../src/scan.ts";
+import test, { mock } from "node:test";
+import { extractHeadings, isInside, parseSkillMd, scanSource, splitSkillMd } from "../src/scan.ts";
 import { link, skillMd, tmp, writeSkill } from "./helpers.ts";
 
 test("frontmatter with a missing field is skipped, with a warning", async () => {
@@ -119,4 +120,128 @@ test("a duplicate name inside one source keeps the first and warns", async () =>
   assert.equal(r.skills.length, 1);
   assert.equal(r.skills[0]?.description, "first");
   assert.match(r.warnings.join("\n"), /duplicate skill name/u);
+});
+
+test("isInside accepts the parent itself and its children, and works for a root that ends with a separator", () => {
+  assert.equal(isInside("/a/b", "/a/b"), true);
+  assert.equal(isInside("/a/b/c", "/a/b"), true);
+  assert.equal(isInside("/a/bc", "/a/b"), false);
+  assert.equal(isInside("/a", "/"), true);
+});
+
+test("frontmatter that is not a mapping is skipped: a list, a plain string, or null", () => {
+  for (const fm of ["- a\n- b", "just text", "null"]) {
+    const r = parseSkillMd(`---\n${fm}\n---\nbody\n`);
+    assert.deepEqual(r, { ok: false, reason: "frontmatter is not a mapping" }, fm);
+  }
+});
+
+test("a SKILL.md that is a directory, or that cannot be read, is skipped with a warning", async (t) => {
+  const root = await tmp();
+  await mkdir(path.join(root, "dir-skill", "SKILL.md"), { recursive: true });
+  await writeSkill(root, "good", "a good skill");
+  const r = await scanSource(root, { followSymlinks: false });
+  assert.deepEqual(
+    r.skills.map((s) => s.name),
+    ["good"],
+  );
+  assert.match(r.warnings.join("\n"), /dir-skill.SKILL\.md: not a regular file/u);
+
+  // A file mode of 000 does not stop root, so this half does not run as root.
+  if (process.getuid?.() === 0) return t.diagnostic("running as root: skipped the unreadable-file half");
+  const locked = await tmp();
+  const dir = await writeSkill(locked, "locked", "cannot be read");
+  const file = path.join(dir, "SKILL.md");
+  await chmod(file, 0o000);
+  t.after(() => chmod(file, 0o644));
+  const r2 = await scanSource(locked, { followSymlinks: false });
+  assert.deepEqual(r2.skills, []);
+  assert.match(r2.warnings.join("\n"), /locked.SKILL\.md: EACCES/u);
+});
+
+test("a directory that cannot be listed is skipped with a warning", async (t) => {
+  if (process.getuid?.() === 0) return t.skip("a file mode of 000 does not stop root");
+  const root = await tmp();
+  await writeSkill(root, "good", "a good skill");
+  const locked = path.join(root, "locked");
+  await mkdir(locked);
+  await chmod(locked, 0o000);
+  t.after(() => chmod(locked, 0o755));
+  const r = await scanSource(root, { followSymlinks: false });
+  assert.deepEqual(
+    r.skills.map((s) => s.name),
+    ["good"],
+  );
+  assert.match(r.warnings.join("\n"), /cannot read .*locked: EACCES/u);
+});
+
+test("a dangling symlink is ignored, for git rules and for local rules", async () => {
+  const root = await tmp();
+  await writeSkill(root, "good", "a good skill");
+  await link(path.join(root, "does-not-exist"), path.join(root, "dangling"));
+  for (const followSymlinks of [false, true]) {
+    const r = await scanSource(root, { followSymlinks });
+    assert.deepEqual(
+      r.skills.map((s) => s.name),
+      ["good"],
+      `followSymlinks=${followSymlinks}`,
+    );
+    assert.deepEqual(r.warnings, [], `followSymlinks=${followSymlinks}`);
+  }
+});
+
+test("a directory that vanishes between the listing and the walk is skipped", async (t) => {
+  const root = await tmp();
+  await writeSkill(root, "good", "a good skill");
+  await mkdir(path.join(root, "ghost"));
+  const real = fsp.realpath;
+  mock.method(fsp, "realpath", (p: string, ...rest: never[]) =>
+    p.endsWith("ghost") ? Promise.reject(new Error("ENOENT: vanished")) : (real as (...a: unknown[]) => Promise<string>)(p, ...rest),
+  );
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  const r = await scanSource(root, { followSymlinks: false });
+  assert.deepEqual(
+    r.skills.map((s) => s.name),
+    ["good"],
+  );
+  assert.deepEqual(r.warnings, []);
+});
+
+test("the result is sorted by skill name, whatever order the directories and the filesystem list them in", async (t) => {
+  const root = await tmp();
+  // Directory order is a, b, c; skill order is c, b, a. The reverse of what the walk finds.
+  await writeSkill(path.join(root, "a"), "skill-c", "third");
+  await writeSkill(path.join(root, "b"), "skill-b", "second");
+  await writeSkill(path.join(root, "c"), "skill-a", "first");
+  // And skills already in directory order.
+  await writeSkill(path.join(root, "d"), "skill-d", "fourth");
+  const names = async (): Promise<string[]> => (await scanSource(root, { followSymlinks: false })).skills.map((s) => s.name);
+  const expected = ["skill-a", "skill-b", "skill-c", "skill-d"];
+
+  const real = fsp.readdir;
+  const listed = (order: 1 | -1) =>
+    mock.method(fsp, "readdir", async (...args: unknown[]) => {
+      const entries = (await (real as (...a: unknown[]) => Promise<{ name: string }[]>)(...args)) as { name: string }[];
+      return entries.sort((x, y) => order * (x.name < y.name ? -1 : 1));
+    });
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  for (const order of [1, -1] as const) {
+    listed(order);
+    syncBuiltinESMExports();
+    assert.deepEqual(await names(), expected, `readdir order ${order}`);
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(await names(), expected, "real readdir order");
+});
+
+test("splitSkillMd reads an empty frontmatter block", () => {
+  assert.deepEqual(splitSkillMd("---\n---\nbody\n"), { rawFrontmatter: "", body: "body\n" });
 });

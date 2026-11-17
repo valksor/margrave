@@ -83,6 +83,8 @@ export interface RunOptions {
   fakeBin?: string;
   extra?: Record<string, string>;
   cwd?: string;
+  /** Extra node options, put before the CLI path (for example a `--import` of a preload). */
+  nodeArgs?: string[];
 }
 
 export function runCli(args: string[], opts: RunOptions): Promise<Run> {
@@ -90,7 +92,7 @@ export function runCli(args: string[], opts: RunOptions): Promise<Run> {
   return new Promise((resolve) => {
     execFile(
       process.execPath,
-      [CLI, ...args],
+      [...(opts.nodeArgs ?? []), CLI, ...args],
       {
         cwd: opts.cwd ?? ROOT,
         encoding: "utf8",

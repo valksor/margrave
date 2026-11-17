@@ -42,6 +42,7 @@ function parse(args: string[], options: NonNullable<Parameters<typeof parseArgs>
   }
 }
 
+/** With `min` of 1 or more, the first element exists: callers cast it. */
 function positionals(p: Parsed, min: number, max: number, what: string): string[] {
   if (p.positionals.length < min || p.positionals.length > max) throw new UsageError(`expected ${what}`);
   return p.positionals;
@@ -71,7 +72,7 @@ async function run(argv: string[]): Promise<void> {
       const p = parse(rest, { ref: { type: "string" }, "allow-unsafe": { type: "boolean" } });
       const [spec] = positionals(p, 1, 1, "install <spec>");
       const r = await installSource(
-        spec ?? "",
+        spec as string,
         typeof p.values["ref"] === "string" ? p.values["ref"] : null,
         ctx(p.values["allow-unsafe"] === true),
       );
@@ -97,7 +98,7 @@ async function run(argv: string[]): Promise<void> {
     case "remove": {
       const p = parse(rest, {});
       const [source] = positionals(p, 1, 1, "remove <source>");
-      const rec = await removeSource(source ?? "");
+      const rec = await removeSource(source as string);
       out(rec.kind === "local" ? `unregistered ${clean(rec.id)} (the directory was not touched)` : `removed ${clean(rec.id)}`);
       return;
     }
@@ -147,7 +148,7 @@ async function run(argv: string[]): Promise<void> {
       const [id] = positionals(p, 1, 1, "load <id>");
       const c = await loadContext();
       if (c === null) throw new MargraveError(NO_SOURCES_MESSAGE);
-      const entry = resolveSkill(c.index, id ?? "");
+      const entry = resolveSkill(c.index, id as string);
       if (typeof p.values["file"] === "string") {
         const content = await readSkillFile(entry.dir, p.values["file"]);
         if (p.values["json"] === true) json({ id: entry.id, path: p.values["file"], content });
@@ -174,7 +175,7 @@ async function run(argv: string[]): Promise<void> {
     case "wrap": {
       const p = parse(rest, {});
       const [agent] = positionals(p, 1, 1, "wrap <claude|codex|bb|generic>");
-      const w = wrap(agent ?? "");
+      const w = wrap(agent as string);
       if (w.note !== null) err(w.note);
       out(w.text);
       return;
@@ -186,6 +187,9 @@ async function run(argv: string[]): Promise<void> {
 
 // A closed pipe (`margrave load x | head`) is not an error.
 process.stdout.on("error", (e: NodeJS.ErrnoException) => {
+  // Any other stdout error must stay loud. A test could emit an error event with another code through a
+  // preload, but that test would cost more than it checks, so this line is left out of the coverage count.
+  /* node:coverage ignore next */
   if (e.code !== "EPIPE") throw e;
 });
 

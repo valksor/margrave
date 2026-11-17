@@ -33,7 +33,7 @@ Thank you for your interest in contributing to margrave. Contributions are welco
 ### Available scripts
 
 - `pnpm build` - Compile `src/` to `dist/` with tsrs, then make sure ripwire is available
-- `pnpm test` - Run the tests (`node --test test/`; no network, temporary `MARGRAVE_HOME`)
+- `pnpm test` - Run the tests under c8 (`node --test test/`; no network, temporary `MARGRAVE_HOME`). It fails when line, branch, function, or statement coverage of `src/` is below 100%. The coverage gate needs a non-root user, because the tests that need unreadable files skip as root
 - `pnpm lint` - Check the code with oxlint
 - `pnpm format` - Format all files with prettier
 - `pnpm format:check` - Check formatting without writing

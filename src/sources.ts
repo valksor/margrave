@@ -59,8 +59,9 @@ function gitUrlId(spec: string): string {
   if (spec.startsWith("git@")) {
     const m = /^git@([^:/]+):(.+)$/u.exec(spec);
     if (m === null) throw new UsageError(`cannot parse git URL "${spec}"`);
-    host = m[1] ?? "";
-    rawPath = m[2] ?? "";
+    // Both groups take part in every match.
+    host = m[1] as string;
+    rawPath = m[2] as string;
   } else {
     let u: URL;
     try {
@@ -73,7 +74,7 @@ function gitUrlId(spec: string): string {
   }
   const segs = rawPath.split("/").filter((s) => s !== "");
   const last = segs.length - 1;
-  if (last >= 0) segs[last] = stripGit(segs[last] ?? "");
+  if (last >= 0) segs[last] = stripGit(segs[last] as string);
   const id = [host, ...segs]
     .filter((s) => s !== "")
     .map(sanitizeId)
@@ -110,8 +111,9 @@ export function parseSpec(spec: string): ParsedSpec {
   if (segs.some((s) => s === "." || !ID_RE.test(s))) {
     throw new UsageError(`unrecognized source "${spec}": use owner/repo[/sub/path] with letters, digits, ".", "_", "-"`);
   }
-  const owner = segs[0] ?? "";
-  const repo = stripGit(segs[1] ?? "");
+  // At least two segments, none empty: checked above.
+  const owner = segs[0] as string;
+  const repo = stripGit(segs[1] as string);
   if (repo === "") throw new UsageError(`unrecognized source "${spec}"`);
   const sub = segs.slice(2);
   const id = checkId([owner, repo, ...sub].map(sanitizeId).join("__"));
@@ -133,6 +135,9 @@ export function sourceDir(id: string): string {
   checkId(id);
   const root = path.resolve(sourcesRoot());
   const dir = path.join(root, id);
+  // Defence in depth in front of every `rm -rf`. checkId() already limits `id` to one safe path segment,
+  // so no test can make this fire; the guard stays so a later change to checkId() cannot make it unsafe.
+  /* node:coverage ignore next 3 */
   if (path.dirname(dir) !== root || path.basename(dir) !== id) {
     throw new MargraveError(`refused: ${dir} is not a direct child of ${root}`);
   }
@@ -176,7 +181,7 @@ function git(args: string[]): Promise<string> {
           reject(new MargraveError(`git was not found on PATH (command: ${cmd})`));
           return;
         }
-        reject(new MargraveError(`command failed: ${cmd}\n${(stderr ?? "").trim() || err.message}`));
+        reject(new MargraveError(`command failed: ${cmd}\n${stderr.trim() || err.message}`));
       },
     );
   });
@@ -417,18 +422,21 @@ async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
   // Re-read state so that several updates in a row see each other's writes.
   const sources = await readSources();
   const rec = sources.find((s) => s.id === id);
+  // A `remove` that runs between updateSources() reading the list and this read makes this fire.
   if (rec === undefined) throw new MargraveError(`no source "${id}"`);
   const old = await currentIndex(sources);
-  const oldEntries = (old?.skills ?? []).filter((e) => e.source === id);
-  const others = (old?.skills ?? []).filter((e) => e.source !== id);
+  // `rec` exists, so sources is not empty, so currentIndex() returned the index or threw.
+  const oldSkills = (old as IndexFile).skills;
+  const oldEntries = oldSkills.filter((e) => e.source === id);
+  const others = oldSkills.filter((e) => e.source !== id);
 
   if (rec.kind === "local") {
     const entries = await scanLocal(rec, ctx);
     await commit(old, [...others, ...entries], sources);
     return { id, kind: "local", oldCommit: null, newCommit: null, ...diffEntries(oldEntries, entries) };
   }
-  if (rec.kind !== "git" || rec.url === undefined) throw new MargraveError(`source ${id} is malformed`);
-  const url = rec.url;
+  // readSources() only returns a git record with a url.
+  const url = rec.url as string;
   const final = sourceDir(id);
 
   return withStaging(async (stage) => {
@@ -477,8 +485,8 @@ async function installedScanRoot(final: string, subpath: string): Promise<string
 }
 
 async function scanLocal(rec: SourceRecord, ctx: Ctx): Promise<IndexEntry[]> {
-  if (rec.path === undefined) throw new MargraveError(`source ${rec.id} is malformed`);
-  const scan = await scanSource(rec.path, { followSymlinks: true }).catch(() => {
+  // readSources() only returns a local record with a path.
+  const scan = await scanSource(rec.path as string, { followSymlinks: true }).catch(() => {
     throw new MargraveError(`${rec.path} is not readable; remove the source or restore the directory`);
   });
   logWarnings(ctx, scan.warnings);
@@ -491,17 +499,15 @@ export async function removeSource(arg: string): Promise<SourceRecord> {
   const sources = await readSources();
   const rec = findSource(sources, arg);
   const old = await currentIndex(sources);
-  const remaining = (old?.skills ?? []).filter((e) => e.source !== rec.id);
+  // findSource() found `rec`, so sources is not empty, so currentIndex() returned the index or threw.
+  const remaining = (old as IndexFile).skills.filter((e) => e.source !== rec.id);
   const nextSources = sources.filter((s) => s.id !== rec.id);
 
   await commit(old, remaining, nextSources);
+  // Local sources are only unregistered. The user's directory is never deleted.
   if (rec.kind === "git") {
     // Deletes only sources/<id>, after sourceDir() checked it is a direct child of sources/.
     await rm(sourceDir(rec.id), { recursive: true, force: true });
-  } else if (rec.kind === "local") {
-    // Local sources are only unregistered. The user's directory is never deleted.
-  } else {
-    throw new MargraveError(`source ${rec.id} has an unknown kind`);
   }
   return rec;
 }

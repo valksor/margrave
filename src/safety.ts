@@ -78,7 +78,7 @@ function exec(bin: string, dir: string): Promise<Execed> {
         return;
       }
       const e = err as NodeJS.ErrnoException & { code?: number | string };
-      resolve({ code: e.code ?? null, stdout: stdout ?? "", stderr: stderr ?? "", missing: e.code === "ENOENT" });
+      resolve({ code: e.code ?? null, stdout, stderr, missing: e.code === "ENOENT" });
     });
   });
 }
@@ -105,8 +105,9 @@ const NAMED: Record<string, string> = { quot: '"', amp: "&", lt: "<", gt: ">", a
 
 function unescapeXml(s: string): string {
   return s.replace(ENTITY_RE, (whole: string, named: string | undefined, dec: string | undefined, hex: string | undefined) => {
-    if (named !== undefined) return NAMED[named] ?? whole;
-    const n = dec !== undefined ? Number.parseInt(dec, 10) : Number.parseInt(hex ?? "", 16);
+    // ENTITY_RE only matches the names in NAMED, and `hex` is set whenever `named` and `dec` are not.
+    if (named !== undefined) return NAMED[named] as string;
+    const n = dec !== undefined ? Number.parseInt(dec, 10) : Number.parseInt(hex as string, 16);
     try {
       return String.fromCodePoint(n);
     } catch {
@@ -117,7 +118,8 @@ function unescapeXml(s: string): string {
 
 function attrs(raw: string): Map<string, string> {
   const out = new Map<string, string>();
-  for (const m of raw.matchAll(ATTR_RE)) out.set(m[1] ?? "", unescapeXml(m[2] ?? m[3] ?? ""));
+  // ATTR_RE always sets group 1, and one of groups 2 and 3.
+  for (const m of raw.matchAll(ATTR_RE)) out.set(m[1] as string, unescapeXml((m[2] ?? m[3]) as string));
   return out;
 }
 
@@ -133,9 +135,10 @@ export function parseScanXml(xml: string, code: number): Parsed {
   let root: Map<string, string> | null = null;
   const rows: Row[] = [];
   for (const m of xml.matchAll(TAG_RE)) {
-    if (m[1] === "skillscan" && root === null) root = attrs(m[2] ?? "");
+    // TAG_RE always sets group 2 (the attribute text, possibly empty).
+    if (m[1] === "skillscan" && root === null) root = attrs(m[2] as string);
     else if (m[1] === "f") {
-      const a = attrs(m[2] ?? "");
+      const a = attrs(m[2] as string);
       rows.push({ p: a.get("p") ?? "", rule: a.get("rule") ?? "", sev: normSev(a.get("sev")) });
     }
   }
@@ -170,7 +173,8 @@ interface FileInfo {
  * inside the real scan root, and valid UTF-8.
  */
 async function readFlagged(realRoot: string, rel: string, cache: Map<string, FileInfo | null>): Promise<FileInfo | null> {
-  if (cache.has(rel)) return cache.get(rel) ?? null;
+  // `has` says the entry exists, so get() does not return undefined.
+  if (cache.has(rel)) return cache.get(rel) as FileInfo | null;
   let info: FileInfo | null = null;
   try {
     const abs = path.join(realRoot, rel);
@@ -289,7 +293,8 @@ const MAX_DETAIL_LINES = 40;
 const MAX_DETAIL_WIDTH = 500;
 
 function ranked(counts: Map<string, number>): [string, number][] {
-  return [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  // Map keys are unique, so two keys are never equal.
+  return [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
 }
 
 function tally(items: readonly string[]): Map<string, number> {

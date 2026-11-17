@@ -126,7 +126,8 @@ export function buildFieldTokens(parts: { name: string; description: string; hea
 
 /** Own-property lookup: after a JSON round trip, "constructor" must not resolve to Object.prototype. */
 function own(map: Record<string, number>, key: string): number {
-  return Object.hasOwn(map, key) ? (map[key] ?? 0) : 0;
+  // hasOwn says the key is there, so the value is a number.
+  return Object.hasOwn(map, key) ? (map[key] as number) : 0;
 }
 
 function fieldLength(tf: TermFreqs): number {

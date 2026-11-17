@@ -27,7 +27,7 @@
   "packageManager": "pnpm@12.21.0",
   "scripts": {
     "build": "tsrs && chmod +x dist/cli.js && node scripts/ensure-ripwire.mjs",
-    "test": "node --test test/",
+    "test": "c8 --check-coverage --100 --all --src src --include 'src/**/*.ts' --reporter=text node --test test/",
     "lint": "oxlint",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -42,6 +42,7 @@
   },
   "devDependencies": {
     "@types/node": "26.6.6",
+    "c8": "12.0.0",
     "knip": "6.45.1",
     "oxlint": "1.94.0",
     "prettier": "3.10.1",

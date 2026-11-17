@@ -224,7 +224,7 @@ A missing `sources.json` is an empty list. A malformed one is an error, and marg
 ```sh
 nvm use && pnpm install --frozen-lockfile
 pnpm run build  # tsrs, chmod +x dist/cli.js, then scripts/ensure-ripwire.mjs
-pnpm test       # node --test test/ (runs the .ts sources directly; no network, temp MARGRAVE_HOME)
+pnpm test       # node --test test/ under c8 (runs the .ts sources directly; no network, temp MARGRAVE_HOME); fails when line, branch, function, or statement coverage of src/ is below 100%
 ```
 
 ## License

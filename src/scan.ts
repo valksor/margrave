@@ -55,7 +55,8 @@ export function splitSkillMd(text: string): ParsedSkillMd {
     if (empty !== null) return { rawFrontmatter: "", body: src.slice(empty[0].length) };
     return { rawFrontmatter: null, body: src };
   }
-  return { rawFrontmatter: m[1] ?? "", body: src.slice(m[0].length) };
+  // Group 1 always takes part in a match, so it is a string here.
+  return { rawFrontmatter: m[1] as string, body: src.slice(m[0].length) };
 }
 
 /** Markdown headings outside fenced code blocks. */
@@ -65,7 +66,8 @@ export function extractHeadings(body: string): string[] {
   for (const line of body.split(/\r?\n/u)) {
     const f = /^\s{0,3}(`{3,}|~{3,})/u.exec(line);
     if (f !== null) {
-      const marker = (f[1] ?? "")[0] ?? "";
+      // Group 1 is one or more fence characters, so its first character exists.
+      const marker = (f[1] as string)[0] as string;
       if (fence === null) fence = marker;
       else if (fence === marker) fence = null;
       continue;
@@ -133,7 +135,8 @@ export async function scanSource(root: string, opts: ScanOptions): Promise<ScanR
       warnings.push(`cannot read ${dir}: ${(err as Error).message}`);
       return;
     }
-    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    // Names in one directory are unique, so two names are never equal.
+    entries.sort((a, b) => (a.name < b.name ? -1 : 1));
 
     const skillMd = entries.find((e) => e.name === "SKILL.md");
     if (skillMd !== undefined) {
@@ -198,6 +201,7 @@ export async function scanSource(root: string, opts: ScanOptions): Promise<ScanR
   }
 
   await walk(root);
-  skills.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  // Names are unique within a source (see seenNames), so two names are never equal.
+  skills.sort((a, b) => (a.name < b.name ? -1 : 1));
   return { skills, warnings };
 }

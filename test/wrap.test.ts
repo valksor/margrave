@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
-import test from "node:test";
-import { AGENTS, SNIPPET, defaultWrapInput, renderWrap } from "../src/wrap.ts";
+import test, { mock } from "node:test";
+import { UsageError } from "../src/store.ts";
+import { AGENTS, SNIPPET, defaultWrapInput, renderWrap, wrap } from "../src/wrap.ts";
 import { ROOT, runCli, tmp } from "./helpers.ts";
 
 const input = { nodePath: "/opt/node/bin/node", cliPath: "/opt/margrave/dist/cli.js", home: undefined };
@@ -45,6 +48,12 @@ test("bb: the claude command line plus a note that bb runs the provider's MCP co
   assert.ok(text.includes(SNIPPET));
 });
 
+test("generic: no MARGRAVE_HOME prefix when it is not set", () => {
+  const text = renderWrap("generic", input);
+  assert.ok(text.includes("\n\n/opt/node/bin/node /opt/margrave/dist/cli.js mcp\n"));
+  assert.ok(!text.includes("MARGRAVE_HOME"));
+});
+
 test("generic: the command line and the snippet", () => {
   const text = renderWrap("generic", withHome);
   assert.ok(text.includes("MARGRAVE_HOME='/data/margrave home' /opt/node/bin/node /opt/margrave/dist/cli.js mcp\n"));
@@ -72,4 +81,36 @@ test("`margrave wrap` prints, exits 0, and writes nothing into MARGRAVE_HOME", a
   }
   const { readdir } = await import("node:fs/promises");
   assert.deepEqual(await readdir(home), []);
+});
+
+test("defaultWrapInput has no home when MARGRAVE_HOME is unset or empty", (t) => {
+  const prev = process.env["MARGRAVE_HOME"];
+  t.after(() => {
+    if (prev === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prev;
+  });
+  delete process.env["MARGRAVE_HOME"];
+  assert.equal(defaultWrapInput().home, undefined);
+  process.env["MARGRAVE_HOME"] = "";
+  assert.equal(defaultWrapInput().home, undefined);
+});
+
+test("wrap rejects an unknown agent, and adds a build note only when dist/cli.js is missing", (t) => {
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  assert.throws(
+    () => wrap("emacs"),
+    (e: unknown) => e instanceof UsageError && /unknown agent "emacs"/u.test(e.message),
+  );
+
+  const exists = mock.method(fs, "existsSync", () => false);
+  syncBuiltinESMExports();
+  const missing = wrap("claude");
+  assert.equal(missing.note, `note: ${path.join(ROOT, "dist", "cli.js")} does not exist yet; run: pnpm run build`);
+  assert.ok(missing.text.includes(SNIPPET));
+
+  exists.mock.mockImplementation(() => true);
+  assert.equal(wrap("claude").note, null);
 });
