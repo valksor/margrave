@@ -662,6 +662,26 @@ test("git source: the stored copy keeps no .git, after install and after update"
   await assert.rejects(stat(path.join(stored, ".git")), { code: "ENOENT" });
 });
 
+test("install scan warnings show control characters in a path as text", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const bad = "bad\u001b]0;T\u0007\nINJECTED-LINE";
+  await mkdir(path.join(repo.dir, "skills", bad));
+  await writeFile(path.join(repo.dir, "skills", bad, "SKILL.md"), "no frontmatter\n");
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-q", "-m", "bad dir");
+
+  const r = await mg(env, ["install", repo.url]);
+  assert.equal(r.code, 0, r.stderr);
+  const lines = r.stderr.split("\n");
+  const warnings = lines.filter((l) => l.startsWith("warning:"));
+  assert.ok(!warnings.join("\n").includes("\u001b"), "no ESC byte in a warning");
+  const forBad = warnings.filter((l) => l.includes("bad"));
+  assert.equal(forBad.length, 1, warnings.join("\n"));
+  assert.ok(forBad[0]?.includes("\\x1b]0;T\\x07\\x0aINJECTED-LINE"), forBad[0]);
+  assert.ok(!lines.some((l) => l.startsWith("INJECTED-LINE")));
+});
+
 test("usage errors exit 2, unknown commands exit 2, and find/list say when no sources exist", async () => {
   const env = await setup();
   assert.equal((await mg(env, [])).code, 2);

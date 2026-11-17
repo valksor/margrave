@@ -7,7 +7,7 @@ import path from "node:path";
 import { buildStats } from "./bm25.ts";
 import { isInside, scanSource } from "./scan.ts";
 import type { ScannedSkill } from "./scan.ts";
-import { scanWithRipwire } from "./safety.ts";
+import { esc, scanWithRipwire } from "./safety.ts";
 import {
   MargraveError,
   UsageError,
@@ -257,7 +257,7 @@ async function restoreIndex(old: IndexFile | null): Promise<void> {
 }
 
 function logWarnings(ctx: Ctx, warnings: readonly string[]): void {
-  for (const w of warnings) ctx.log(`warning: ${w}`);
+  for (const w of warnings) ctx.log(`warning: ${esc(w)}`);
 }
 
 // ---- install ----
@@ -534,7 +534,7 @@ export async function reindexAll(ctx: Ctx): Promise<{ skills: number; sources: n
         entries.push(...toEntries(rec.id, scan.skills, (d) => d));
       }
     } catch (err) {
-      ctx.log(`warning: ${rec.id}: ${err instanceof Error ? err.message : String(err)}; skipped`);
+      ctx.log(`warning: ${rec.id}: ${esc(err instanceof Error ? err.message : String(err))}; skipped`);
     }
   }
   try {

@@ -128,7 +128,7 @@ A skill is a directory with a `SKILL.md` whose frontmatter (YAML) has `name` and
 
 ### Terminal output
 
-Names, descriptions, and the `load` header lose control characters and ANSI escapes in human output. `--json` output and `load` bodies are never changed.
+Names, descriptions, and the `load` header lose control characters and ANSI escapes in human output. `--json` output and `load` bodies are never changed. Scan warnings on stderr show control characters as `\xNN`.
 
 ## Install scan and `--allow-unsafe`
 

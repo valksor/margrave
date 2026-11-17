@@ -518,3 +518,22 @@ test("reindex: a rejection that is not an Error is logged as text and the source
     assert.deepEqual(logs, [`warning: ${id}: boom, not an Error; skipped`]);
   });
 });
+
+test("reindex: control characters in a failure message are logged as text", async (t) => {
+  await inStore(t, async (home) => {
+    const repo = await makeRepo();
+    const { id } = await installSource(repo.url, null, quiet);
+    const dir = path.join(home, "sources", id);
+
+    mock.restoreAll();
+    const real = fsp.realpath;
+    mock.method(fsp, "realpath", (p: string, ...rest: never[]) =>
+      String(p) === dir ? Promise.reject(new Error("bad \u001b[2J name")) : (real as (...a: unknown[]) => Promise<string>)(p, ...rest),
+    );
+    syncBuiltinESMExports();
+    const logs: string[] = [];
+    await reindexAll({ log: (m) => logs.push(m), allowUnsafe: false });
+    assert.deepEqual(logs, [`warning: ${id}: bad \\x1b[2J name; skipped`]);
+    assert.ok(!logs.join("").includes("\u001b"));
+  });
+});
