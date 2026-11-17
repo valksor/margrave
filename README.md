@@ -209,7 +209,7 @@ A remote client sees these differences:
 - With no skills installed, the text is `no skills are installed on this server`.
 - An error caused by the client's input (unknown id, bad path) keeps its text. Any other error returns `the skill store on this server is not available; the server log has details`, and the full error goes to `console.error`.
 
-The handler serves every skill in the store, including any installed with `--allow-unsafe`.
+The handler serves every skill in the store, including any installed with `--allow-unsafe`. Skill ids carry the source id (see [Ids](#ids)), so a remote client sees the basename of a local source's directory, and the path of a `file://` git source.
 
 margrave does no auth, TLS, CORS, Host/Origin checks, or rate limiting. The host app must do them. Do not expose the handler without auth.
 
