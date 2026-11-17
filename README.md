@@ -16,7 +16,7 @@ Node 27 or newer. The repo pins `27.0.0-alpha.0.1.0` in `.nvmrc`. nvm hides alph
 nvm use && pnpm install --frozen-lockfile && pnpm run build && pnpm add -g "$PWD"
 ```
 
-`pnpm add -g` needs pnpm's global bin directory on `PATH`. If it is not there yet, run `pnpm setup` once and open a new shell.
+`pnpm run build` also makes sure ripwire is available (see [Where ripwire comes from](#where-ripwire-comes-from)). `pnpm add -g` needs pnpm's global bin directory on `PATH`. If it is not there yet, run `pnpm setup` once and open a new shell.
 
 ## 2. Install a skill source
 
@@ -110,9 +110,15 @@ This syntax was checked against `ripwire --help` and against a clean directory (
 |---|---|
 | 0 | continue, no output |
 | 1 (WARN) | print the summary and continue |
-| 2 (CRITICAL), 3 (could not read), any other code, output that cannot be parsed, or ripwire not on `PATH` | refuse |
+| 2 (CRITICAL), 3 (could not read), any other code, output that cannot be parsed, or ripwire found neither on `PATH` nor in `vendor/ripwire/` | refuse |
 
 `--allow-unsafe` overrides a refusal for that one `install` or `update` and prints what it overrode. Git sources are scanned in staging, so `update` never leaves an unscanned revision live. Local sources are scanned on `install`. `update` on a local source only reindexes.
+
+### Where ripwire comes from
+
+margrave runs `ripwire` from `PATH` first. When `PATH` has none, it runs `vendor/ripwire/ripwire` in the package root. `pnpm run build` runs `scripts/ensure-ripwire.mjs`, which does nothing when `ripwire` is on `PATH` or `vendor/ripwire/` already holds the pinned version. Otherwise it downloads the pinned ripwire release (0.6.10 from [redhat-et/ripwire](https://github.com/redhat-et/ripwire)), checks the SHA-256 that is hard-coded in the script, and unpacks only the binary and its `LICENSE` into `vendor/ripwire/` (git-ignored). A failed download or checksum fails the build.
+
+Prebuilt ripwire exists for linux-x64, linux-arm64, and macos-arm64. On any other platform the build prints a warning and you install ripwire yourself (see its `INSTALL.md`) and put it on `PATH`. Without ripwire, `install` and `update` refuse.
 
 ### Short output
 
@@ -185,6 +191,6 @@ A missing `sources.json` is an empty list. A malformed one is an error, and marg
 
 ```sh
 nvm use && pnpm install --frozen-lockfile
-pnpm run build  # tsrs, then chmod +x dist/cli.js
+pnpm run build  # tsrs, chmod +x dist/cli.js, then scripts/ensure-ripwire.mjs
 pnpm test       # node --test test/ (runs the .ts sources directly; no network, temp MARGRAVE_HOME)
 ```

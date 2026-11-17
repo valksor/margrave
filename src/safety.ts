@@ -6,8 +6,10 @@
 // refuses only on findings that the installed copy does not have.
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { isInside } from "./scan.ts";
 import { MargraveError, atomicWrite, reportsRoot } from "./store.ts";
 
@@ -30,6 +32,8 @@ export interface ScanOptions {
    * Left out for `install`, which has nothing to compare against.
    */
   baselineDir?: string | null;
+  /** Where to look for ripwire when PATH has none. Tests only: the default is the vendored binary in the package root. */
+  vendored?: string;
 }
 
 type Sev = "warn" | "critical";
@@ -63,10 +67,13 @@ interface Execed {
   missing: boolean;
 }
 
-function run(dir: string): Promise<Execed> {
+/** The ripwire that `pnpm build` (scripts/ensure-ripwire.mjs) and the release bundles put in the package root. */
+export const VENDORED_RIPWIRE = fileURLToPath(new URL("../vendor/ripwire/ripwire", import.meta.url));
+
+function exec(bin: string, dir: string): Promise<Execed> {
   return new Promise((resolve) => {
     execFile(
-      "ripwire",
+      bin,
       ["security", `--scan-skills=${dir}`],
       { maxBuffer: 64 * 1024 * 1024, encoding: "utf8" },
       (err, stdout, stderr) => {
@@ -79,6 +86,13 @@ function run(dir: string): Promise<Execed> {
       },
     );
   });
+}
+
+/** `ripwire` from PATH first. The vendored binary only when PATH has none. `missing` is true when both are absent. */
+export async function runRipwire(dir: string, vendored: string = VENDORED_RIPWIRE): Promise<Execed> {
+  const r = await exec("ripwire", dir);
+  if (!r.missing || !existsSync(vendored)) return r;
+  return exec(vendored, dir);
 }
 
 // ---- parsing ----
@@ -195,18 +209,18 @@ async function toFinding(row: Row, realRoot: string, cache: Map<string, FileInfo
 }
 
 /** Run ripwire on `dir` and sort the result into clean, findings, or failed. */
-async function runScan(dir: string): Promise<ScanResult> {
+async function runScan(dir: string, vendored: string): Promise<ScanResult> {
   let realRoot: string;
   try {
     realRoot = await realpath(dir);
   } catch {
     return { status: "failed", code: null, reason: `cannot resolve the scan root ${dir}`, detail: "", xml: null };
   }
-  const r = await run(realRoot);
+  const r = await runRipwire(realRoot, vendored);
   const stderr = r.stderr.trim();
   const detail = stderr !== "" ? stderr : r.stdout.trim();
   if (r.code === 0) return { status: "clean" };
-  if (r.missing) return { status: "failed", code: null, reason: "ripwire was not found on PATH", detail, xml: null };
+  if (r.missing) return { status: "failed", code: null, reason: `ripwire was not found on PATH or at ${vendored}`, detail, xml: null };
   if (r.code === 3) return { status: "failed", code: 3, reason: "ripwire could not read the files (exit 3)", detail, xml: null };
   if (r.code !== 1 && r.code !== 2) {
     return { status: "failed", code: typeof r.code === "number" ? r.code : null, reason: `ripwire failed (exit ${String(r.code)})`, detail, xml: null };
@@ -347,7 +361,7 @@ function clipDetail(detail: string): string {
  * `allowUnsafe` overrides a refusal.
  */
 export async function scanWithRipwire(dir: string, opts: ScanOptions): Promise<ScanOutcome> {
-  const res = await runScan(dir);
+  const res = await runScan(dir, opts.vendored ?? VENDORED_RIPWIRE);
   if (res.status === "clean") return { code: 0, overridden: false };
 
   const reportFile = path.join(reportsRoot(), `${opts.sourceId}.xml`);
@@ -360,7 +374,7 @@ export async function scanWithRipwire(dir: string, opts: ScanOptions): Promise<S
   // The baseline scan runs on the installed copy, before the caller swaps anything.
   let cmp: Compared | null = null;
   if (opts.baselineDir !== undefined) {
-    const base = opts.baselineDir === null ? null : await runScan(opts.baselineDir);
+    const base = opts.baselineDir === null ? null : await runScan(opts.baselineDir, opts.vendored ?? VENDORED_RIPWIRE);
     let why = "the installed copy is missing";
     if (base?.status === "failed") why = base.reason;
     if (base?.status === "clean" || base?.status === "findings") {

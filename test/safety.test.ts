@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { esc, parseScanXml, scanWithRipwire } from "../src/safety.ts";
+import { esc, parseScanXml, runRipwire, scanWithRipwire } from "../src/safety.ts";
 import { MargraveError } from "../src/store.ts";
 import { fakeRipwire, tmp } from "./helpers.ts";
 
@@ -108,8 +109,12 @@ async function scanDir(lines: Record<string, string>): Promise<string> {
   return dir;
 }
 
-const opts = (logs: string[], over: { allowUnsafe?: boolean; baselineDir?: string | null } = {}) => ({
+// No vendored ripwire for these tests: a developer's real vendor/ripwire must not change what they check.
+const NO_VENDOR = path.join(tmpdir(), "mg-no-vendored-ripwire", "ripwire");
+
+const opts = (logs: string[], over: { allowUnsafe?: boolean; baselineDir?: string | null; vendored?: string } = {}) => ({
   allowUnsafe: over.allowUnsafe ?? false,
+  vendored: over.vendored ?? NO_VENDOR,
   log: (m: string) => logs.push(m),
   sourceId: "src",
   skills: [] as { name: string; dir: string }[],
@@ -205,6 +210,82 @@ test("ripwire missing from PATH refuses; --allow-unsafe overrides", async () => 
     process.env["PATH"] = prev.PATH;
     if (prev.HOME === undefined) delete process.env["MARGRAVE_HOME"];
     else process.env["MARGRAVE_HOME"] = prev.HOME;
+  }
+});
+
+// ---- ripwire lookup: PATH first, vendored binary second ----
+
+/** A ripwire stand-in that exits 3 and names itself on stderr, so a test can tell which binary ran. */
+async function namedRipwire(name: string): Promise<string> {
+  const dir = await tmp("mg-named-");
+  const file = path.join(dir, "ripwire");
+  await writeFile(file, `#!/bin/sh\necho ${name} >&2\nexit 3\n`);
+  await chmod(file, 0o755);
+  return file;
+}
+
+async function withPath<T>(value: string, fn: () => Promise<T>): Promise<T> {
+  const prev = process.env["PATH"];
+  process.env["PATH"] = value;
+  try {
+    return await fn();
+  } finally {
+    process.env["PATH"] = prev;
+  }
+}
+
+test("ripwire on PATH wins over the vendored binary", async () => {
+  const onPath = path.dirname(await namedRipwire("from-path"));
+  const vendored = await namedRipwire("from-vendor");
+  const r = await withPath(onPath, () => runRipwire("/nonexistent", vendored));
+  assert.equal(r.missing, false);
+  assert.equal(r.code, 3);
+  assert.match(r.stderr, /from-path/u);
+});
+
+test("the vendored binary runs when PATH has no ripwire", async () => {
+  const vendored = await namedRipwire("from-vendor");
+  const r = await withPath(await tmp("mg-emptybin-"), () => runRipwire("/nonexistent", vendored));
+  assert.equal(r.missing, false);
+  assert.equal(r.code, 3);
+  assert.match(r.stderr, /from-vendor/u);
+});
+
+test("ripwire is missing only when PATH and the vendored path both lack it", async () => {
+  const none = path.join(await tmp("mg-novendor-"), "ripwire");
+  const r = await withPath(await tmp("mg-emptybin-"), () => runRipwire("/nonexistent", none));
+  assert.equal(r.missing, true);
+});
+
+test("the refusal for a missing ripwire names the vendored path", async () => {
+  const empty = await tmp("mg-emptybin-");
+  const home = await tmp("mg-home-");
+  const vendored = path.join(await tmp("mg-novendor-"), "ripwire");
+  const prevHome = process.env["MARGRAVE_HOME"];
+  process.env["MARGRAVE_HOME"] = home;
+  try {
+    await assert.rejects(
+      withPath(empty, () => scanWithRipwire(empty, opts([], { vendored }))),
+      (err: unknown) => err instanceof MargraveError && err.message.includes(`not found on PATH or at ${vendored}`),
+    );
+  } finally {
+    if (prevHome === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prevHome;
+  }
+});
+
+test("scanWithRipwire scans with the vendored binary when PATH has no ripwire", async () => {
+  const empty = await tmp("mg-emptybin-");
+  const home = await tmp("mg-home-");
+  const vendored = path.join(await fakeRipwire(), "ripwire");
+  const prevHome = process.env["MARGRAVE_HOME"];
+  process.env["MARGRAVE_HOME"] = home;
+  try {
+    const r = await withPath(empty, () => scanWithRipwire(empty, opts([], { vendored })));
+    assert.equal(r.code, 0);
+  } finally {
+    if (prevHome === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prevHome;
   }
 });
 
