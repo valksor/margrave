@@ -53,6 +53,7 @@ export function home(): string {
 
 export const sourcesRoot = (): string => path.join(home(), "sources");
 export const stagingRoot = (): string => path.join(home(), "staging");
+export const reportsRoot = (): string => path.join(home(), "reports");
 export const sourcesFile = (): string => path.join(home(), "sources.json");
 export const indexFile = (): string => path.join(home(), "index.json");
 

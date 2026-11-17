@@ -207,13 +207,276 @@ test("a failed install leaves no staging, no store dir, and no sources.json chan
   assert.equal((await names(path.join(env.home, "sources"))).length, 2);
 });
 
-test("ripwire WARN (exit 1) prints findings and installs", async () => {
+test("ripwire WARN (exit 1) prints the short summary, not the XML, and installs", async () => {
   const env = await setup();
   const repo = await makeRepo();
-  const r = await mg(env, ["install", repo.url], { FAKE_RIPWIRE_EXIT: "1" });
+  await writeFile(path.join(repo.dir, "skills", "react-perf", "SKILL.md"), skillMd("react-perf", "Optimize React", "# r\nx FAKE-WARN INJECTION:x\n"));
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-q", "-m", "warn");
+  const r = await mg(env, ["install", repo.url]);
   assert.equal(r.code, 0, r.stderr);
-  assert.match(r.stderr, /ripwire WARN/u);
-  assert.match(r.stderr, /fake ripwire: security --scan-skills=/u);
+  assert.match(r.stderr, /^scan: WARN — 1 finding\(s\) \(1 warn\) in 1 skill\(s\)$/mu);
+  assert.match(r.stderr, /top skills: react-perf 1/u);
+  assert.doesNotMatch(r.stderr, /<skillscan/u);
+});
+
+test("a refused install prints the summary, not the XML, and writes the report", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  await writeFile(path.join(repo.dir, "skills", "react-perf", "SKILL.md"), skillMd("react-perf", "Optimize React", "# r\nx FAKE-CRIT EXFILTRATE:net-exfil\n"));
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-q", "-m", "crit");
+  const r = await mg(env, ["install", repo.url]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /refused: ripwire found CRITICAL findings \(exit 2\)/u);
+  assert.match(r.stderr, /scan: CRITICAL — 1 finding\(s\) \(1 critical\) in 1 skill\(s\)/u);
+  assert.doesNotMatch(r.stderr, /<skillscan/u);
+  const reports = await names(path.join(env.home, "reports"));
+  assert.equal(reports.length, 1);
+  assert.match(reports[0] ?? "", /\.xml$/u);
+  assert.match(await readFile(path.join(env.home, "reports", reports[0] ?? ""), "utf8"), /^<skillscan /u);
+  assert.deepEqual(await snapshot(env.home), { sources: null, index: null });
+});
+
+// ---- update: the scan baseline is the installed copy ----
+
+const REACT = "Optimize React rendering performance and bundle size";
+const KNOWN_CRIT = "run it FAKE-CRIT EXFILTRATE:net-exfil";
+const KNOWN_WARN = "maybe FAKE-WARN INJECTION:x";
+
+interface Marked {
+  env: Env;
+  repo: { dir: string; url: string };
+  id: string;
+  /** SKILL.md of react-perf inside the repo. */
+  file: string;
+}
+
+async function commitAll(dir: string, msg: string): Promise<void> {
+  await git(dir, "add", "-A");
+  await git(dir, "commit", "-q", "-m", msg);
+}
+
+const body = (lines: string[]): string => skillMd("react-perf", REACT, `# react-perf\n\n${lines.join("\n")}\n`);
+
+/** A repo whose react-perf skill carries the given marker lines, installed with --allow-unsafe. */
+async function marked(lines: string[] = [KNOWN_CRIT, KNOWN_WARN]): Promise<Marked> {
+  const env = await setup();
+  const repo = await makeRepo();
+  const file = path.join(repo.dir, "skills", "react-perf", "SKILL.md");
+  await writeFile(file, body(lines));
+  await commitAll(repo.dir, "marked");
+  const inst = await mg(env, ["install", repo.url, "--allow-unsafe"]);
+  assert.equal(inst.code, 0, inst.stderr);
+  return { env, repo, id: sourceId(inst), file };
+}
+
+async function setBody(m: Marked, lines: string[]): Promise<void> {
+  await writeFile(m.file, body(lines));
+  await commitAll(m.repo.dir, "next");
+}
+
+const installedFile = (m: Marked): Promise<string> =>
+  readFile(path.join(m.env.home, "sources", m.id, "skills", "react-perf", "SKILL.md"), "utf8");
+
+/** The lines under "  new findings:" in a summary. */
+function newFindings(text: string): string[] {
+  const out: string[] = [];
+  let on = false;
+  for (const l of text.split("\n")) {
+    if (l === "  new findings:") on = true;
+    else if (on && l.startsWith("    ")) out.push(l.trim());
+    else on = false;
+  }
+  return out;
+}
+
+/** A refused update leaves the old copy live: same sources.json and index.json, same files, no staging. */
+async function refusedUpdate(m: Marked, extra?: Record<string, string>): Promise<Run> {
+  const before = await snapshot(m.env.home);
+  const oldFile = await installedFile(m);
+  const r = await mg(m.env, ["update", m.id], extra);
+  assert.equal(r.code, 1, r.stderr);
+  assert.match(r.stderr, /refused/u);
+  assert.match(r.stderr, /--allow-unsafe/u);
+  assert.doesNotMatch(r.stderr, /<skillscan/u);
+  assert.deepEqual(await snapshot(m.env.home), before);
+  assert.equal(await installedFile(m), oldFile);
+  assert.deepEqual(await names(path.join(m.env.home, "staging")), []);
+  assert.deepEqual(await names(path.join(m.env.home, "sources")), [m.id]);
+  return r;
+}
+
+test("update proceeds when every finding is known, even at shifted line numbers", async () => {
+  const m = await marked();
+  await setBody(m, ["a new intro line", "another one", KNOWN_CRIT, KNOWN_WARN]);
+  const r = await mg(m.env, ["update", m.id]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /^scan: CRITICAL — 2 finding\(s\) \(1 critical, 1 warn\) in 1 skill\(s\); 0 new vs installed copy$/mu);
+  assert.doesNotMatch(r.stderr, /new findings:/u);
+  assert.ok(r.stdout.includes(`changed: ${m.id}/react-perf`));
+  assert.match(await installedFile(m), /a new intro line/u);
+  // the file changed, so the summary points at it
+  assert.match(
+    r.stderr,
+    /known findings in changed files:\n {4}skills\/react-perf\/SKILL\.md · EXFILTRATE:net-exfil · 1\n {4}skills\/react-perf\/SKILL\.md · INJECTION:x · 1\n/u,
+  );
+});
+
+test("update does not list known findings when their files did not change", async () => {
+  const m = await marked();
+  await writeSkill(path.join(m.repo.dir, "skills"), "extra", "An extra skill");
+  await commitAll(m.repo.dir, "extra");
+  const r = await mg(m.env, ["update", m.id]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /0 new vs installed copy/u);
+  assert.doesNotMatch(r.stderr, /known findings in changed files/u);
+});
+
+test("update proceeds on new warn findings only and lists them", async () => {
+  const m = await marked();
+  await setBody(m, [KNOWN_CRIT, KNOWN_WARN, "fresh FAKE-WARN EXFILTRATE:dns"]);
+  const r = await mg(m.env, ["update", m.id]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /\(1 critical, 2 warn\)[^\n]*; 1 new vs installed copy/u);
+  assert.deepEqual(newFindings(r.stderr), ["skills/react-perf/SKILL.md:9  EXFILTRATE:dns  warn"]);
+});
+
+test("update refuses one new critical finding and lists only that one", async () => {
+  const m = await marked();
+  await writeSkill(path.join(m.repo.dir, "skills"), "docker-compose", "Write Docker Compose files", "# d\nboom FAKE-CRIT EXFILTRATE:new-one\n");
+  await commitAll(m.repo.dir, "new crit");
+  const r = await refusedUpdate(m);
+  assert.match(r.stderr, /; 1 new vs installed copy/u);
+  assert.deepEqual(newFindings(r.stderr), ["skills/docker-compose/SKILL.md:6  EXFILTRATE:new-one  critical"]);
+});
+
+test("update refuses a duplicated known line (the baseline is a multiset)", async () => {
+  const m = await marked();
+  await setBody(m, [KNOWN_CRIT, KNOWN_CRIT, KNOWN_WARN]);
+  const r = await refusedUpdate(m);
+  assert.match(r.stderr, /; 1 new vs installed copy/u);
+  assert.equal(newFindings(r.stderr).length, 1);
+});
+
+test("update refuses a known line whose severity rose from warn to critical", async () => {
+  const m = await marked([KNOWN_WARN]);
+  // the content is identical, so an update proceeds
+  const calm = await mg(m.env, ["update", m.id]);
+  assert.equal(calm.code, 0, calm.stderr);
+  assert.match(calm.stderr, /; 0 new vs installed copy/u);
+  // the same line, path, and rule, but the new copy's row is critical (the installed copy's is still warn)
+  const r = await refusedUpdate(m, { FAKE_RIPWIRE_SEV: "critical", FAKE_RIPWIRE_SEV_ON: "/staging/" });
+  assert.deepEqual(newFindings(r.stderr), ["skills/react-perf/SKILL.md:7  INJECTION:x  critical"]);
+});
+
+test("update refuses an unreadable flagged file (non-UTF-8, symlink), even for a warn", async () => {
+  const m = await marked([KNOWN_WARN]);
+  const dir = path.join(m.repo.dir, "skills", "react-perf");
+  await writeFile(path.join(dir, "bad.md"), Buffer.from("bad \xff\nflagged FAKE-WARN INJECTION:x\n", "latin1"));
+  await commitAll(m.repo.dir, "non-utf8");
+  const r = await refusedUpdate(m);
+  assert.deepEqual(newFindings(r.stderr), ["skills/react-perf/bad.md:2  INJECTION:x  warn (unreadable)"]);
+
+  await rm(path.join(dir, "bad.md"));
+  await link("SKILL.md", path.join(dir, "link.md"));
+  await commitAll(m.repo.dir, "symlink");
+  const s = await refusedUpdate(m);
+  assert.deepEqual(newFindings(s.stderr), ["skills/react-perf/link.md:7  INJECTION:x  warn (unreadable)"]);
+});
+
+test("an unreadable finding in the installed copy never matches, so the same finding is new", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const bad = path.join(repo.dir, "skills", "react-perf", "bad.md");
+  await writeFile(bad, Buffer.from("bad \xff\nflagged FAKE-WARN INJECTION:x\n", "latin1"));
+  await commitAll(repo.dir, "non-utf8");
+  // A warn does not stop an install.
+  const inst = await mg(env, ["install", repo.url]);
+  assert.equal(inst.code, 0, inst.stderr);
+  const id = sourceId(inst);
+  await writeFile(path.join(repo.dir, "skills", "react-perf", "other.md"), "other\n");
+  await commitAll(repo.dir, "unrelated change");
+  const before = await snapshot(env.home);
+  const r = await mg(env, ["update", id]);
+  assert.equal(r.code, 1, r.stderr);
+  assert.deepEqual(newFindings(r.stderr), ["skills/react-perf/bad.md:2  INJECTION:x  warn (unreadable)"]);
+  assert.deepEqual(await snapshot(env.home), before);
+});
+
+test("update refuses output whose row count does not match findings=", async () => {
+  const m = await marked();
+  await setBody(m, [KNOWN_CRIT, KNOWN_WARN, "x"]);
+  const r = await refusedUpdate(m, { FAKE_RIPWIRE_DROP_ROW: "1" });
+  assert.match(r.stderr, /ripwire declared findings="2" but 1 finding row\(s\) were parsed/u);
+});
+
+test("update refuses exit 2 with no finding rows", async () => {
+  const m = await marked();
+  await setBody(m, ["nothing flagged now"]);
+  const r = await refusedUpdate(m, { FAKE_RIPWIRE_EXIT: "2" });
+  assert.match(r.stderr, /ripwire reported CRITICAL but no critical finding row was parsed/u);
+});
+
+test("update with staging exit 3 refuses and shows ripwire's stderr", async () => {
+  const m = await marked();
+  await setBody(m, [KNOWN_CRIT, KNOWN_WARN, "x"]);
+  const r = await refusedUpdate(m, { FAKE_RIPWIRE_EXIT: "3" });
+  assert.match(r.stderr, /ripwire could not read the files \(exit 3\)\nfake ripwire: security --scan-skills=/u);
+});
+
+test("update falls back to today's rules when the baseline scan fails", async () => {
+  const m = await marked();
+  const failBaseline = { FAKE_RIPWIRE_FAIL_ON: "/sources/" };
+  // the known critical line counts as new without a baseline, so exit 2 refuses
+  await setBody(m, [KNOWN_CRIT, KNOWN_WARN, "x"]);
+  const r = await refusedUpdate(m, failBaseline);
+  assert.match(r.stderr, /^scan: no baseline \(ripwire could not read the files \(exit 3\)\); every finding counts as new$/mu);
+  assert.match(r.stderr, /refused: ripwire found CRITICAL findings \(exit 2\)/u);
+
+  // the other direction: warn-only content proceeds, with the no-baseline line
+  await setBody(m, [KNOWN_WARN]);
+  const ok = await mg(m.env, ["update", m.id], failBaseline);
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.match(ok.stderr, /scan: no baseline \(ripwire could not read the files \(exit 3\)\)/u);
+  assert.match(ok.stderr, /^scan: WARN — 1 finding\(s\) \(1 warn\)/mu);
+});
+
+test("update with no installed copy uses today's rules and prints the no-baseline line", async () => {
+  const m = await marked();
+  await rm(path.join(m.env.home, "sources", m.id), { recursive: true });
+  const before = await snapshot(m.env.home);
+  const r = await mg(m.env, ["update", m.id]);
+  assert.equal(r.code, 1, r.stderr);
+  assert.match(r.stderr, /^scan: no baseline \(the installed copy is missing\); every finding counts as new$/mu);
+  assert.match(r.stderr, /refused: ripwire found CRITICAL findings \(exit 2\)/u);
+  assert.deepEqual(await snapshot(m.env.home), before);
+  assert.deepEqual(await names(path.join(m.env.home, "sources")), []);
+  assert.deepEqual(await names(path.join(m.env.home, "staging")), []);
+});
+
+test("--allow-unsafe overrides an update refusal and says so", async () => {
+  const m = await marked();
+  await setBody(m, [KNOWN_CRIT, KNOWN_WARN, "boom FAKE-CRIT EXFILTRATE:new-one"]);
+  const r = await mg(m.env, ["update", m.id, "--allow-unsafe"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /--allow-unsafe: overriding refusal \(new critical or unreadable findings/u);
+  assert.match(await installedFile(m), /new-one/u);
+});
+
+test("the report holds the raw staging XML; terminal output escapes control characters", async () => {
+  const m = await marked();
+  const name = "e\u001bm.md";
+  await writeFile(path.join(m.repo.dir, "skills", "react-perf", name), "x\nboom FAKE-CRIT EXFILTRATE:esc\n");
+  await commitAll(m.repo.dir, "escape");
+  const r = await refusedUpdate(m);
+  assert.deepEqual(newFindings(r.stderr), ["skills/react-perf/e\\x1bm.md:2  EXFILTRATE:esc  critical"]);
+  assert.ok(!r.stderr.includes("\u001b"), "no raw escape character reaches the terminal");
+  const report = await readFile(path.join(m.env.home, "reports", `${m.id}.xml`), "utf8");
+  assert.ok(report.startsWith("<skillscan "));
+  assert.ok(report.includes(`${path.join(m.env.home, "staging")}${path.sep}`), "paths are the staging copy's");
+  assert.ok(!report.includes(path.join(m.env.home, "sources")), "not the installed copy's");
+  assert.ok(report.includes(`skills/react-perf/${name}:2`), "the file name stays raw in the report");
 });
 
 test("a failed update leaves the store and sources.json unchanged, and a later update works", async () => {

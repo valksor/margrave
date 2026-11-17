@@ -51,7 +51,7 @@ margrave load <id from the result>
 | Command | What it does |
 |---|---|
 | `margrave install <spec> [--ref R] [--allow-unsafe]` | Add a source. A git source is cloned into staging, scanned, indexed, then moved into the store. Any failure leaves the store and `sources.json` unchanged. A source with 0 valid skills is a failure. An id that already exists is an error. `--ref` is a branch or tag. It is not allowed with a local source. |
-| `margrave update [source] [--allow-unsafe]` | Git: fresh `git clone --depth 1` of the stored ref into staging, scan, then swap. A source installed without `--ref` is pinned to the branch the remote's default pointed to at install time, so `update` never jumps to a new default branch. Prints `old → new` commits and the skill ids added, changed (by `SKILL.md` hash), and removed. On any error the old copy stays untouched. Local: reindex only. With no argument it updates every source. |
+| `margrave update [source] [--allow-unsafe]` | Git: fresh `git clone --depth 1` of the stored ref into staging, scan (against the installed copy, see below), then swap. A source installed without `--ref` is pinned to the branch the remote's default pointed to at install time, so `update` never jumps to a new default branch. Prints `old → new` commits and the skill ids added, changed (by `SKILL.md` hash), and removed. On any error the old copy stays untouched. Local: reindex only. With no argument it updates every source. |
 | `margrave remove <source>` | Git: deletes `sources/<id>` after checking it is a direct child of `sources/`. Local: unregisters only. It never deletes your directory. |
 | `margrave list [--skills] [--json]` | Sources with kind, ref, commit, and skill count. `--skills` adds every skill id and its description. |
 | `margrave find "<task>" [--limit N] [--json]` | BM25 top N (default 5, clamped to 1..25). Prints qualified id, score, and description, then `load: margrave load <id>`. With no match it exits 0 and prints `no match`. |
@@ -106,11 +106,44 @@ This syntax was checked against `ripwire --help` and against a clean directory (
 
 | ripwire exit | margrave |
 |---|---|
-| 0 | continue |
-| 1 (WARN) | print the findings and continue |
-| 2 (CRITICAL), 3 (could not read), any other code, or ripwire not on `PATH` | refuse |
+| 0 | continue, no output |
+| 1 (WARN) | print the summary and continue |
+| 2 (CRITICAL), 3 (could not read), any other code, output that cannot be parsed, or ripwire not on `PATH` | refuse |
 
 `--allow-unsafe` overrides a refusal for that one `install` or `update` and prints what it overrode. Git sources are scanned in staging, so `update` never leaves an unscanned revision live. Local sources are scanned on `install`. `update` on a local source only reindexes.
+
+### Short output
+
+Every scan prints a summary, never the raw XML:
+
+```
+scan: CRITICAL — 157 finding(s) (156 critical, 1 warn) in 41 skill(s); 0 new vs installed copy
+  by rule:   EXFILTRATE:net-exfil 150 · EXFILTRATE:ssh-aws-creds 3 · …
+  top skills: testing-for-sensitive-data-exposure 14 · exploiting-idor-vulnerabilities 13 · …
+  new findings:            (update only, up to 20)
+  known findings in changed files:   (update only, up to 10)
+  full report: <MARGRAVE_HOME>/reports/<source-id>.xml
+```
+
+For every scan that is not clean, ripwire's raw XML for the new copy is written to `reports/<source-id>.xml` (the latest one only). Paths, skill names, and rules from the scanned repo are shown with control characters replaced by `\xNN`. The report file is not changed. When ripwire fails (exit 3, another code, unparseable output), margrave shows ripwire's stderr, or its output when stderr is empty, up to 40 lines.
+
+### Baseline on `update`
+
+The baseline is the installed copy in `sources/<id>/`: what you accepted, either because it was clean or because you installed it with `--allow-unsafe`. `update` of a git source scans both the installed copy and the new copy, then refuses only on findings that the installed copy does not have. Nothing is stored for this. A source installed before this rule gets its baseline from its first `update`. `update` therefore runs ripwire twice (the baseline scan is skipped when the new copy is clean).
+
+A finding is identified by `(path inside the source, rule, severity, sha256 of the trimmed flagged line)`. The line number is not part of it, so an edit elsewhere in a file creates no new finding. Findings are compared as a multiset: a second copy of a known line is new. Severity `warn` is warn; any other value counts as critical, and a rise from warn to critical is new.
+
+| Situation | Outcome |
+|---|---|
+| The new copy is clean, or every finding is in the installed copy | continue |
+| New findings, all warn | continue, new findings listed |
+| Any new critical finding, or a finding whose line cannot be read | refuse, new findings listed |
+| The new scan fails (exit 3, another code, unparseable output, ripwire missing) | refuse |
+| No baseline: the installed copy is missing, or its scan fails | print `scan: no baseline (<reason>); every finding counts as new` and apply the `install` rules |
+
+A flagged line cannot be read when its file is a symlink or has a symlink in its path, is outside the scan root, is not valid UTF-8, or the line number does not exist. Such a finding always counts as new, in the new copy and in the baseline. Output is unparseable when it has no `<skillscan>` element, its row count differs from `findings=`, it reports CRITICAL without a critical row, or it exits 1 without a row.
+
+Limit: the baseline compares the flagged line, not the lines around it. A known flagged line can be moved into a new context (for example out of an example block and into a "run this first" step) and the scan sees no change. To make this visible, the summary lists `known findings in changed files` (path, rule, count): known findings whose file differs between the two copies. Check those files before you trust `0 new`.
 
 ## MCP server
 
@@ -124,7 +157,7 @@ This syntax was checked against `ripwire --help` and against a clean directory (
 
 ## Ranking
 
-BM25F with k1 = 1.2 and b = 0.75. Field weights: name 3, description 2, headings 1, body 0.3. The first 2000 body tokens are indexed. Tokens are lowercased, split on non-alphanumerics, stripped of stopwords, and lightly stemmed. An exact match of the query to a name or id adds a fixed bonus. Ties break by id ascending.
+BM25F with k1 = 1.2 and b = 0.75. Field weights: name 3, description 2, headings 1, body 0.3. The first 2000 body tokens are indexed. Tokens are lowercased, split on non-alphanumerics, stripped of stopwords, and stemmed with the Porter algorithm (the `stemmer` package). The stopword check runs on the word and again on its stem. An exact match of the query to a name or id adds a fixed bonus. Ties break by id ascending.
 
 ## Store
 

@@ -289,10 +289,10 @@ async function installLocal(spec: string, dir: string, ctx: Ctx): Promise<Instal
   if (sources.some((s) => s.id === id)) throw duplicate(id);
   const old = await currentIndex(sources);
 
-  await scanWithRipwire(real, ctx);
   const scan = await scanSource(real, { followSymlinks: true });
   logWarnings(ctx, scan.warnings);
   if (scan.skills.length === 0) throw new MargraveError(`no valid skills (SKILL.md with name and description) found in ${real}`);
+  await scanWithRipwire(real, { ...ctx, sourceId: id, skills: scan.skills });
 
   const entries = toEntries(id, scan.skills, (d) => d);
   const record: SourceRecord = {
@@ -339,14 +339,15 @@ async function installGit(
     // No --ref: pin the branch the remote's default resolved to, so a later
     // `update` stays on it even if the remote changes its default branch.
     const pinned = ref ?? (await git(["-C", clone, "symbolic-ref", "--short", "HEAD"])).trim();
-    const scanRoot = await resolveScanRoot(clone, parsed.subpath);
-    await scanWithRipwire(scanRoot, ctx);
-    const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: clone });
+    const realClone = await realpath(clone);
+    const scanRoot = await realpath(await resolveScanRoot(realClone, parsed.subpath));
+    const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone });
     logWarnings(ctx, scan.warnings);
     if (scan.skills.length === 0) {
       throw new MargraveError(`no valid skills (SKILL.md with name and description) found in ${spec}`);
     }
-    const entries = toEntries(id, scan.skills, (d) => path.join(final, path.relative(clone, d)));
+    await scanWithRipwire(scanRoot, { ...ctx, sourceId: id, skills: scan.skills });
+    const entries = toEntries(id, scan.skills, (d) => path.join(final, path.relative(realClone, d)));
     const record: SourceRecord = {
       id,
       kind: "git",
@@ -432,12 +433,15 @@ async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
   return withStaging(async (stage) => {
     const clone = path.join(stage, "repo");
     const sha = await gitClone(url, rec.ref, clone);
-    const scanRoot = await resolveScanRoot(clone, rec.subpath);
-    await scanWithRipwire(scanRoot, ctx);
-    const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: clone });
+    const realClone = await realpath(clone);
+    const scanRoot = await realpath(await resolveScanRoot(realClone, rec.subpath));
+    const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone });
     logWarnings(ctx, scan.warnings);
     if (scan.skills.length === 0) throw new MargraveError(`no valid skills found in the new revision of ${id}; kept the old copy`);
-    const entries = toEntries(id, scan.skills, (d) => path.join(final, path.relative(clone, d)));
+    // The baseline: the installed copy, scanned before the swap. It is what the user accepted.
+    const baselineDir = await installedScanRoot(final, rec.subpath);
+    await scanWithRipwire(scanRoot, { ...ctx, sourceId: id, skills: scan.skills, baselineDir });
+    const entries = toEntries(id, scan.skills, (d) => path.join(final, path.relative(realClone, d)));
     const nextSources = sources.map((s) => (s.id === id ? { ...s, commit: sha } : s));
 
     // Swap: old dir aside, new dir in, then write. Roll back on failure.
@@ -459,6 +463,16 @@ async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
     }
     return { id, kind: "git" as const, oldCommit: rec.commit, newCommit: sha, ...diffEntries(oldEntries, entries) };
   });
+}
+
+/** The real scan root inside the installed copy of a git source, or null when it is not there. */
+async function installedScanRoot(final: string, subpath: string): Promise<string | null> {
+  if ((await lstat(final).catch(() => null)) === null) return null;
+  try {
+    return await realpath(await resolveScanRoot(await realpath(final), subpath));
+  } catch {
+    return null;
+  }
 }
 
 async function scanLocal(rec: SourceRecord, ctx: Ctx): Promise<IndexEntry[]> {

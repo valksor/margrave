@@ -11,11 +11,61 @@ export async function tmp(prefix = "mg-"): Promise<string> {
   return realpath(await mkdtemp(path.join(tmpdir(), prefix)));
 }
 
-/** A fake ripwire that exits with $FAKE_RIPWIRE_EXIT (default 0) and prints a marker line. */
+/**
+ * A fake ripwire, content-driven. It reads --scan-skills=<dir> and finds the marker lines
+ * `FAKE-CRIT <rule>` and `FAKE-WARN <rule>` in that dir (symlinked files included). It prints real-shaped XML (absolute paths, findings=, verdict=)
+ * on stdout, a tally line on stderr, and exits 2, 1, or 0 to match. Env knobs:
+ *   FAKE_RIPWIRE_EXIT=<n>        force the exit code (3 and above print no XML)
+ *   FAKE_RIPWIRE_DROP_ROW=1      drop the last row, so findings= no longer matches
+ *   FAKE_RIPWIRE_SEV=<sev>       override every row's severity
+ *   FAKE_RIPWIRE_SEV_ON=<text>   with SEV: only when the scanned dir path contains <text>
+ *   FAKE_RIPWIRE_FAIL_ON=<text>  exit 3 when the scanned dir path contains <text>
+ * POSIX sh only: it must run under macOS /bin/sh with BSD grep and sed. The script has no `${` so
+ * that String.raw keeps it readable.
+ */
+const FAKE_RIPWIRE = String.raw`#!/bin/sh
+dir=
+for a in "$@"; do
+  case "$a" in --scan-skills=*) dir=$(printf '%s' "$a" | cut -c15-) ;; esac
+done
+echo "fake ripwire: $*" >&2
+if [ -n "$FAKE_RIPWIRE_FAIL_ON" ]; then
+  case "$dir" in *"$FAKE_RIPWIRE_FAIL_ON"*) echo "fake ripwire: cannot read $dir" >&2; exit 3 ;; esac
+fi
+forced=$FAKE_RIPWIRE_EXIT
+case "$forced" in ""|0|1|2) ;; *) exit "$forced" ;; esac
+tab=$(printf '\t')
+rows=$(find "$dir" -name .git -prune -o \( -type f -o -type l \) -exec grep -naE 'FAKE-(CRIT|WARN) ' {} /dev/null \; 2>/dev/null \
+  | sed -E "s/^(.*):([0-9]+):.*FAKE-(CRIT|WARN) ([^ ]*).*\$/\1$tab\2$tab\3$tab\4/")
+n=0; crit=0; body=; prev=
+while IFS="$tab" read -r p l m r; do
+  [ -n "$p" ] || continue
+  if [ "$m" = CRIT ]; then sev=critical; crit=$((crit + 1)); else sev=warn; fi
+  if [ -n "$FAKE_RIPWIRE_SEV" ]; then
+    case "$dir" in *"$FAKE_RIPWIRE_SEV_ON"*) sev=$FAKE_RIPWIRE_SEV ;; esac
+  fi
+  pe=$(printf '%s' "$p" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g')
+  n=$((n + 1))
+  prev=$body
+  body="$body<f p=\"$pe:$l\" rule=\"$r\" sev=\"$sev\"/>"
+done <<ROWS
+$rows
+ROWS
+if [ "$FAKE_RIPWIRE_DROP_ROW" = 1 ] && [ "$n" -gt 0 ]; then body=$prev; fi
+if [ "$crit" -gt 0 ]; then code=2; verdict=critical; elif [ "$n" -gt 0 ]; then code=1; verdict=warn; else code=0; verdict=clean; fi
+if [ -n "$forced" ]; then
+  code=$forced
+  case "$code" in 2) verdict=critical ;; 1) verdict=warn ;; *) verdict=clean ;; esac
+fi
+echo "ripwire scan: $n finding(s) total" >&2
+printf '<skillscan files="1" findings="%s" skipped="0" verdict="%s">%s</skillscan>\n' "$n" "$verdict" "$body"
+exit "$code"
+`;
+
 export async function fakeRipwire(): Promise<string> {
   const dir = await tmp("mg-fakebin-");
   const file = path.join(dir, "ripwire");
-  await writeFile(file, '#!/bin/sh\necho "fake ripwire: $*"\nexit "${FAKE_RIPWIRE_EXIT:-0}"\n');
+  await writeFile(file, FAKE_RIPWIRE);
   await chmod(file, 0o755);
   return dir;
 }

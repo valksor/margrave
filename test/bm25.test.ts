@@ -32,6 +32,27 @@ test("tokenizer maps e-final and y-final base words to the same stem as their in
   }
 });
 
+test("tokenizer keeps unrelated words apart (Porter does not strip a final e after a consonant-vowel-consonant)", () => {
+  for (const [a, b] of [
+    ["care", "car"],
+    ["hope", "hop"],
+    ["rate", "rat"],
+    ["node", "nod"],
+  ] as const) {
+    assert.notDeepEqual(tokenize(a), tokenize(b), `${a} and ${b} must not share a stem`);
+  }
+});
+
+test("note and noted keep a token that is not a stopword", () => {
+  assert.deepEqual(tokenize("note"), ["note"]);
+  assert.deepEqual(tokenize("noted"), ["note"]);
+});
+
+test("a stopword is dropped before stemming and again after it", () => {
+  assert.deepEqual(tokenize("used using use"), [], "stopword before stemming");
+  assert.deepEqual(tokenize("uses gets setting"), [], "stem is a stopword: us, get, set");
+});
+
 test("tokenizer stems -ing, -ed, -es, -s consistently", () => {
   assert.deepEqual(tokenize("testing"), ["test"]);
   assert.deepEqual(tokenize("tested"), ["test"]);
