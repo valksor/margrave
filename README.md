@@ -51,7 +51,7 @@ margrave load <id from the result>
 | Command | What it does |
 |---|---|
 | `margrave install <spec> [--ref R] [--allow-unsafe]` | Add a source. A git source is cloned into staging, scanned, indexed, then moved into the store. Any failure leaves the store and `sources.json` unchanged. A source with 0 valid skills is a failure. An id that already exists is an error. `--ref` is a branch or tag. It is not allowed with a local source. |
-| `margrave update [source] [--allow-unsafe]` | Git: fresh `git clone --depth 1` of the stored ref into staging, scan, then swap. Prints `old → new` commits and the skill ids added, changed (by `SKILL.md` hash), and removed. On any error the old copy stays untouched. Local: reindex only. With no argument it updates every source. |
+| `margrave update [source] [--allow-unsafe]` | Git: fresh `git clone --depth 1` of the stored ref into staging, scan, then swap. A source installed without `--ref` follows the remote's current default branch, so pin a branch or tag with `--ref` to stay on one line. Prints `old → new` commits and the skill ids added, changed (by `SKILL.md` hash), and removed. On any error the old copy stays untouched. Local: reindex only. With no argument it updates every source. |
 | `margrave remove <source>` | Git: deletes `sources/<id>` after checking it is a direct child of `sources/`. Local: unregisters only. It never deletes your directory. |
 | `margrave list [--skills] [--json]` | Sources with kind, ref, commit, and skill count. `--skills` adds every skill id and its description. |
 | `margrave find "<task>" [--limit N] [--json]` | BM25 top N (default 5, clamped to 1..25). Prints qualified id, score, and description, then `load: margrave load <id>`. With no match it exits 0 and prints `no match`. |
