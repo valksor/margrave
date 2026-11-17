@@ -1,5 +1,8 @@
 # margrave
 
+[![Test](https://github.com/valksor/margrave/actions/workflows/test.yml/badge.svg)](https://github.com/valksor/margrave/actions/workflows/test.yml)
+[![CodeQL](https://github.com/valksor/margrave/actions/workflows/codeql.yml/badge.svg)](https://github.com/valksor/margrave/actions/workflows/codeql.yml)
+
 margrave keeps agent skills (folders with a `SKILL.md`) in one store. It does not install them into any agent. An agent asks for what it needs in plain words, gets ranked suggestions, and loads one skill from the store.
 
 - `margrave find "<task>"` returns ranked skills.
@@ -17,6 +20,32 @@ nvm use && pnpm install --frozen-lockfile && pnpm run build && pnpm add -g "$PWD
 ```
 
 `pnpm run build` also makes sure ripwire is available (see [Where ripwire comes from](#where-ripwire-comes-from)). `pnpm add -g` needs pnpm's global bin directory on `PATH`. If it is not there yet, run `pnpm setup` once and open a new shell.
+
+### From a release
+
+Every push to `master` publishes a release at https://github.com/valksor/margrave/releases with these assets. All of them need Node 27 or newer (see above).
+
+| Asset                                                                                | Contents                                                                                                                                                  |
+| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `margrave-v<version>-linux-x64.tar.gz`, `-linux-arm64.tar.gz`, `-macos-arm64.tar.gz` | A `margrave/` directory with the built CLI, its production `node_modules`, and ripwire in `vendor/ripwire/`. Nothing else to install.                     |
+| `margrave-v<version>.tgz`                                                            | The npm package. It does not carry ripwire: put `ripwire` on `PATH`, or run `node <package dir>/scripts/ensure-ripwire.mjs` once to fetch the pinned one. |
+
+Bundle:
+
+```sh
+gh release download --repo valksor/margrave --pattern 'margrave-v*-linux-x64.tar.gz'   # or curl -LO <asset URL>
+gh attestation verify margrave-v*-linux-x64.tar.gz --repo valksor/margrave
+tar -xzf margrave-v*-linux-x64.tar.gz
+ln -s "$PWD/margrave/dist/cli.js" ~/.local/bin/margrave
+```
+
+Package:
+
+```sh
+pnpm add -g ./margrave-v<version>.tgz
+```
+
+On macOS, download with `gh release download` or `curl`. A download in a browser is quarantined, and macOS then blocks the bundled ripwire, which is ad-hoc signed. If you used a browser, run `gh attestation verify` on the file first, then `xattr -dr com.apple.quarantine margrave/` after you extract it.
 
 ## 2. Install a skill source
 
@@ -194,3 +223,9 @@ nvm use && pnpm install --frozen-lockfile
 pnpm run build  # tsrs, chmod +x dist/cli.js, then scripts/ensure-ripwire.mjs
 pnpm test       # node --test test/ (runs the .ts sources directly; no network, temp MARGRAVE_HOME)
 ```
+
+## License
+
+margrave is licensed under the [BSD-3-Clause license](LICENSE).
+
+The release bundles also contain ripwire (`vendor/ripwire/`), which is a separate project under the Apache-2.0 license: [redhat-et/ripwire](https://github.com/redhat-et/ripwire). Its license text is in `vendor/ripwire/LICENSE`. For the licenses of the code inside the ripwire binary, see its [THIRD_PARTY.md at v0.6.10](https://github.com/redhat-et/ripwire/blob/v0.6.10/THIRD_PARTY.md).

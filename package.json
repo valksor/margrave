@@ -2,10 +2,25 @@
   "name": "margrave",
   "version": "0.1.0",
   "description": "On-demand skill router: one skill store, ranked search, load on demand.",
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/valksor/margrave.git"
+  },
+  "homepage": "https://github.com/valksor/margrave#readme",
+  "bugs": {
+    "url": "https://github.com/valksor/margrave/issues"
+  },
   "type": "module",
   "bin": {
     "margrave": "dist/cli.js"
   },
+  "files": [
+    "dist",
+    "scripts/ensure-ripwire.mjs",
+    "README.md",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=27.0.0-0"
   },
