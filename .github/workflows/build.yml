@@ -179,6 +179,7 @@ jobs:
             exit 1
           fi
           grep -q "refused:" "$RUNNER_TEMP/stub-refusal.txt"
+          # Expects the ripwire rule EXFILTRATE:net-exfil for the `curl -d @<dotenv file>` line; change this check if ripwire renames that rule.
           grep -q "EXFILTRATE" "$RUNNER_TEMP/stub-refusal.txt"
 
           CLEAN_PATH=""

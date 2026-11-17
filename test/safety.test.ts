@@ -3,7 +3,7 @@ import { chmod, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { PINNED_RIPWIRE, esc, parseScanXml, runRipwire, scanWithRipwire } from "../src/safety.ts";
+import { PINNED_RIPWIRE, VERSION_TIMEOUT_MS, esc, parseScanXml, runRipwire, scanWithRipwire } from "../src/safety.ts";
 import { MargraveError } from "../src/store.ts";
 import { ROOT, fakeRipwire, tmp } from "./helpers.ts";
 
@@ -240,6 +240,12 @@ async function standIn(name: string, versionLine: string = `ripwire ${PINNED_RIP
   return file;
 }
 
+/** Write the VERSION stamp that scripts/ensure-ripwire.mjs puts next to a vendored binary. */
+async function stamp(binary: string, text: string = PINNED_RIPWIRE): Promise<string> {
+  await writeFile(path.join(path.dirname(binary), "VERSION"), `${text}\n`);
+  return binary;
+}
+
 /** The arguments of every call that a stand-in got, or [] when it never ran. */
 async function calls(file: string): Promise<string[]> {
   try {
@@ -248,6 +254,8 @@ async function calls(file: string): Promise<string[]> {
     return [];
   }
 }
+
+const ENSURE = path.join(ROOT, "scripts", "ensure-ripwire.mjs");
 
 async function withPath<T>(value: string, fn: () => Promise<T>): Promise<T> {
   const prev = process.env["PATH"];
@@ -266,7 +274,7 @@ test("the pinned ripwire version equals the VERSION in scripts/ensure-ripwire.mj
 
 test("the vendored binary wins over PATH, and --version is never run for it", async () => {
   const onPath = await standIn("from-path");
-  const vendored = await standIn("from-vendor");
+  const vendored = await stamp(await standIn("from-vendor"));
   const r = await withPath(path.dirname(onPath), () => runRipwire("/nonexistent", vendored));
   assert.equal(r.missing, false);
   assert.equal(r.refusal, undefined);
@@ -274,6 +282,65 @@ test("the vendored binary wins over PATH, and --version is never run for it", as
   assert.match(r.stderr, /from-vendor/u);
   assert.deepEqual(await calls(vendored), ["security --scan-skills=/nonexistent"]);
   assert.deepEqual(await calls(onPath), []);
+});
+
+test("a vendored binary with a missing or wrong VERSION stamp is refused, and neither it nor PATH runs", async () => {
+  for (const [label, text] of [
+    ["unstamped", null],
+    ["0.4.0", "0.4.0"],
+    ["0.4\\x1b[2J", "0.4\u001b[2J"],
+  ] as const) {
+    const onPath = await standIn("from-path");
+    const vendored = await standIn("from-vendor");
+    if (text !== null) await stamp(vendored, text);
+    const r = await withPath(path.dirname(onPath), () => runRipwire("/nonexistent", vendored));
+    assert.equal(r.refusal, `vendored ripwire at ${vendored} is ${label}, not the pinned ${PINNED_RIPWIRE}; run: node ${ENSURE}`, label);
+    assert.equal(r.code, null, label);
+    assert.equal(r.missing, false, label);
+    assert.deepEqual(await calls(vendored), [], label);
+    assert.deepEqual(await calls(onPath), [], label);
+  }
+});
+
+test("a vendored binary that cannot start fails as ripwire failed, not as not found", async () => {
+  const vendored = await stamp(await standIn("from-vendor"));
+  await writeFile(vendored, "#!/nonexistent/interpreter\n");
+  const home = await tmp("mg-home-");
+  const empty = await tmp("mg-emptybin-");
+  const prevHome = process.env["MARGRAVE_HOME"];
+  process.env["MARGRAVE_HOME"] = home;
+  try {
+    const r = await withPath(empty, () => runRipwire("/nonexistent", vendored));
+    assert.equal(r.missing, false);
+    await assert.rejects(
+      withPath(empty, () => scanWithRipwire(empty, opts([], { vendored }))),
+      (err: unknown) => err instanceof MargraveError && err.message.includes("ripwire failed") && !err.message.includes("not found"),
+    );
+  } finally {
+    if (prevHome === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prevHome;
+  }
+});
+
+test("--allow-unsafe overrides a wrong VERSION stamp", async () => {
+  const vendored = await stamp(await standIn("from-vendor"), "0.4.0");
+  const home = await tmp("mg-home-");
+  const empty = await tmp("mg-emptybin-");
+  const prevHome = process.env["MARGRAVE_HOME"];
+  process.env["MARGRAVE_HOME"] = home;
+  try {
+    await assert.rejects(
+      withPath(empty, () => scanWithRipwire(empty, opts([], { vendored }))),
+      (err: unknown) =>
+        err instanceof MargraveError && err.message.startsWith(`refused: vendored ripwire at ${vendored} is 0.4.0, not the pinned `),
+    );
+    const r = await withPath(empty, () => scanWithRipwire(empty, opts([], { vendored, allowUnsafe: true })));
+    assert.equal(r.overridden, true);
+    assert.deepEqual(await calls(vendored), []);
+  } finally {
+    if (prevHome === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prevHome;
+  }
 });
 
 test("ripwire on PATH runs when there is no vendored binary, after its --version", async () => {
@@ -314,7 +381,7 @@ test("the refusal for a missing ripwire names the vendored path", async () => {
 test("scanWithRipwire scans with the vendored binary even when PATH has a different ripwire", async () => {
   const onPath = path.dirname(await standIn("from-path"));
   const home = await tmp("mg-home-");
-  const vendored = path.join(await fakeRipwire(), "ripwire");
+  const vendored = await stamp(path.join(await fakeRipwire(), "ripwire"));
   const prevHome = process.env["MARGRAVE_HOME"];
   process.env["MARGRAVE_HOME"] = home;
   try {
@@ -357,22 +424,93 @@ test("a ripwire on PATH older than the pinned version is refused with the reason
   }
 });
 
-test("a ripwire on PATH with no parseable version, or a failing --version, is refused", async () => {
-  const cases: [string, number][] = [
-    ["ripwire dev build", 0],
-    ["", 0],
-    [`ripwire ${PINNED_RIPWIRE}`, 1],
+test("a ripwire on PATH with no parseable version is refused", async () => {
+  const head = `ripwire on PATH reports no version, older than the pinned ${PINNED_RIPWIRE}; run: node `;
+  const tail = "ensure-ripwire.mjs, or update ripwire";
+  for (const line of ["ripwire dev build", "", "ripwire 1.2", "ripwire v0.7.0", "xripwire 0.7.0"]) {
+    const onPath = await standIn("from-path", line);
+    const r = await withPath(path.dirname(onPath), () => runRipwire("/nonexistent", NO_VENDOR));
+    assert.ok(r.refusal?.startsWith(head) === true && r.refusal.endsWith(tail), `${line} -> ${r.refusal}`);
+    assert.deepEqual(await calls(onPath), ["--version"], line);
+  }
+});
+
+test("only the first line of --version counts, and only as `ripwire X.Y.Z`", async () => {
+  const cases: [string, string][] = [
+    ["wrapper 9.9.9 runs ripwire 0.4.0", "no version"],
+    ["ripwire 0.4.0 (built with tool 9.9.9)", "0.4.0"],
+    ["banner\nripwire 0.6.10", "no version"],
   ];
-  for (const [line, exit] of cases) {
-    const onPath = await standIn("from-path", line, exit);
+  for (const [text, shown] of cases) {
+    const onPath = await standIn("from-path", text);
     const r = await withPath(path.dirname(onPath), () => runRipwire("/nonexistent", NO_VENDOR));
     assert.match(
       r.refusal ?? "",
-      /^ripwire on PATH reports no version, older than the pinned 0\.6\.10; run: node .*ensure-ripwire\.mjs, or update ripwire$/u,
-      line,
+      new RegExp(`^ripwire on PATH reports ${shown.replaceAll(".", "\\.")}, older than the pinned `, "u"),
+      text,
     );
-    assert.deepEqual(await calls(onPath), ["--version"], line);
+    assert.deepEqual(await calls(onPath), ["--version"], text);
   }
+  const real = await standIn("from-path", "ripwire 0.6.10 (Release, AppleClang 21.0.0.21000101, emit=std::print, built_from=ac869640e)");
+  const r = await withPath(path.dirname(real), () => runRipwire("/nonexistent", NO_VENDOR));
+  assert.equal(r.refusal, undefined);
+  assert.equal(r.code, 3);
+});
+
+test("a pre-release of the pinned version is older, and a pre-release of a newer version is not", async () => {
+  for (const pre of [`${PINNED_RIPWIRE}-rc.1`, `${PINNED_RIPWIRE}-dev`]) {
+    const onPath = await standIn("from-path", `ripwire ${pre} (fake)`);
+    const r = await withPath(path.dirname(onPath), () => runRipwire("/nonexistent", NO_VENDOR));
+    assert.ok(r.refusal?.startsWith(`ripwire on PATH reports ${pre}, older than the pinned ${PINNED_RIPWIRE}; run: node `), pre);
+    assert.deepEqual(await calls(onPath), ["--version"], pre);
+  }
+  const newer = await standIn("from-path", "ripwire 0.7.0-rc.1 (fake)");
+  const r = await withPath(path.dirname(newer), () => runRipwire("/nonexistent", NO_VENDOR));
+  assert.equal(r.refusal, undefined);
+  assert.equal(r.code, 3);
+});
+
+test("a --version that cannot run is refused with the cause", async () => {
+  const head = (why: string): string => `ripwire on PATH could not report its version (${why}); run: node `;
+  const tail = "ensure-ripwire.mjs, or update ripwire";
+  const check = async (onPath: string, why: string, timeoutMs?: number): Promise<void> => {
+    const r = await withPath(path.dirname(onPath), () => runRipwire("/nonexistent", NO_VENDOR, timeoutMs));
+    assert.ok(r.refusal?.startsWith(head(why)) === true && r.refusal.endsWith(tail), `${why} -> ${r.refusal}`);
+    assert.equal(r.missing, false, why);
+    assert.equal(r.code, null, why);
+  };
+
+  const exits = await standIn("from-path", `ripwire ${PINNED_RIPWIRE}`, 1);
+  await check(exits, "exit 1");
+  assert.deepEqual(await calls(exits), ["--version"]);
+
+  const noExec = await standIn("from-path");
+  await chmod(noExec, 0o644);
+  await check(noExec, "EACCES");
+
+  const killed = await standIn("from-path");
+  await writeFile(killed, "#!/bin/sh\nkill -9 $$\n");
+  await check(killed, "SIGKILL");
+
+  // More than Node's 1 MiB maxBuffer: execFile kills the child, which is not a timeout.
+  const loud = await standIn("from-path");
+  await writeFile(loud, "#!/bin/sh\nexec /usr/bin/head -c 2000000 /dev/zero\n");
+  await check(loud, "output too large");
+});
+
+test("the --version time limit is 10 seconds by default", () => {
+  assert.equal(VERSION_TIMEOUT_MS, 10_000);
+});
+
+test("a --version that hangs is killed at the time limit and refused", async () => {
+  const slow = await standIn("from-path");
+  // exec, so the SIGKILL at the time limit reaches the sleeping process itself.
+  await writeFile(slow, `#!/bin/sh\necho "$*" >> "$0.calls"\nexec /bin/sleep 30\n`);
+  const started = Date.now();
+  const r = await withPath(path.dirname(slow), () => runRipwire("/nonexistent", NO_VENDOR, 200));
+  assert.ok(Date.now() - started < 10_000);
+  assert.ok(r.refusal?.startsWith("ripwire on PATH could not report its version (timed out); run: node ") === true, r.refusal);
+  assert.deepEqual(await calls(slow), ["--version"]);
 });
 
 test("a ripwire on PATH at the pinned version or newer is accepted and runs the scan", async () => {

@@ -2,8 +2,9 @@
 // Exit codes: 0 clean, 1 WARN, 2 CRITICAL, 3 could not read.
 // stdout is `<skillscan files= findings= verdict=><f p="<abs path>:<line>" rule= sev=/>…</skillscan>`.
 //
-// ripwire lookup: the vendored `vendor/ripwire/ripwire` (the pinned version, checked by SHA-256 at build) runs
-// when it exists. Only without one does `ripwire` from PATH run, and then only at the pinned version or newer.
+// ripwire lookup: the vendored `vendor/ripwire/ripwire` (the pinned version; ensure-ripwire.mjs checks its SHA-256
+// at build, and this module checks only the VERSION stamp it writes) runs when it exists and its VERSION stamp matches. Only without one does `ripwire` from PATH run, and then only at the
+// pinned version or newer.
 //
 // `update` of a git source compares the new copy's findings with the installed copy's findings and
 // refuses only on findings that the installed copy does not have.
@@ -68,7 +69,7 @@ interface Execed {
   stdout: string;
   stderr: string;
   missing: boolean;
-  /** Set instead of a scan: ripwire on PATH is older than the pinned version, or reports none. */
+  /** Set instead of a scan: the vendored copy is not the pinned version, or ripwire on PATH is older than it or reports none. */
   refusal?: string;
 }
 
@@ -81,8 +82,12 @@ export const VENDORED_RIPWIRE = fileURLToPath(new URL("../vendor/ripwire/ripwire
 /** The ripwire version that scripts/ensure-ripwire.mjs vendors. A ripwire on PATH must be at least this version. */
 export const PINNED_RIPWIRE = "0.6.10";
 
+/** How long `ripwire --version` on PATH may run. */
+export const VERSION_TIMEOUT_MS = 10_000;
+
 const ENSURE_RIPWIRE = fileURLToPath(new URL("../scripts/ensure-ripwire.mjs", import.meta.url));
-const VERSION_RE = /\d+\.\d+\.\d+/u;
+/** The first line of `ripwire --version`: `ripwire <X.Y.Z>`, optionally with a `-<pre-release>` suffix, then a space or the end. */
+const VERSION_RE = /^ripwire (\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?=\s|$)/u;
 
 function exec(bin: string, dir: string): Promise<Execed> {
   return new Promise((resolve) => {
@@ -97,42 +102,72 @@ function exec(bin: string, dir: string): Promise<Execed> {
   });
 }
 
-/** True when version `found` is older than `pinned`. Both are `<major>.<minor>.<patch>`. */
+/**
+ * True when version `found` is older than `pinned`. `found` is `<major>.<minor>.<patch>` with an optional `-<pre-release>`.
+ * A pre-release is older than the same `<major>.<minor>.<patch>` without one. `pinned` has no suffix.
+ */
 function isOlder(found: string, pinned: string): boolean {
-  const a = found.split(".").map(Number);
+  const dash = found.indexOf("-");
+  const a = (dash < 0 ? found : found.slice(0, dash)).split(".").map(Number);
   const b = pinned.split(".").map(Number);
   for (let i = 0; i < b.length; i++) {
     if (a[i] !== b[i]) return (a[i] as number) < (b[i] as number);
   }
-  return false;
+  return dash >= 0;
 }
 
-/** The version `ripwire --version` prints, null when it fails or prints none. `missing` is true when PATH has no ripwire. */
-function pathVersion(): Promise<{ missing: boolean; version: string | null }> {
+type PathVersion =
+  /** PATH has no ripwire. */
+  | { status: "missing" }
+  /** `--version` could not run, exited non-zero, or timed out. `why` names the cause. */
+  | { status: "failed"; why: string }
+  /** `--version` ran. `version` is null when its first line is not `ripwire <version>`. */
+  | { status: "ran"; version: string | null };
+
+/** What `ripwire --version` on PATH reports. */
+function pathVersion(timeoutMs: number): Promise<PathVersion> {
   return new Promise((resolve) => {
-    execFile("ripwire", ["--version"], { encoding: "utf8" }, (err, stdout) => {
-      if (err === null) resolve({ missing: false, version: VERSION_RE.exec(stdout)?.[0] ?? null });
-      else resolve({ missing: (err as NodeJS.ErrnoException).code === "ENOENT", version: null });
+    execFile("ripwire", ["--version"], { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL" }, (err, stdout) => {
+      if (err === null) {
+        resolve({ status: "ran", version: VERSION_RE.exec(stdout.split(/\r?\n/u, 1)[0] as string)?.[1] ?? null });
+        return;
+      }
+      const e = err as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+      if (e.code === "ENOENT") resolve({ status: "missing" });
+      else if (e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") resolve({ status: "failed", why: "output too large" });
+      else if (e.killed === true) resolve({ status: "failed", why: "timed out" });
+      else resolve({ status: "failed", why: typeof e.code === "number" ? `exit ${e.code}` : String(e.code ?? e.signal) });
     });
   });
 }
 
 /**
- * The vendored binary when it exists. A vendored binary that cannot run is not replaced by PATH: it fails like any ripwire failure.
+ * The vendored binary when it exists and its VERSION stamp (written by scripts/ensure-ripwire.mjs) is PINNED_RIPWIRE,
+ * refused (`refusal`) otherwise. A vendored binary that cannot run is not replaced by PATH: it fails like any ripwire failure.
  * Without one, `ripwire` from PATH, refused (`refusal`) when older than PINNED_RIPWIRE. `missing` is true when both are absent.
+ * `versionTimeoutMs` limits `ripwire --version` on PATH. Tests only.
  */
-export async function runRipwire(dir: string, vendored: string = VENDORED_RIPWIRE): Promise<Execed> {
-  if (existsSync(vendored)) return exec(vendored, dir);
-  const found = await pathVersion();
-  if (found.missing) return { code: "ENOENT", stdout: "", stderr: "", missing: true };
+export async function runRipwire(dir: string, vendored: string = VENDORED_RIPWIRE, versionTimeoutMs = VERSION_TIMEOUT_MS): Promise<Execed> {
+  const refuse = (refusal: string): Execed => ({ code: null, stdout: "", stderr: "", missing: false, refusal });
+  if (existsSync(vendored)) {
+    const stamp = (await readFile(path.join(path.dirname(vendored), "VERSION"), "utf8").catch(() => "")).trim();
+    if (stamp !== PINNED_RIPWIRE) {
+      return refuse(
+        `vendored ripwire at ${vendored} is ${stamp === "" ? "unstamped" : esc(stamp)}, not the pinned ${PINNED_RIPWIRE}; run: node ${ENSURE_RIPWIRE}`,
+      );
+    }
+    // A vendored binary that cannot start (a broken interpreter line, for example) is a failure, not an absent ripwire.
+    return { ...(await exec(vendored, dir)), missing: false };
+  }
+  const found = await pathVersion(versionTimeoutMs);
+  if (found.status === "missing") return { code: "ENOENT", stdout: "", stderr: "", missing: true };
+  if (found.status === "failed") {
+    return refuse(`ripwire on PATH could not report its version (${found.why}); run: node ${ENSURE_RIPWIRE}, or update ripwire`);
+  }
   if (found.version === null || isOlder(found.version, PINNED_RIPWIRE)) {
-    return {
-      code: null,
-      stdout: "",
-      stderr: "",
-      missing: false,
-      refusal: `ripwire on PATH reports ${found.version ?? "no version"}, older than the pinned ${PINNED_RIPWIRE}; run: node ${ENSURE_RIPWIRE}, or update ripwire`,
-    };
+    return refuse(
+      `ripwire on PATH reports ${found.version ?? "no version"}, older than the pinned ${PINNED_RIPWIRE}; run: node ${ENSURE_RIPWIRE}, or update ripwire`,
+    );
   }
   return exec("ripwire", dir);
 }
