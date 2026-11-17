@@ -336,6 +336,9 @@ async function installGit(
   return withStaging(async (stage) => {
     const clone = path.join(stage, "repo");
     const sha = await gitClone(parsed.url, ref, clone);
+    // No --ref: pin the branch the remote's default resolved to, so a later
+    // `update` stays on it even if the remote changes its default branch.
+    const pinned = ref ?? (await git(["-C", clone, "symbolic-ref", "--short", "HEAD"])).trim();
     const scanRoot = await resolveScanRoot(clone, parsed.subpath);
     await scanWithRipwire(scanRoot, ctx);
     const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: clone });
@@ -350,7 +353,7 @@ async function installGit(
       spec,
       url: parsed.url,
       subpath: parsed.subpath,
-      ref,
+      ref: pinned,
       commit: sha,
       installedAt: new Date().toISOString(),
     };

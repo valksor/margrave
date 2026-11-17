@@ -51,7 +51,7 @@ test("git source via file://: install, duplicate, find, load, update, remove", a
   assert.equal(rec[0]?.["kind"], "git");
   assert.equal(rec[0]?.["commit"], first);
   assert.equal(rec[0]?.["url"], repo.url);
-  assert.equal(rec[0]?.["ref"], null);
+  assert.equal(rec[0]?.["ref"], "main", "no --ref pins the default branch");
 
   // duplicate install errors and changes nothing
   const before = await snapshot(env.home);
@@ -111,7 +111,7 @@ test("git source via file://: install, duplicate, find, load, update, remove", a
 
   // list
   const list = await mg(env, ["list"]);
-  assert.equal(list.stdout.trim(), `${id}  git  ref=-  commit=${second.slice(0, 7)}  skills=3`);
+  assert.equal(list.stdout.trim(), `${id}  git  ref=main  commit=${second.slice(0, 7)}  skills=3`);
   const listSkills = await mg(env, ["list", "--skills"]);
   assert.ok(listSkills.stdout.includes(`  ${id}/vue-perf: Optimize Vue rendering performance`));
 
