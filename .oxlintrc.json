@@ -11,7 +11,14 @@
     "typescript/no-floating-promises": [
       "error",
       { "allowForKnownSafeCalls": [{ "from": "package", "name": "test", "package": "node:test" }] }
-    ]
+    ],
+    "typescript/no-misused-promises": "error",
+    "typescript/switch-exhaustiveness-check": "error",
+    "typescript/only-throw-error": "error",
+    "typescript/no-deprecated": "error",
+    "typescript/restrict-plus-operands": "error",
+    "typescript/return-await": "error",
+    "typescript/require-await": "error"
   },
   "ignorePatterns": ["dist", "vendor", "node_modules"]
 }
