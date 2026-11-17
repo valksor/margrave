@@ -33,11 +33,7 @@ export function renderWrap(agent: Agent, i: WrapInput): string {
     case "claude":
       return `Run this command to add the margrave MCP server to Claude Code:\n\n${commandLine(i)}\n\n${snippet}\n`;
     case "codex": {
-      const lines = [
-        "[mcp_servers.margrave]",
-        `command = ${toml(i.nodePath)}`,
-        `args = [${toml(i.cliPath)}, "mcp"]`,
-      ];
+      const lines = ["[mcp_servers.margrave]", `command = ${toml(i.nodePath)}`, `args = [${toml(i.cliPath)}, "mcp"]`];
       if (i.home !== undefined) lines.push(`env = { MARGRAVE_HOME = ${toml(i.home)} }`);
       return `Add this block to ~/.codex/config.toml:\n\n${lines.join("\n")}\n\n${snippet}\n`;
     }

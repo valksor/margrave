@@ -21,19 +21,81 @@ export const MAX_LIMIT = 25;
 // Two-letter tech tokens (go, js, ci, db) are meaningful, so the minimum token
 // length is 2. These grammar words are dropped instead.
 const STOPWORDS = new Set([
-  "is", "in", "on", "at", "to", "of", "or", "if", "it", "be", "as", "by", "we",
-  "do", "no", "so", "up", "an", "my", "me", "us", "the", "and", "for", "with",
-  "use", "used", "using", "when", "into", "from", "your", "that", "this", "you",
-  "are", "not", "any", "its", "how", "why", "what", "which", "will", "can",
-  "get", "set", "via", "per", "out", "new", "one", "two", "all", "but", "has",
-  "have", "had", "was", "were", "them", "then", "than", "over", "under",
-  "before", "after",
+  "is",
+  "in",
+  "on",
+  "at",
+  "to",
+  "of",
+  "or",
+  "if",
+  "it",
+  "be",
+  "as",
+  "by",
+  "we",
+  "do",
+  "no",
+  "so",
+  "up",
+  "an",
+  "my",
+  "me",
+  "us",
+  "the",
+  "and",
+  "for",
+  "with",
+  "use",
+  "used",
+  "using",
+  "when",
+  "into",
+  "from",
+  "your",
+  "that",
+  "this",
+  "you",
+  "are",
+  "not",
+  "any",
+  "its",
+  "how",
+  "why",
+  "what",
+  "which",
+  "will",
+  "can",
+  "get",
+  "set",
+  "via",
+  "per",
+  "out",
+  "new",
+  "one",
+  "two",
+  "all",
+  "but",
+  "has",
+  "have",
+  "had",
+  "was",
+  "were",
+  "them",
+  "then",
+  "than",
+  "over",
+  "under",
+  "before",
+  "after",
 ]);
 
 /** Lowercase, split on non-alphanumerics, drop stopwords, Porter-stem. Keeps duplicates. */
 export function tokenize(input: string): string[] {
   const out: string[] = [];
-  for (const raw of String(input).toLowerCase().split(/[^a-z0-9]+/u)) {
+  for (const raw of String(input)
+    .toLowerCase()
+    .split(/[^a-z0-9]+/u)) {
     if (raw.length < 2 || STOPWORDS.has(raw)) continue;
     const word = stemmer(raw);
     if (word.length < 2 || STOPWORDS.has(word)) continue;
@@ -53,12 +115,7 @@ export function countTerms(tokens: readonly string[]): TermFreqs {
 }
 
 /** Build the per-field term frequencies for one skill. Body is cut to its first 2000 tokens. */
-export function buildFieldTokens(parts: {
-  name: string;
-  description: string;
-  headings: readonly string[];
-  body: string;
-}): FieldTokens {
+export function buildFieldTokens(parts: { name: string; description: string; headings: readonly string[]; body: string }): FieldTokens {
   return {
     name: countTerms(tokenize(parts.name)),
     description: countTerms(tokenize(parts.description)),
@@ -121,12 +178,7 @@ export interface Ranked {
 }
 
 /** BM25F over name, description, headings, and body. Ties break by id ascending. */
-export function rank(
-  docs: readonly Doc[],
-  stats: CorpusStats,
-  query: string,
-  limit: number,
-): Ranked[] {
+export function rank(docs: readonly Doc[], stats: CorpusStats, query: string, limit: number): Ranked[] {
   const terms = [...new Set(tokenize(query))];
   const q = String(query).trim().toLowerCase();
   const scored: Ranked[] = [];

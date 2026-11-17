@@ -24,7 +24,9 @@ test("claude: mcp add command with absolute paths, then the snippet", () => {
 
 test("claude: -e MARGRAVE_HOME is added, and quoted, when set", () => {
   const text = renderWrap("claude", withHome);
-  assert.ok(text.includes("claude mcp add margrave -e 'MARGRAVE_HOME=/data/margrave home' -- /opt/node/bin/node /opt/margrave/dist/cli.js mcp\n"));
+  assert.ok(
+    text.includes("claude mcp add margrave -e 'MARGRAVE_HOME=/data/margrave home' -- /opt/node/bin/node /opt/margrave/dist/cli.js mcp\n"),
+  );
 });
 
 test("codex: a [mcp_servers.margrave] TOML block, env only when MARGRAVE_HOME is set", () => {

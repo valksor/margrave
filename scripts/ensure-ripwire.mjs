@@ -84,7 +84,9 @@ try {
   const out = path.join(work, "out");
   writeFileSync(tarball, data);
   mkdirSync(out);
-  const tar = spawnSync("tar", ["-xzf", tarball, "-C", out, "--strip-components=1", `${name}/ripwire`, `${name}/LICENSE`], { encoding: "utf8" });
+  const tar = spawnSync("tar", ["-xzf", tarball, "-C", out, "--strip-components=1", `${name}/ripwire`, `${name}/LICENSE`], {
+    encoding: "utf8",
+  });
   if (tar.status !== 0) fail(`could not unpack ${url}: ${tar.stderr.trim() || `tar exited ${tar.status}`}`);
 
   chmodSync(path.join(out, "ripwire"), 0o755);

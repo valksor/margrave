@@ -67,8 +67,13 @@ test("git source via file://: install, duplicate, find, load, update, remove", a
   assert.equal(find.code, 0, find.stderr);
   assert.match(find.stdout, new RegExp(`^1\\. ${id}/react-perf `, "u"));
   assert.match(find.stdout, new RegExp(`load: margrave load ${id}/react-perf\\n$`, "u"));
-  const pg = JSON.parse((await mg(env, ["find", "tune postgresql indexes", "--json", "--limit", "1"])).stdout) as { results: { id: string }[] };
-  assert.deepEqual(pg.results.map((r) => r.id), [`${id}/postgres-tuning`]);
+  const pg = JSON.parse((await mg(env, ["find", "tune postgresql indexes", "--json", "--limit", "1"])).stdout) as {
+    results: { id: string }[];
+  };
+  assert.deepEqual(
+    pg.results.map((r) => r.id),
+    [`${id}/postgres-tuning`],
+  );
   const none = await mg(env, ["find", "kubernetes operators"]);
   assert.equal(none.code, 0);
   assert.match(none.stdout, /^no match\n/u);
@@ -79,7 +84,10 @@ test("git source via file://: install, duplicate, find, load, update, remove", a
   assert.match(load.stdout, new RegExp(`^skill: ${id}/react-perf\\n`, "u"));
   assert.match(load.stdout, new RegExp(`commit: ${first}\\n`, "u"));
   assert.match(load.stdout, new RegExp(`base: ${path.join(env.home, "sources", id, "skills", "react-perf")}\\n`, "u"));
-  assert.match(load.stdout, /frontmatter:\n---\nname: react-perf\ndescription: .*\n---\nfiles:\n- SKILL\.md\nbody:\n# react-perf\n\nBody of react-perf\.\n$/u);
+  assert.match(
+    load.stdout,
+    /frontmatter:\n---\nname: react-perf\ndescription: .*\n---\nfiles:\n- SKILL\.md\nbody:\n# react-perf\n\nBody of react-perf\.\n$/u,
+  );
   const loadJson = JSON.parse((await mg(env, ["load", `${id}/react-perf`, "--json"])).stdout) as { commit: string; body: string };
   assert.equal(loadJson.commit, first);
   assert.equal(loadJson.body, "# react-perf\n\nBody of react-perf.\n");
@@ -90,7 +98,10 @@ test("git source via file://: install, duplicate, find, load, update, remove", a
   assert.match(escape.stderr, /outside/u);
 
   // upstream commit, then update
-  await writeFile(path.join(repo.dir, "skills", "react-perf", "SKILL.md"), skillMd("react-perf", "Optimize React rendering, now with signals"));
+  await writeFile(
+    path.join(repo.dir, "skills", "react-perf", "SKILL.md"),
+    skillMd("react-perf", "Optimize React rendering, now with signals"),
+  );
   await writeSkill(path.join(repo.dir, "skills"), "vue-perf", "Optimize Vue rendering performance");
   await rm(path.join(repo.dir, "skills", "docker-compose"), { recursive: true });
   await git(repo.dir, "add", "-A");
@@ -210,7 +221,10 @@ test("a failed install leaves no staging, no store dir, and no sources.json chan
 test("ripwire WARN (exit 1) prints the short summary, not the XML, and installs", async () => {
   const env = await setup();
   const repo = await makeRepo();
-  await writeFile(path.join(repo.dir, "skills", "react-perf", "SKILL.md"), skillMd("react-perf", "Optimize React", "# r\nx FAKE-WARN INJECTION:x\n"));
+  await writeFile(
+    path.join(repo.dir, "skills", "react-perf", "SKILL.md"),
+    skillMd("react-perf", "Optimize React", "# r\nx FAKE-WARN INJECTION:x\n"),
+  );
   await git(repo.dir, "add", "-A");
   await git(repo.dir, "commit", "-q", "-m", "warn");
   const r = await mg(env, ["install", repo.url]);
@@ -223,7 +237,10 @@ test("ripwire WARN (exit 1) prints the short summary, not the XML, and installs"
 test("a refused install prints the summary, not the XML, and writes the report", async () => {
   const env = await setup();
   const repo = await makeRepo();
-  await writeFile(path.join(repo.dir, "skills", "react-perf", "SKILL.md"), skillMd("react-perf", "Optimize React", "# r\nx FAKE-CRIT EXFILTRATE:net-exfil\n"));
+  await writeFile(
+    path.join(repo.dir, "skills", "react-perf", "SKILL.md"),
+    skillMd("react-perf", "Optimize React", "# r\nx FAKE-CRIT EXFILTRATE:net-exfil\n"),
+  );
   await git(repo.dir, "add", "-A");
   await git(repo.dir, "commit", "-q", "-m", "crit");
   const r = await mg(env, ["install", repo.url]);
@@ -344,7 +361,12 @@ test("update proceeds on new warn findings only and lists them", async () => {
 
 test("update refuses one new critical finding and lists only that one", async () => {
   const m = await marked();
-  await writeSkill(path.join(m.repo.dir, "skills"), "docker-compose", "Write Docker Compose files", "# d\nboom FAKE-CRIT EXFILTRATE:new-one\n");
+  await writeSkill(
+    path.join(m.repo.dir, "skills"),
+    "docker-compose",
+    "Write Docker Compose files",
+    "# d\nboom FAKE-CRIT EXFILTRATE:new-one\n",
+  );
   await commitAll(m.repo.dir, "new crit");
   const r = await refusedUpdate(m);
   assert.match(r.stderr, /; 1 new vs installed copy/u);
@@ -561,7 +583,10 @@ test("local directory source: install, find, load, update, remove leaves the dir
   assert.equal(rm1.code, 0, rm1.stderr);
   assert.match(rm1.stdout, /unregistered/u);
   assert.deepEqual(await names(dir), ["ansible-roles", "kubectl-debug"], "the local directory is untouched");
-  assert.equal(await readFile(path.join(dir, "ansible-roles", "SKILL.md"), "utf8"), skillMd("ansible-roles", "Ansible, now with collections"));
+  assert.equal(
+    await readFile(path.join(dir, "ansible-roles", "SKILL.md"), "utf8"),
+    skillMd("ansible-roles", "Ansible, now with collections"),
+  );
   assert.equal((await snapshot(env.home)).sources?.trim(), "[]");
 });
 
@@ -669,7 +694,10 @@ test("atomic writes leave no temp file and a reader never sees a partial file", 
   }
   stop = true;
   await writer;
-  assert.deepEqual((await readdir(dir)).filter((n) => n.endsWith(".tmp")), []);
+  assert.deepEqual(
+    (await readdir(dir)).filter((n) => n.endsWith(".tmp")),
+    [],
+  );
 });
 
 test("subpath resolution refuses .., a missing dir, a file, and a symlink out of the clone", async () => {

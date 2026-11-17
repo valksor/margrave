@@ -127,18 +127,25 @@ function entry(source: string, name: string): IndexEntry {
 
 test("qualified ids stay stable after a second source adds the same name; the bare alias works only while unique", () => {
   const first = assemble([entry("src-a", "react"), entry("src-a", "docker")]);
-  assert.deepEqual(first.skills.map((s) => s.id), ["src-a/docker", "src-a/react"]);
+  assert.deepEqual(
+    first.skills.map((s) => s.id),
+    ["src-a/docker", "src-a/react"],
+  );
   assert.equal(resolveSkill(first, "react").id, "src-a/react");
   assert.equal(resolveSkill(first, "src-a/react").id, "src-a/react");
 
   const second = assemble([...first.skills, entry("src-b", "react")]);
-  assert.ok(second.skills.some((s) => s.id === "src-a/react"), "existing id unchanged");
+  assert.ok(
+    second.skills.some((s) => s.id === "src-a/react"),
+    "existing id unchanged",
+  );
   assert.equal(resolveSkill(second, "src-a/react").id, "src-a/react");
   assert.equal(resolveSkill(second, "src-b/react").id, "src-b/react");
   assert.equal(resolveSkill(second, "docker").id, "src-a/docker");
   assert.throws(
     () => resolveSkill(second, "react"),
-    (e: unknown) => e instanceof MargraveError && /ambiguous/u.test(e.message) && e.message.includes("src-a/react") && e.message.includes("src-b/react"),
+    (e: unknown) =>
+      e instanceof MargraveError && /ambiguous/u.test(e.message) && e.message.includes("src-a/react") && e.message.includes("src-b/react"),
   );
   assert.throws(() => resolveSkill(second, "nope"), /no skill "nope"/u);
   assert.equal(second.stats.docCount, 3);
@@ -183,7 +190,10 @@ test("a malformed sources.json is an error and nothing is written", async () => 
     assert.match(r.stderr, /sources\.json/u);
     assert.equal(await readFile(file, "utf8"), content, "sources.json unchanged");
     assert.equal((await readdir(home)).includes("index.json"), false, "no index.json written");
-    assert.deepEqual((await readdir(home)).filter((n) => n.endsWith(".tmp")), []);
+    assert.deepEqual(
+      (await readdir(home)).filter((n) => n.endsWith(".tmp")),
+      [],
+    );
   }
 });
 

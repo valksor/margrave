@@ -48,7 +48,10 @@ test("parser treats warn as warn and every other severity as critical", () => {
     2,
   );
   assert.ok(out.ok);
-  assert.deepEqual(out.rows.map((r) => r.sev), ["warn", "critical", "critical", "critical"]);
+  assert.deepEqual(
+    out.rows.map((r) => r.sev),
+    ["warn", "critical", "critical", "critical"],
+  );
 });
 
 test("parser fails closed: no root, count mismatch, CRITICAL without a critical row, WARN without a row", () => {
@@ -172,7 +175,8 @@ for (const code of [3, 7]) {
     const extra = { FAKE_RIPWIRE_EXIT: String(code) };
     await assert.rejects(
       e.run(() => scanWithRipwire(dir, opts([])), extra),
-      (err: unknown) => err instanceof MargraveError && /refused/u.test(err.message) && /fake ripwire: security --scan-skills=/u.test(err.message),
+      (err: unknown) =>
+        err instanceof MargraveError && /refused/u.test(err.message) && /fake ripwire: security --scan-skills=/u.test(err.message),
     );
     const logs: string[] = [];
     const r = await e.run(() => scanWithRipwire(dir, opts(logs, { allowUnsafe: true })), extra);
@@ -189,8 +193,14 @@ test("unparseable output refuses like exit 3, whatever the exit code", async () 
     /refused: ripwire declared findings="2" but 1 finding row\(s\) were parsed/u,
   );
   const clean = await scanDir({ "a/SKILL.md": "x\n" });
-  await assert.rejects(e.run(() => scanWithRipwire(clean, opts([])), { FAKE_RIPWIRE_EXIT: "2" }), /refused: ripwire reported CRITICAL but no critical finding row/u);
-  await assert.rejects(e.run(() => scanWithRipwire(clean, opts([])), { FAKE_RIPWIRE_EXIT: "1" }), /refused: ripwire exited 1/u);
+  await assert.rejects(
+    e.run(() => scanWithRipwire(clean, opts([])), { FAKE_RIPWIRE_EXIT: "2" }),
+    /refused: ripwire reported CRITICAL but no critical finding row/u,
+  );
+  await assert.rejects(
+    e.run(() => scanWithRipwire(clean, opts([])), { FAKE_RIPWIRE_EXIT: "1" }),
+    /refused: ripwire exited 1/u,
+  );
 });
 
 test("ripwire missing from PATH refuses; --allow-unsafe overrides", async () => {
@@ -313,7 +323,10 @@ test("baseline: a clean installed copy makes every finding new; a missing one pr
   const e = await env();
   const clean = await scanDir({ "a/SKILL.md": "x\n" });
   const staging = await scanDir({ "a/SKILL.md": KNOWN });
-  await assert.rejects(e.run(() => scanWithRipwire(staging, opts([], { baselineDir: clean }))), /1 new vs installed copy/u);
+  await assert.rejects(
+    e.run(() => scanWithRipwire(staging, opts([], { baselineDir: clean }))),
+    /1 new vs installed copy/u,
+  );
 
   const logs: string[] = [];
   const warnOnly = await scanDir({ "a/SKILL.md": "x FAKE-WARN INJECTION:eval\n" });

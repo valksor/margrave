@@ -16,7 +16,10 @@ const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/gu;
 
 /** One-line text for human output: strips ANSI escapes and control characters. */
 export function clean(s: string): string {
-  return s.replace(ANSI, "").replace(/[\t\n]/gu, " ").replace(CONTROL, "");
+  return s
+    .replace(ANSI, "")
+    .replace(/[\t\n]/gu, " ")
+    .replace(CONTROL, "");
 }
 
 /** Multi-line text for human output: like clean(), but keeps newlines and tabs. */
@@ -49,7 +52,10 @@ export function resolveSkill(index: IndexFile, input: string): IndexEntry {
   const byName = index.skills.filter((s) => s.name === input);
   if (byName.length === 1 && byName[0] !== undefined) return byName[0];
   if (byName.length > 1) {
-    const ids = byName.map((s) => `  ${clean(s.id)}`).sort().join("\n");
+    const ids = byName
+      .map((s) => `  ${clean(s.id)}`)
+      .sort()
+      .join("\n");
     throw new MargraveError(`"${clean(input)}" is ambiguous; use one of these ids:\n${ids}`);
   }
   throw new MargraveError(`no skill "${clean(input)}"; run: margrave find "<task>" or margrave list --skills`);

@@ -77,9 +77,7 @@ export function extractHeadings(body: string): string[] {
   return out;
 }
 
-type Parsed =
-  | { ok: true; skill: Omit<ScannedSkill, "dir"> }
-  | { ok: false; reason: string };
+type Parsed = { ok: true; skill: Omit<ScannedSkill, "dir"> } | { ok: false; reason: string };
 
 export function parseSkillMd(text: string): Parsed {
   const { rawFrontmatter, body } = splitSkillMd(text);

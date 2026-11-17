@@ -40,9 +40,18 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   const tools = (await client.listTools()).tools;
   assert.deepEqual(tools.map((x) => x.name).sort(), ["find_skills", "load_skill", "read_skill_file"]);
   const desc = Object.fromEntries(tools.map((x) => [x.name, x.description]));
-  assert.equal(desc["find_skills"], "Find installed skills for a task. Give the task in plain words. Returns ranked skill ids with descriptions. Use load_skill to read one.");
-  assert.equal(desc["load_skill"], "Load the instructions of one skill. Use an id from find_skills. Returns the skill text, its source, and its base directory.");
-  assert.equal(desc["read_skill_file"], "Read one file inside a skill directory. Use a path relative to the base directory that load_skill returns.");
+  assert.equal(
+    desc["find_skills"],
+    "Find installed skills for a task. Give the task in plain words. Returns ranked skill ids with descriptions. Use load_skill to read one.",
+  );
+  assert.equal(
+    desc["load_skill"],
+    "Load the instructions of one skill. Use an id from find_skills. Returns the skill text, its source, and its base directory.",
+  );
+  assert.equal(
+    desc["read_skill_file"],
+    "Read one file inside a skill directory. Use a path relative to the base directory that load_skill returns.",
+  );
   assert.equal(FIND_DESCRIPTION, desc["find_skills"]);
   assert.equal(LOAD_DESCRIPTION, desc["load_skill"]);
   assert.equal(READ_DESCRIPTION, desc["read_skill_file"]);

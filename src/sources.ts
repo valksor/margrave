@@ -42,9 +42,7 @@ function checkId(id: string): string {
   return id;
 }
 
-export type ParsedSpec =
-  | { kind: "local"; path: string }
-  | { kind: "git"; url: string; subpath: string; id: string };
+export type ParsedSpec = { kind: "local"; path: string } | { kind: "git"; url: string; subpath: string; id: string };
 
 export function checkRef(ref: string): string {
   if (ref === "" || ref.startsWith("-")) throw new UsageError(`refused --ref "${ref}": must not be empty or start with "-"`);
@@ -76,7 +74,10 @@ function gitUrlId(spec: string): string {
   const segs = rawPath.split("/").filter((s) => s !== "");
   const last = segs.length - 1;
   if (last >= 0) segs[last] = stripGit(segs[last] ?? "");
-  const id = [host, ...segs].filter((s) => s !== "").map(sanitizeId).join("__");
+  const id = [host, ...segs]
+    .filter((s) => s !== "")
+    .map(sanitizeId)
+    .join("__");
   return checkId(id);
 }
 

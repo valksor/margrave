@@ -87,10 +87,7 @@ test("BM25 ranks the document that matches the query best first", () => {
 });
 
 test("a name match outweighs the same word in the body", () => {
-  const docs = [
-    doc("s/a", "alpha", "Something unrelated", "redis redis redis redis"),
-    doc("s/b", "redis", "Something else"),
-  ];
+  const docs = [doc("s/a", "alpha", "Something unrelated", "redis redis redis redis"), doc("s/b", "redis", "Something else")];
   assert.equal(ranked(docs, "redis")[0], "s/b");
 });
 
@@ -122,7 +119,10 @@ test("tokens named like Object.prototype members do not break ranking after a JS
   const docs = [doc("s/a", "a-skill", "explains the constructor pattern and toString"), doc("s/b", "b-skill", "other")];
   const round = JSON.parse(JSON.stringify({ docs, stats: buildStats(docs) })) as { docs: Doc[]; stats: ReturnType<typeof buildStats> };
   const result = rank(round.docs, round.stats, "constructor valueOf", 5);
-  assert.deepEqual(result.map((r) => r.id), ["s/a"]);
+  assert.deepEqual(
+    result.map((r) => r.id),
+    ["s/a"],
+  );
   assert.ok(Number.isFinite(result[0]?.score));
 });
 

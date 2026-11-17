@@ -72,19 +72,14 @@ export const VENDORED_RIPWIRE = fileURLToPath(new URL("../vendor/ripwire/ripwire
 
 function exec(bin: string, dir: string): Promise<Execed> {
   return new Promise((resolve) => {
-    execFile(
-      bin,
-      ["security", `--scan-skills=${dir}`],
-      { maxBuffer: 64 * 1024 * 1024, encoding: "utf8" },
-      (err, stdout, stderr) => {
-        if (err === null) {
-          resolve({ code: 0, stdout, stderr, missing: false });
-          return;
-        }
-        const e = err as NodeJS.ErrnoException & { code?: number | string };
-        resolve({ code: e.code ?? null, stdout: stdout ?? "", stderr: stderr ?? "", missing: e.code === "ENOENT" });
-      },
-    );
+    execFile(bin, ["security", `--scan-skills=${dir}`], { maxBuffer: 64 * 1024 * 1024, encoding: "utf8" }, (err, stdout, stderr) => {
+      if (err === null) {
+        resolve({ code: 0, stdout, stderr, missing: false });
+        return;
+      }
+      const e = err as NodeJS.ErrnoException & { code?: number | string };
+      resolve({ code: e.code ?? null, stdout: stdout ?? "", stderr: stderr ?? "", missing: e.code === "ENOENT" });
+    });
   });
 }
 
@@ -223,7 +218,13 @@ async function runScan(dir: string, vendored: string): Promise<ScanResult> {
   if (r.missing) return { status: "failed", code: null, reason: `ripwire was not found on PATH or at ${vendored}`, detail, xml: null };
   if (r.code === 3) return { status: "failed", code: 3, reason: "ripwire could not read the files (exit 3)", detail, xml: null };
   if (r.code !== 1 && r.code !== 2) {
-    return { status: "failed", code: typeof r.code === "number" ? r.code : null, reason: `ripwire failed (exit ${String(r.code)})`, detail, xml: null };
+    return {
+      status: "failed",
+      code: typeof r.code === "number" ? r.code : null,
+      reason: `ripwire failed (exit ${String(r.code)})`,
+      detail,
+      xml: null,
+    };
   }
   const parsed = parseScanXml(r.stdout, r.code);
   if (!parsed.ok) {
@@ -314,9 +315,19 @@ function summarize(findings: readonly Finding[], opts: ScanOptions, report: stri
   const lines = [`scan: ${crit > 0 ? "CRITICAL" : "WARN"} — ${findings.length} finding(s) (${counts}) in ${inSkills} skill(s)${vs}`];
 
   const rules = ranked(tally(findings.map((f) => esc(f.rule))));
-  lines.push(`  by rule:   ${rules.slice(0, MAX_RULES).map(([k, n]) => `${k} ${n}`).join(" · ")}${rules.length > MAX_RULES ? " · …" : ""}`);
+  lines.push(
+    `  by rule:   ${rules
+      .slice(0, MAX_RULES)
+      .map(([k, n]) => `${k} ${n}`)
+      .join(" · ")}${rules.length > MAX_RULES ? " · …" : ""}`,
+  );
   const skills = ranked(new Map([...perSkill].map(([k, n]) => [esc(k), n] as [string, number])));
-  lines.push(`  top skills: ${skills.slice(0, MAX_SKILLS).map(([k, n]) => `${k} ${n}`).join(" · ")}`);
+  lines.push(
+    `  top skills: ${skills
+      .slice(0, MAX_SKILLS)
+      .map(([k, n]) => `${k} ${n}`)
+      .join(" · ")}`,
+  );
 
   if (cmp !== null && cmp.fresh.length > 0) {
     lines.push("  new findings:");

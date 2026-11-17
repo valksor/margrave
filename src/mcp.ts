@@ -3,16 +3,7 @@ import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import {
-  NO_SOURCES_MESSAGE,
-  findSkills,
-  formatFind,
-  formatLoad,
-  loadContext,
-  loadSkill,
-  readSkillFile,
-  resolveSkill,
-} from "./skills.ts";
+import { NO_SOURCES_MESSAGE, findSkills, formatFind, formatLoad, loadContext, loadSkill, readSkillFile, resolveSkill } from "./skills.ts";
 
 export const SERVER_INSTRUCTIONS =
   "This server gives access to installed skills that the agent does not load by default. Before a task in an unfamiliar domain, tool, or framework, call find_skills with the task in plain words. Call load_skill with the best id. Call read_skill_file for a file that the skill names.";
@@ -61,20 +52,16 @@ export function createServer(): McpServer {
     },
   );
 
-  server.registerTool(
-    "load_skill",
-    { description: LOAD_DESCRIPTION, inputSchema: { id: z.string() } },
-    async ({ id }) => {
-      try {
-        const ctx = await loadContext();
-        if (ctx === null) return fail(new Error(NO_SOURCES_MESSAGE));
-        const entry = resolveSkill(ctx.index, id);
-        return ok(formatLoad(await loadSkill(entry, ctx.sources)));
-      } catch (err) {
-        return fail(err);
-      }
-    },
-  );
+  server.registerTool("load_skill", { description: LOAD_DESCRIPTION, inputSchema: { id: z.string() } }, async ({ id }) => {
+    try {
+      const ctx = await loadContext();
+      if (ctx === null) return fail(new Error(NO_SOURCES_MESSAGE));
+      const entry = resolveSkill(ctx.index, id);
+      return ok(formatLoad(await loadSkill(entry, ctx.sources)));
+    } catch (err) {
+      return fail(err);
+    }
+  });
 
   server.registerTool(
     "read_skill_file",

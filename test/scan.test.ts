@@ -18,7 +18,10 @@ test("frontmatter with a missing field is skipped, with a warning", async () => 
   await writeFile(path.join(root, "bad-yaml", "SKILL.md"), "---\nname: [unclosed\ndescription: x\n---\n");
 
   const r = await scanSource(root, { followSymlinks: false });
-  assert.deepEqual(r.skills.map((s) => s.name), ["good"]);
+  assert.deepEqual(
+    r.skills.map((s) => s.name),
+    ["good"],
+  );
   assert.equal(r.warnings.length, 4);
   assert.match(r.warnings.join("\n"), /missing description/u);
   assert.match(r.warnings.join("\n"), /missing name/u);
@@ -48,7 +51,10 @@ test("the walk skips .git and node_modules", async () => {
   await writeSkill(path.join(root, ".git"), "hidden2", "x");
   await writeSkill(root, "shown", "x");
   const r = await scanSource(root, { followSymlinks: false });
-  assert.deepEqual(r.skills.map((s) => s.name), ["shown"]);
+  assert.deepEqual(
+    r.skills.map((s) => s.name),
+    ["shown"],
+  );
 });
 
 test("git rules: a symlinked skill dir and a symlinked SKILL.md are skipped with a warning", async () => {
@@ -61,7 +67,10 @@ test("git rules: a symlinked skill dir and a symlinked SKILL.md are skipped with
   await link(path.join(outside, "evil", "SKILL.md"), path.join(root, "linked-md", "SKILL.md"));
 
   const r = await scanSource(root, { followSymlinks: false });
-  assert.deepEqual(r.skills.map((s) => s.name), ["real"]);
+  assert.deepEqual(
+    r.skills.map((s) => s.name),
+    ["real"],
+  );
   assert.match(r.warnings.join("\n"), /skipped symlink .*linked-dir/u);
   assert.match(r.warnings.join("\n"), /linked-md.*SKILL\.md is a symlink/u);
 });
@@ -94,7 +103,10 @@ test("local rules: a symlink cycle terminates", async () => {
   await link(root, path.join(root, "a", "back-to-root"));
   await link(path.join(root, "a"), path.join(root, "b"));
   const r = await scanSource(root, { followSymlinks: true });
-  assert.deepEqual(r.skills.map((s) => s.name), ["inner"]);
+  assert.deepEqual(
+    r.skills.map((s) => s.name),
+    ["inner"],
+  );
 });
 
 test("a duplicate name inside one source keeps the first and warns", async () => {
