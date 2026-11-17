@@ -1,0 +1,66 @@
+version: 2
+
+# Automates dependency currency. Dependabot is pnpm-aware (it updates pnpm-lock.yaml).
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    versioning-strategy: increase
+    # pnpm 12 rejects lockfile entries younger than 24h (minimumReleaseAge,
+    # default 1440 min), so a bump to a fresh release fails CI's
+    # `pnpm install --frozen-lockfile`. Make Dependabot wait longer than that
+    # gate so its PRs arrive already past it. 3 days also gives the ecosystem
+    # time to catch malicious releases before we pull them. Cooldown is a
+    # floor, not a freeze: Dependabot takes the newest version >= 3 days old.
+    # (Security updates bypass cooldown by design and may still trip the gate.)
+    cooldown:
+      default-days: 3
+    labels:
+      - "dependencies"
+    groups:
+      # Batch low-risk dev-dependency minor/patch bumps into one PR.
+      dev-minor-patch:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
+      # Batch low-risk runtime-dependency minor/patch bumps into one PR.
+      prod-minor-patch:
+        dependency-type: "production"
+        update-types:
+          - "minor"
+          - "patch"
+    # Major bumps land as individual PRs so they can be reviewed one at a time.
+
+  # Third-party (non actions/*, github/*) actions are pinned to a full commit
+  # SHA with a `# vX.Y.Z` comment (CodeQL actions/unpinned-tag); Dependabot
+  # bumps the SHA and the comment together.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    groups:
+      # Group routine action minor/patch bumps; majors (including the
+      # security-sensitive github/codeql-action) land as individual PRs.
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # The '/' entry covers .github/workflows/** only. Composite actions nested
+  # under .github/actions/*/action.yml need their own directory, or they
+  # silently drift behind the workflows on every major bump.
+  - package-ecosystem: "github-actions"
+    directory: "/.github/actions/setup-build"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "github-actions"

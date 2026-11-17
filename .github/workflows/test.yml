@@ -1,0 +1,59 @@
+name: Test
+
+on:
+  push:
+    branches: [master, feature/*]
+  pull_request:
+    branches: [master]
+  # build.yml calls this workflow as the gate in front of its release chain.
+  workflow_call:
+
+# Least-privilege token: nothing in this workflow writes to the repository.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref for PRs (fast feedback), but let
+# branch pushes finish so a green run is recorded per commit.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build
+
+      - name: Audit dependencies
+        # --prod scopes the gate to the runtime deps that ship to users, so an
+        # unfixable advisory in a dev-only tool can't block unrelated PRs.
+        run: pnpm audit --prod --audit-level=high
+
+      # Informational only (continue-on-error): surfaces CVEs in the
+      # devDependency tree that the --prod gate deliberately excludes.
+      - name: Audit dev dependencies (informational)
+        continue-on-error: true
+        run: pnpm audit --audit-level=high
+
+      - name: Run linter
+        run: pnpm lint
+
+      - name: Check formatting
+        run: pnpm format:check
+
+      - name: Type-check
+        run: pnpm typecheck
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Find unused code and dependencies
+        run: pnpm knip

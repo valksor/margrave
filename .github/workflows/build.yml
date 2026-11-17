@@ -1,0 +1,336 @@
+name: Build and Release
+
+on:
+  # No pull_request trigger: test.yml runs the same checks on every PR. The
+  # `test` job below calls it as the gate in front of the push-triggered release
+  # chain, which never fires on a PR.
+  push:
+    branches: [master]
+
+# Least-privilege default: a read-only token for every job. Only `attest` and
+# `create-release` escalate, and each declares its own block.
+permissions:
+  contents: read
+
+# Serialise the stateful release pipeline per ref. Without this, two quick
+# pushes run two full version-bump -> bundle -> create-release chains in
+# parallel, both bumping, pushing, and tagging from the same base. Never cancel
+# a build or release mid-flight.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Workflows can't gate on each other (there is no cross-workflow `needs`), so
+  # this job is the only thing between a red test suite and the release chain.
+  test:
+    uses: ./.github/workflows/test.yml
+
+  version-bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [test]
+    outputs:
+      new-version: ${{ steps.bump_version.outputs.NEW_VERSION }}
+      bump-type: ${{ steps.version_bump_type.outputs.BUMP_TYPE }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build
+        with:
+          install: "false"
+
+      - name: Determine version bump type
+        id: version_bump_type
+        # The commit message goes through the environment instead of
+        # ${{ ... }} interpolation, so backticks, $(), and parentheses in the
+        # message are never evaluated as shell. Only the subject line selects
+        # the bump: a [major] or [minor] token quoted in the body (a squashed or
+        # merged commit lists its parents' messages) must not promote the release.
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          SUBJECT=$(printf '%s' "$COMMIT_MSG" | head -n 1)
+          if [[ "$SUBJECT" =~ \[major\] ]]; then
+            echo "BUMP_TYPE=major" >> "$GITHUB_OUTPUT"
+          elif [[ "$SUBJECT" =~ \[minor\] ]]; then
+            echo "BUMP_TYPE=minor" >> "$GITHUB_OUTPUT"
+          else
+            echo "BUMP_TYPE=patch" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump version
+        id: bump_version
+        env:
+          BUMP_TYPE: ${{ steps.version_bump_type.outputs.BUMP_TYPE }}
+        # `--no-git-checks` skips pnpm's working-tree check; the bump only
+        # rewrites package.json, and nothing is committed or tagged here.
+        run: |
+          pnpm version "$BUMP_TYPE" --no-git-tag-version --no-git-checks
+          NEW_VERSION=$(node -p "require('./package.json').version")
+          echo "NEW_VERSION=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Upload bumped package.json
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bumped-package
+          path: package.json
+          retention-days: 1
+
+  # One release bundle per platform: the built CLI, its production
+  # node_modules, and the vendored ripwire, in a `margrave/` directory.
+  bundle:
+    name: bundle (${{ matrix.plat }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: [version-bump]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            plat: linux-x64
+          - os: ubuntu-24.04-arm
+            plat: linux-arm64
+          - os: macos-latest
+            plat: macos-arm64
+    env:
+      PLAT: ${{ matrix.plat }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build
+        with:
+          download-bumped: "true"
+
+      - name: Build
+        run: pnpm build
+
+      # `pnpm build` skips the download when the runner already has a ripwire
+      # on PATH. The bundle must always carry its own.
+      - name: Vendor ripwire
+        run: node scripts/ensure-ripwire.mjs --vendor
+
+      # margrave/ = the packed package + its production node_modules (hoisted,
+      # so the bundle holds no symlinks into a pnpm store) + vendor/ripwire.
+      - name: Stage and pack the bundle
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          STAGE="$RUNNER_TEMP/stage"
+          OUT="$RUNNER_TEMP/out"
+          rm -rf "$STAGE" "$OUT" "$RUNNER_TEMP/pack"
+          mkdir -p "$STAGE" "$OUT" "$RUNNER_TEMP/pack"
+
+          pnpm pack --pack-destination "$RUNNER_TEMP/pack"
+          tar -xzf "$RUNNER_TEMP/pack/margrave-$VERSION.tgz" -C "$STAGE"
+          mv "$STAGE/package" "$STAGE/margrave"
+
+          cp package.json pnpm-lock.yaml "$STAGE/margrave/"
+          (cd "$STAGE/margrave" && pnpm install --prod --frozen-lockfile --config.node-linker=hoisted)
+          rm "$STAGE/margrave/pnpm-lock.yaml"
+
+          mkdir -p "$STAGE/margrave/vendor"
+          cp -R vendor/ripwire "$STAGE/margrave/vendor/ripwire"
+
+          COPYFILE_DISABLE=1 tar -czf "$OUT/margrave-v$VERSION-$PLAT.tar.gz" -C "$STAGE" margrave
+
+          # The npm package is the same on every platform: upload it once.
+          if [[ "$PLAT" == "linux-x64" ]]; then
+            cp "$RUNNER_TEMP/pack/margrave-$VERSION.tgz" "$OUT/margrave-v$VERSION.tgz"
+          fi
+
+      # Unpacks the finished tarball into a fresh directory, with every PATH
+      # entry that holds a ripwire removed. The install can then only succeed
+      # through vendor/ripwire/ripwire. The second install, with that directory
+      # moved away, must refuse with "ripwire was not found": together they
+      # show that the scan ran through the vendored binary.
+      - name: Smoke test the bundle without ripwire on PATH
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          VERIFY="$RUNNER_TEMP/verify"
+          rm -rf "$VERIFY"
+          mkdir -p "$VERIFY"
+          tar -xzf "$RUNNER_TEMP/out/margrave-v$VERSION-$PLAT.tar.gz" -C "$VERIFY"
+          BUNDLE="$VERIFY/margrave"
+
+          CLEAN_PATH=""
+          OLD_IFS=$IFS
+          IFS=:
+          for dir in $PATH; do
+            if [[ ! -e "$dir/ripwire" ]]; then
+              CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$dir"
+            fi
+          done
+          IFS=$OLD_IFS
+
+          export PATH="$CLEAN_PATH"
+          if command -v ripwire > /dev/null; then
+            echo "::error::ripwire is still on the stripped PATH"
+            exit 1
+          fi
+
+          node "$BUNDLE/dist/cli.js" --help > /dev/null
+
+          SKILLS="$RUNNER_TEMP/smoke-skills"
+          rm -rf "$SKILLS"
+          mkdir -p "$SKILLS/smoke"
+          printf -- '---\nname: smoke\ndescription: Say hello.\n---\n# smoke\n\nGreet the user.\n' > "$SKILLS/smoke/SKILL.md"
+
+          MARGRAVE_HOME="$RUNNER_TEMP/home-vendored" node "$BUNDLE/dist/cli.js" install "$SKILLS"
+
+          mv "$BUNDLE/vendor/ripwire" "$BUNDLE/vendor/ripwire.off"
+          if MARGRAVE_HOME="$RUNNER_TEMP/home-missing" node "$BUNDLE/dist/cli.js" install "$SKILLS" > "$RUNNER_TEMP/refusal.txt" 2>&1; then
+            echo "::error::install succeeded without vendor/ripwire, so the first scan did not prove the vendored binary ran"
+            exit 1
+          fi
+          grep -q "ripwire was not found" "$RUNNER_TEMP/refusal.txt"
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bundle-${{ matrix.plat }}
+          path: ${{ runner.temp }}/out/*
+          retention-days: 1
+          if-no-files-found: error
+
+  attest:
+    needs: [bundle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # id-token: write lets the attestation step request a Sigstore OIDC token
+    # to sign with; attestations: write lets it store the signed attestation
+    # against this repository. Only this job holds them, so signing stays
+    # isolated from the steps that run repo and dependency code. It only
+    # downloads the artifacts.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bundle-*
+          path: artifacts
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          # Keep this glob in sync with create-release's files: list.
+          subject-path: artifacts/bundle-*/margrave-v*
+
+  create-release:
+    needs: [bundle, version-bump, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # A job-level permissions block REPLACES the workflow-level set (it does
+    # not merge). This job commits the version bump, pushes the tag, and
+    # publishes the release, so it escalates above the contents:read default.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The commit the bundles were built from, not the branch tip: a push
+          # that landed since must not leak into this release.
+          ref: ${{ github.sha }}
+
+      # No `pnpm install`: nothing from the repo or its dependencies runs in
+      # this job beyond reading package.json.
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build
+        with:
+          download-bumped: "true"
+          install: "false"
+
+      - name: Get version from package.json
+        id: get_version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      # Commit and push the bump BEFORE anything is published, so the tag the
+      # release creates points at a commit that exists on the branch. The push
+      # is a plain fast-forward: if the branch moved past the built commit
+      # meanwhile it is rejected and the job stops here, leaving nothing
+      # published. A re-run of this job after the bump was pushed finds it at the
+      # branch tip (a commit on top of the built one, carrying the new version)
+      # and reuses it instead of committing the same bump a second time, which
+      # would be rejected. The reuse only applies while the bump commit is still
+      # the branch tip. A push made with GITHUB_TOKEN does not start new workflow
+      # runs, so this commit does not release again.
+      - name: Commit and push version bump
+        id: bump_commit
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          BUILT_SHA: ${{ github.sha }}
+          NEW_VERSION: ${{ needs.version-bump.outputs.new-version }}
+          BUMP_TYPE: ${{ needs.version-bump.outputs.bump-type }}
+        run: |
+          set -euo pipefail
+          git fetch --depth=2 origin "refs/heads/$REF_NAME"
+          TIP_SHA=$(git rev-parse FETCH_HEAD)
+          TIP_PARENT=$(git rev-parse --verify --quiet "$TIP_SHA^" || true)
+          if [[ "$TIP_PARENT" == "$BUILT_SHA" ]]; then
+            TIP_VERSION=$(git show "$TIP_SHA:package.json" | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")
+            if [[ "$TIP_VERSION" == "$NEW_VERSION" ]]; then
+              echo "The version bump to $NEW_VERSION is already on $REF_NAME ($TIP_SHA); reusing it."
+              echo "sha=$TIP_SHA" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add package.json
+          git commit -m "Bump version to $NEW_VERSION ($BUMP_TYPE)" -m "Release commit from the build workflow."
+          if ! git push origin "HEAD:refs/heads/$REF_NAME"; then
+            echo "::error::Could not push the version bump to $REF_NAME (non-fast-forward: the branch moved past the built commit, or the push was refused). Nothing was published. A re-run succeeds only while the bump commit is still the branch tip; once the branch has moved on, push a new commit to release a new version."
+            exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bundle-*
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          tag_name: v${{ steps.get_version.outputs.VERSION }}
+          target_commitish: ${{ steps.bump_commit.outputs.sha }}
+          name: Release v${{ steps.get_version.outputs.VERSION }}
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            - **Bundle** (`margrave-v${{ steps.get_version.outputs.VERSION }}-<platform>.tar.gz`, for linux-x64, linux-arm64, and macos-arm64): margrave, its dependencies, and ripwire in one directory. Needs Node 27 or newer.
+            - **Package** (`margrave-v${{ steps.get_version.outputs.VERSION }}.tgz`): the npm package without ripwire. Put `ripwire` on `PATH`.
+
+            On macOS, download with `gh release download` or `curl`. A browser download is quarantined and macOS blocks the bundled ripwire; see the README for the `xattr` workaround.
+
+            ### Build Info
+            - Commit: ${{ github.sha }}
+            - Version: ${{ steps.get_version.outputs.VERSION }}
+            - Version Bump Type: ${{ needs.version-bump.outputs.bump-type }}
+            - Verify a download (GitHub CLI, signed in): `gh attestation verify <file> --repo valksor/margrave --signer-workflow valksor/margrave/.github/workflows/build.yml`
+          draft: false
+          prerelease: false
+          # Keep this glob in sync with the attest job's subject-path.
+          files: artifacts/bundle-*/margrave-v*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
