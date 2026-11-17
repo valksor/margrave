@@ -637,7 +637,7 @@ test("git source: a skill dir that is a symlink out of the clone is skipped", as
   assert.match(r.stderr, /warning: skipped .*md-link.*SKILL\.md is a symlink/u);
 });
 
-test("git source: the stored copy keeps no .git, after install and after update", async () => {
+test("git source: the stored copy keeps no .git after install, and update drops one left by an older install", async () => {
   const env = await setup();
   const dir = await tmp("mg-rootrepo-");
   await git(dir, "init", "-q", "-b", "main");
@@ -653,6 +653,9 @@ test("git source: the stored copy keeps no .git, after install and after update"
   assert.equal((await stat(path.join(stored, "SKILL.md"))).isFile(), true);
   assert.match((await mg(env, ["list"])).stdout, new RegExp(`^${id}  git  ref=main `, "mu"));
 
+  // A copy installed by an earlier version still holds the clone's .git.
+  await mkdir(path.join(stored, ".git"));
+  await writeFile(path.join(stored, ".git", "config"), "[remote]\n");
   await writeFile(path.join(dir, "SKILL.md"), skillMd("root-skill", "A skill at the repository root, changed"));
   await git(dir, "add", "-A");
   await git(dir, "commit", "-q", "-m", "second");

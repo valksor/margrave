@@ -14,7 +14,7 @@ import {
   HOSTED_SERVER_ERROR,
   createServer,
 } from "../src/mcp.ts";
-import { fakeRipwire, runCli, tmp, writeSkill } from "./helpers.ts";
+import { fakeRipwire, git, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
 
 interface ToolText {
   isError: boolean;
@@ -167,6 +167,27 @@ test("hosted: read_skill_file refuses .git and the text holds no store path", as
   assert.ok(!r.text.includes(home), r.text);
   assert.ok(!r.text.includes(dir), r.text);
   assert.ok(!r.text.includes("token"), r.text);
+});
+
+test("hosted: a git source with SKILL.md at the repository root serves no .git file", async (t) => {
+  const home = await useHome(t);
+  const fakeBin = await fakeRipwire();
+  const repo = await tmp("mg-rootrepo-");
+  await git(repo, "init", "-q", "-b", "main");
+  await writeFile(path.join(repo, "SKILL.md"), skillMd("root-skill", "A skill at the repository root"));
+  await git(repo, "add", "-A");
+  await git(repo, "commit", "-q", "-m", "initial");
+  const inst = await runCli(["install", `file://${repo}`], { home, fakeBin });
+  assert.equal(inst.code, 0, inst.stderr);
+  const id = `${/^installed (\S+)/mu.exec(inst.stdout)?.[1] ?? ""}/root-skill`;
+  const client = await connectHosted(t);
+
+  assert.equal((await call(client, "load_skill", { id })).isError, false);
+  for (const p of [".git/config", ".git/logs/HEAD"]) {
+    const r = await call(client, "read_skill_file", { id, path: p });
+    assert.equal(r.isError, true, p);
+    assert.match(r.text, /inside \.git/u);
+  }
 });
 
 test("hosted: a store failure returns a generic error and logs the cause", async (t) => {
