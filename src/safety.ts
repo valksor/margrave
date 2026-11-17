@@ -2,6 +2,9 @@
 // Exit codes: 0 clean, 1 WARN, 2 CRITICAL, 3 could not read.
 // stdout is `<skillscan files= findings= verdict=><f p="<abs path>:<line>" rule= sev=/>…</skillscan>`.
 //
+// ripwire lookup: the vendored `vendor/ripwire/ripwire` (the pinned version, checked by SHA-256 at build) runs
+// when it exists. Only without one does `ripwire` from PATH run, and then only at the pinned version or newer.
+//
 // `update` of a git source compares the new copy's findings with the installed copy's findings and
 // refuses only on findings that the installed copy does not have.
 import { execFile } from "node:child_process";
@@ -32,7 +35,7 @@ export interface ScanOptions {
    * Left out for `install`, which has nothing to compare against.
    */
   baselineDir?: string | null;
-  /** Where to look for ripwire when PATH has none. Tests only: the default is the vendored binary in the package root. */
+  /** The vendored ripwire to run first. Tests only: the default is the vendored binary in the package root. */
   vendored?: string;
 }
 
@@ -65,10 +68,21 @@ interface Execed {
   stdout: string;
   stderr: string;
   missing: boolean;
+  /** Set instead of a scan: ripwire on PATH is older than the pinned version, or reports none. */
+  refusal?: string;
 }
 
-/** The ripwire that `pnpm build` (scripts/ensure-ripwire.mjs) and the release bundles put in the package root. */
+/**
+ * The ripwire that `pnpm build` (scripts/ensure-ripwire.mjs) and the release bundles put in the package root.
+ * It runs first, so a weaker ripwire on PATH cannot gate an install.
+ */
 export const VENDORED_RIPWIRE = fileURLToPath(new URL("../vendor/ripwire/ripwire", import.meta.url));
+
+/** The ripwire version that scripts/ensure-ripwire.mjs vendors. A ripwire on PATH must be at least this version. */
+export const PINNED_RIPWIRE = "0.6.10";
+
+const ENSURE_RIPWIRE = fileURLToPath(new URL("../scripts/ensure-ripwire.mjs", import.meta.url));
+const VERSION_RE = /\d+\.\d+\.\d+/u;
 
 function exec(bin: string, dir: string): Promise<Execed> {
   return new Promise((resolve) => {
@@ -83,11 +97,44 @@ function exec(bin: string, dir: string): Promise<Execed> {
   });
 }
 
-/** `ripwire` from PATH first. The vendored binary only when PATH has none. `missing` is true when both are absent. */
+/** True when version `found` is older than `pinned`. Both are `<major>.<minor>.<patch>`. */
+function isOlder(found: string, pinned: string): boolean {
+  const a = found.split(".").map(Number);
+  const b = pinned.split(".").map(Number);
+  for (let i = 0; i < b.length; i++) {
+    if (a[i] !== b[i]) return (a[i] as number) < (b[i] as number);
+  }
+  return false;
+}
+
+/** The version `ripwire --version` prints, null when it fails or prints none. `missing` is true when PATH has no ripwire. */
+function pathVersion(): Promise<{ missing: boolean; version: string | null }> {
+  return new Promise((resolve) => {
+    execFile("ripwire", ["--version"], { encoding: "utf8" }, (err, stdout) => {
+      if (err === null) resolve({ missing: false, version: VERSION_RE.exec(stdout)?.[0] ?? null });
+      else resolve({ missing: (err as NodeJS.ErrnoException).code === "ENOENT", version: null });
+    });
+  });
+}
+
+/**
+ * The vendored binary when it exists. A vendored binary that cannot run is not replaced by PATH: it fails like any ripwire failure.
+ * Without one, `ripwire` from PATH, refused (`refusal`) when older than PINNED_RIPWIRE. `missing` is true when both are absent.
+ */
 export async function runRipwire(dir: string, vendored: string = VENDORED_RIPWIRE): Promise<Execed> {
-  const r = await exec("ripwire", dir);
-  if (!r.missing || !existsSync(vendored)) return r;
-  return exec(vendored, dir);
+  if (existsSync(vendored)) return exec(vendored, dir);
+  const found = await pathVersion();
+  if (found.missing) return { code: "ENOENT", stdout: "", stderr: "", missing: true };
+  if (found.version === null || isOlder(found.version, PINNED_RIPWIRE)) {
+    return {
+      code: null,
+      stdout: "",
+      stderr: "",
+      missing: false,
+      refusal: `ripwire on PATH reports ${found.version ?? "no version"}, older than the pinned ${PINNED_RIPWIRE}; run: node ${ENSURE_RIPWIRE}, or update ripwire`,
+    };
+  }
+  return exec("ripwire", dir);
 }
 
 // ---- parsing ----
@@ -218,6 +265,7 @@ async function runScan(dir: string, vendored: string): Promise<ScanResult> {
   const r = await runRipwire(realRoot, vendored);
   const stderr = r.stderr.trim();
   const detail = stderr !== "" ? stderr : r.stdout.trim();
+  if (r.refusal !== undefined) return { status: "failed", code: null, reason: r.refusal, detail: "", xml: null };
   if (r.code === 0) return { status: "clean" };
   if (r.missing) return { status: "failed", code: null, reason: `ripwire was not found on PATH or at ${vendored}`, detail, xml: null };
   if (r.code === 3) return { status: "failed", code: 3, reason: "ripwire could not read the files (exit 3)", detail, xml: null };

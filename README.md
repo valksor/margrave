@@ -26,10 +26,10 @@ nvm use && pnpm install --frozen-lockfile && pnpm run build && pnpm add -g "$PWD
 
 Every push to `master` publishes a release at https://github.com/valksor/margrave/releases with these assets. All of them need Node 27 or newer (see above).
 
-| Asset                                                                                | Contents                                                                                                                                                  |
-| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `margrave-v<version>-linux-x64.tar.gz`, `-linux-arm64.tar.gz`, `-macos-arm64.tar.gz` | A `margrave/` directory with the built CLI, its production `node_modules`, and ripwire in `vendor/ripwire/`. Nothing else to install.                     |
-| `margrave-v<version>.tgz`                                                            | The npm package. It does not carry ripwire: put `ripwire` on `PATH`, or run `node <package dir>/scripts/ensure-ripwire.mjs` once to fetch the pinned one. |
+| Asset                                                                                | Contents                                                                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `margrave-v<version>-linux-x64.tar.gz`, `-linux-arm64.tar.gz`, `-macos-arm64.tar.gz` | A `margrave/` directory with the built CLI, its production `node_modules`, and ripwire in `vendor/ripwire/`. Nothing else to install.                                                                                            |
+| `margrave-v<version>.tgz`                                                            | The npm package. It does not carry ripwire: run `node <package dir>/scripts/ensure-ripwire.mjs` once to fetch the pinned one. Without it, margrave falls back to `ripwire` on `PATH`, which must be at least the pinned version. |
 
 Bundle:
 
@@ -145,12 +145,17 @@ This syntax was checked against `ripwire --help` and against a clean directory (
 | 0                                                                                                                                           | continue, no output            |
 | 1 (WARN)                                                                                                                                    | print the summary and continue |
 | 2 (CRITICAL), 3 (could not read), any other code, output that cannot be parsed, or ripwire found neither on `PATH` nor in `vendor/ripwire/` | refuse                         |
+| no `vendor/ripwire/`, and `ripwire` on `PATH` is older than the pinned version or prints no version                                         | refuse                         |
 
 `--allow-unsafe` overrides a refusal for that one `install` or `update` and prints what it overrode. Git sources are scanned in staging, so `update` never leaves an unscanned revision live. Local sources are scanned on `install`. `update` on a local source only reindexes.
 
 ### Where ripwire comes from
 
-margrave runs `ripwire` from `PATH` first. When `PATH` has none, it runs `vendor/ripwire/ripwire` in the package root. `pnpm run build` runs `scripts/ensure-ripwire.mjs`, which does nothing when `ripwire` is on `PATH` or `vendor/ripwire/` already holds the pinned version. Otherwise it downloads the pinned ripwire release (0.6.10 from [redhat-et/ripwire](https://github.com/redhat-et/ripwire)), checks the SHA-256 that is hard-coded in the script, and unpacks only the binary and its `LICENSE` into `vendor/ripwire/` (git-ignored). A failed download or checksum fails the build.
+margrave runs `vendor/ripwire/ripwire` in the package root first, so a ripwire on `PATH` cannot make the scan weaker. It runs `ripwire` from `PATH` only when there is no vendored copy. `pnpm run build` and `node scripts/ensure-ripwire.mjs` always make sure `vendor/ripwire/` holds the pinned version, whatever `ripwire` is on `PATH`. The script does nothing when `vendor/ripwire/` already holds it. Otherwise it downloads the pinned ripwire release (0.6.10 from [redhat-et/ripwire](https://github.com/redhat-et/ripwire)), checks the SHA-256 that is hard-coded in the script, and unpacks only the binary and its `LICENSE` into `vendor/ripwire/` (git-ignored). A failed download or checksum fails the build.
+
+The npm package has no vendored copy. Run `node <package dir>/scripts/ensure-ripwire.mjs` once rather than relying on `PATH`. The `PATH` fallback refuses a `ripwire` that is older than the pinned version, or that prints no version, and tells you to run that script or update ripwire. `--allow-unsafe` overrides this refusal like any other.
+
+A vendored binary that exists but cannot run (for example a quarantined macOS download, see the `xattr` note above) makes `install` and `update` refuse with `ripwire failed`. margrave does not fall back to `PATH` in that case.
 
 Prebuilt ripwire exists for linux-x64, linux-arm64, and macos-arm64. On any other platform the build prints a warning and you install ripwire yourself (see its `INSTALL.md`) and put it on `PATH`. Without ripwire, `install` and `update` refuse.
 

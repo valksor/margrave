@@ -1,12 +1,11 @@
-// Makes sure margrave can find ripwire, which `install` and `update` need for the skill scan.
+// Makes sure vendor/ripwire/ holds the pinned ripwire. margrave runs that copy first for the skill scan
+// of `install` and `update`, and `ripwire` from PATH only when there is none. A ripwire on PATH does not skip this.
 //
-// 1. `ripwire` on PATH runs: nothing to do (skipped with --vendor).
-// 2. vendor/ripwire/ already holds the pinned version: nothing to do.
-// 3. Otherwise download the pinned release, check its SHA-256 before it is unpacked, and vendor the
+// 1. vendor/ripwire/ already holds the pinned version: nothing to do.
+// 2. Otherwise download the pinned release, check its SHA-256 before it is unpacked, and vendor the
 //    binary and its LICENSE into vendor/ripwire/. Interrupted runs never leave a half-written vendor/ripwire/.
 //
-// --vendor: always vendor, even when PATH has ripwire (release bundles use it).
-// Unsupported platform: warning, exit 0. Download or checksum failure: exit 1.
+// Unsupported platform: warning, exit 0 (PATH is the only scanner there). Download or checksum failure: exit 1.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -34,14 +33,6 @@ function fail(message) {
 function versionOf(bin) {
   const r = spawnSync(bin, ["--version"], { encoding: "utf8" });
   return r.status === 0 ? r.stdout.trim() : null;
-}
-
-if (!process.argv.includes("--vendor")) {
-  const onPath = versionOf("ripwire");
-  if (onPath !== null) {
-    console.log(`ensure-ripwire: using ripwire on PATH (${onPath})`);
-    process.exit(0);
-  }
 }
 
 const stamp = path.join(target, "VERSION");

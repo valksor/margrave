@@ -33,7 +33,7 @@
   "packageManager": "pnpm@12.21.0",
   "scripts": {
     "build": "tsrs && chmod +x dist/cli.js && node scripts/ensure-ripwire.mjs",
-    "test": "c8 --check-coverage --100 --all --src src --include 'src/**/*.ts' --reporter=text node --test test/",
+    "test": "c8 --check-coverage --100 --all --src src --include 'src/**/*.ts' --reporter=text node --import ./test/no-vendored-ripwire.ts --test test/",
     "lint": "oxlint",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

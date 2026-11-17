@@ -26,13 +26,13 @@ Thank you for your interest in contributing to margrave. Contributions are welco
    pnpm install --frozen-lockfile
    pnpm run build
    ```
-   `pnpm run build` also downloads a pinned ripwire into `vendor/ripwire/` when `ripwire` is not on your `PATH`. See "Where ripwire comes from" in the README.
+   `pnpm run build` also downloads the pinned ripwire into `vendor/ripwire/`, whatever `ripwire` is on your `PATH`. margrave runs the vendored copy first. See "Where ripwire comes from" in the README.
 
 ## Development
 
 ### Available scripts
 
-- `pnpm build` - Compile `src/` to `dist/` with tsrs, then make sure ripwire is available
+- `pnpm build` - Compile `src/` to `dist/` with tsrs, then make sure `vendor/ripwire/` holds the pinned ripwire
 - `pnpm test` - Run the tests under c8 (`node --test test/`; no network, temporary `MARGRAVE_HOME`). It fails when line, branch, function, or statement coverage of `src/` is below 100%. The coverage gate needs a non-root user, because the tests that need unreadable files skip as root
 - `pnpm lint` - Check the code with oxlint
 - `pnpm format` - Format all files with prettier

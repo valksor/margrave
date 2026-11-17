@@ -3,9 +3,12 @@ import { chmod, mkdir, mkdtemp, realpath, symlink, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { PINNED_RIPWIRE } from "../src/safety.ts";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const CLI = path.join(ROOT, "src", "cli.ts");
+/** Preload that hides a vendored ripwire from margrave. `runCli` puts it in front of every spawned CLI. */
+export const NO_VENDORED_PRELOAD = path.join(ROOT, "test", "no-vendored-ripwire.ts");
 
 export async function tmp(prefix = "mg-"): Promise<string> {
   return realpath(await mkdtemp(path.join(tmpdir(), prefix)));
@@ -20,10 +23,12 @@ export async function tmp(prefix = "mg-"): Promise<string> {
  *   FAKE_RIPWIRE_SEV=<sev>       override every row's severity
  *   FAKE_RIPWIRE_SEV_ON=<text>   with SEV: only when the scanned dir path contains <text>
  *   FAKE_RIPWIRE_FAIL_ON=<text>  exit 3 when the scanned dir path contains <text>
+ * `--version` prints the pinned version, so margrave accepts the fake as a PATH ripwire.
  * POSIX sh only: it must run under macOS /bin/sh with BSD grep and sed. The script has no `${` so
  * that String.raw keeps it readable.
  */
 const FAKE_RIPWIRE = String.raw`#!/bin/sh
+if [ "$1" = "--version" ]; then echo "ripwire @VERSION@ (fake)"; exit 0; fi
 dir=
 for a in "$@"; do
   case "$a" in --scan-skills=*) dir=$(printf '%s' "$a" | cut -c15-) ;; esac
@@ -65,7 +70,7 @@ exit "$code"
 export async function fakeRipwire(): Promise<string> {
   const dir = await tmp("mg-fakebin-");
   const file = path.join(dir, "ripwire");
-  await writeFile(file, FAKE_RIPWIRE);
+  await writeFile(file, FAKE_RIPWIRE.replace("@VERSION@", PINNED_RIPWIRE));
   await chmod(file, 0o755);
   return dir;
 }
@@ -83,7 +88,7 @@ export interface RunOptions {
   fakeBin?: string;
   extra?: Record<string, string>;
   cwd?: string;
-  /** Extra node options, put before the CLI path (for example a `--import` of a preload). */
+  /** Extra node options, put after the no-vendored-ripwire preload and before the CLI path (for example a `--import` of a preload). */
   nodeArgs?: string[];
 }
 
@@ -92,7 +97,7 @@ export function runCli(args: string[], opts: RunOptions): Promise<Run> {
   return new Promise((resolve) => {
     execFile(
       process.execPath,
-      [...(opts.nodeArgs ?? []), CLI, ...args],
+      ["--import", NO_VENDORED_PRELOAD, ...(opts.nodeArgs ?? []), CLI, ...args],
       {
         cwd: opts.cwd ?? ROOT,
         encoding: "utf8",
