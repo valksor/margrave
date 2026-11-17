@@ -67,6 +67,6 @@ export function wrap(agentArg: string): { text: string; note: string | null } {
     throw new UsageError(`unknown agent "${agentArg}"; use one of: ${AGENTS.join(", ")}`);
   }
   const input = defaultWrapInput();
-  const note = existsSync(input.cliPath) ? null : `note: ${input.cliPath} does not exist yet; run: npm run build`;
+  const note = existsSync(input.cliPath) ? null : `note: ${input.cliPath} does not exist yet; run: pnpm run build`;
   return { text: renderWrap(agentArg as Agent, input), note };
 }

@@ -13,8 +13,10 @@ Skills are not loaded into the agent by default, so 1000+ installed skills cost 
 Node 27 or newer. The repo pins `27.0.0-alpha.0.1.0` in `.nvmrc`. nvm hides alpha builds by default, so install it with `nvm install --only=alpha 27.0.0-alpha.0.1.0` before `nvm use`.
 
 ```sh
-nvm use && npm ci && npm run build && npm link
+nvm use && pnpm install --frozen-lockfile && pnpm run build && pnpm add -g "$PWD"
 ```
+
+`pnpm add -g` needs pnpm's global bin directory on `PATH`. If it is not there yet, run `pnpm setup` once and open a new shell.
 
 ## 2. Install a skill source
 
@@ -182,7 +184,7 @@ A missing `sources.json` is an empty list. A malformed one is an error, and marg
 ## Development
 
 ```sh
-nvm use && npm ci
-npm run build   # tsrs, then chmod +x dist/cli.js
-npm test        # node --test test/ (runs the .ts sources directly; no network, temp MARGRAVE_HOME)
+nvm use && pnpm install --frozen-lockfile
+pnpm run build  # tsrs, then chmod +x dist/cli.js
+pnpm test       # node --test test/ (runs the .ts sources directly; no network, temp MARGRAVE_HOME)
 ```
