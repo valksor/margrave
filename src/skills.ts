@@ -106,6 +106,11 @@ export function formatFind(hits: readonly FindHit[], text: FindText = CLI_FIND_T
 const MAX_LISTED_FILES = 200;
 const SKIP_DIRS = new Set([".git", "node_modules"]);
 
+/** True when a path relative to the skill dir has a component named .git (case-insensitive, for APFS). HFS+ ignorable code points are not covered. */
+function isGitPath(rel: string): boolean {
+  return rel.split(path.sep).some((s) => s.toLowerCase() === ".git");
+}
+
 /** Regular files inside a skill dir, relative, sorted. Follows no symlink. */
 export async function listFiles(dir: string): Promise<string[]> {
   const out: string[] = [];
@@ -146,6 +151,7 @@ export async function readSkillFile(dir: string, rel: string): Promise<string> {
   const joined = path.resolve(realDir, rel);
   // Lexical check first, so a path outside the directory never reveals whether it exists.
   if (!joined.startsWith(prefix)) throw new RequestError(`path ${clean(rel)} is outside the skill directory`);
+  if (isGitPath(path.relative(realDir, joined))) throw new RequestError(`path ${clean(rel)} is inside .git, which is not served`);
   let realFile: string;
   try {
     realFile = await realpath(joined);
@@ -155,6 +161,7 @@ export async function readSkillFile(dir: string, rel: string): Promise<string> {
   if (!realFile.startsWith(prefix)) {
     throw new RequestError(`path ${clean(rel)} is outside the skill directory`);
   }
+  if (isGitPath(path.relative(realDir, realFile))) throw new RequestError(`path ${clean(rel)} is inside .git, which is not served`);
   const st = await stat(realFile);
   if (!st.isFile()) throw new RequestError(`not a file: ${clean(rel)}`);
   return readFile(realFile, "utf8");

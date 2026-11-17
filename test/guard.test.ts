@@ -28,6 +28,38 @@ test("--file refuses ../, an absolute path, and a symlink out of the dir", async
   await assert.rejects(readSkillFile(dir, "ref\u0000.md"), MargraveError);
 });
 
+test("--file refuses any path with a .git component and serves lookalikes", async () => {
+  const root = await tmp();
+  const dir = await writeSkill(root, "skill", "s");
+  await mkdir(path.join(dir, ".git"));
+  await writeFile(path.join(dir, ".git", "config"), "[remote]\nurl = https://user:token@example.com/r.git\n");
+  await mkdir(path.join(dir, "sub", ".git"), { recursive: true });
+  await writeFile(path.join(dir, "sub", ".git", "HEAD"), "ref: refs/heads/main\n");
+  await link(path.join(dir, ".git", "config"), path.join(dir, "cfg"));
+  await writeFile(path.join(dir, ".gitignore"), "ignore\n");
+  await writeFile(path.join(dir, ".gitmodules"), "modules\n");
+  await mkdir(path.join(dir, ".github", "workflows"), { recursive: true });
+  await writeFile(path.join(dir, ".github", "workflows", "x.yml"), "workflow\n");
+  await writeFile(path.join(dir, "git.md"), "git md\n");
+  await mkdir(path.join(dir, "node_modules", "x"), { recursive: true });
+  await writeFile(path.join(dir, "node_modules", "x", "y.md"), "module\n");
+
+  // `.GIT/config` does not exist on a case-sensitive file system; the lexical check refuses it before any file access.
+  for (const bad of [".git/config", "./.git/config", "x/../.git/config", "sub/.git/HEAD", ".GIT/config", "cfg", ".git/nothing"]) {
+    await assert.rejects(readSkillFile(dir, bad), /inside \.git/u, bad);
+  }
+  assert.equal(await readSkillFile(dir, ".gitignore"), "ignore\n");
+  assert.equal(await readSkillFile(dir, ".gitmodules"), "modules\n");
+  assert.equal(await readSkillFile(dir, ".github/workflows/x.yml"), "workflow\n");
+  assert.equal(await readSkillFile(dir, "git.md"), "git md\n");
+  assert.equal(await readSkillFile(dir, "node_modules/x/y.md"), "module\n");
+
+  // A worktree or submodule has a .git regular file (a gitfile); it is refused too.
+  const gitfile = await writeSkill(root, "gitfile", "s");
+  await writeFile(path.join(gitfile, ".git"), "gitdir: /somewhere\n");
+  await assert.rejects(readSkillFile(gitfile, ".git"), /inside \.git/u);
+});
+
 test("the guard compares with a trailing separator: /a/skill does not allow /a/skill2", async () => {
   const root = await tmp();
   const dir = await writeSkill(root, "skill", "s");

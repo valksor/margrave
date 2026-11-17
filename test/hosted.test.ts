@@ -149,6 +149,26 @@ test("hosted: find, load, read, and request errors, with no server path in any t
   noPaths(unknown.text);
 });
 
+test("hosted: read_skill_file refuses .git and the text holds no store path", async (t) => {
+  const home = await useHome(t);
+  const fakeBin = await fakeRipwire();
+  const dir = await tmp("mg-localsrc-");
+  const skillDir = await writeSkill(dir, "terraform-modules", "Design reusable Terraform modules");
+  await mkdir(path.join(skillDir, ".git"));
+  await writeFile(path.join(skillDir, ".git", "config"), "[remote]\nurl = https://user:token@example.com/r.git\n");
+  const inst = await runCli(["install", dir], { home, fakeBin });
+  assert.equal(inst.code, 0, inst.stderr);
+  const id = `${/^installed (\S+)/mu.exec(inst.stdout)?.[1] ?? ""}/terraform-modules`;
+  const client = await connectHosted(t);
+
+  const r = await call(client, "read_skill_file", { id, path: ".git/config" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /inside \.git/u);
+  assert.ok(!r.text.includes(home), r.text);
+  assert.ok(!r.text.includes(dir), r.text);
+  assert.ok(!r.text.includes("token"), r.text);
+});
+
 test("hosted: a store failure returns a generic error and logs the cause", async (t) => {
   const home = await useHome(t);
   const fakeBin = await fakeRipwire();

@@ -637,6 +637,31 @@ test("git source: a skill dir that is a symlink out of the clone is skipped", as
   assert.match(r.stderr, /warning: skipped .*md-link.*SKILL\.md is a symlink/u);
 });
 
+test("git source: the stored copy keeps no .git, after install and after update", async () => {
+  const env = await setup();
+  const dir = await tmp("mg-rootrepo-");
+  await git(dir, "init", "-q", "-b", "main");
+  await writeFile(path.join(dir, "SKILL.md"), skillMd("root-skill", "A skill at the repository root"));
+  await git(dir, "add", "-A");
+  await git(dir, "commit", "-q", "-m", "initial");
+
+  const inst = await mg(env, ["install", `file://${dir}`]);
+  assert.equal(inst.code, 0, inst.stderr);
+  const id = sourceId(inst);
+  const stored = path.join(env.home, "sources", id);
+  await assert.rejects(stat(path.join(stored, ".git")), { code: "ENOENT" });
+  assert.equal((await stat(path.join(stored, "SKILL.md"))).isFile(), true);
+  assert.match((await mg(env, ["list"])).stdout, new RegExp(`^${id}  git  ref=main `, "mu"));
+
+  await writeFile(path.join(dir, "SKILL.md"), skillMd("root-skill", "A skill at the repository root, changed"));
+  await git(dir, "add", "-A");
+  await git(dir, "commit", "-q", "-m", "second");
+  const upd = await mg(env, ["update", id]);
+  assert.equal(upd.code, 0, upd.stderr);
+  assert.ok(upd.stdout.includes(`changed: ${id}/root-skill`), upd.stdout);
+  await assert.rejects(stat(path.join(stored, ".git")), { code: "ENOENT" });
+});
+
 test("usage errors exit 2, unknown commands exit 2, and find/list say when no sources exist", async () => {
   const env = await setup();
   assert.equal((await mg(env, [])).code, 2);

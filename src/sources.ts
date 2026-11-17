@@ -345,6 +345,8 @@ async function installGit(
     // No --ref: pin the branch the remote's default resolved to, so a later
     // `update` stays on it even if the remote changes its default branch.
     const pinned = ref ?? (await git(["-C", clone, "symbolic-ref", "--short", "HEAD"])).trim();
+    // The store serves files from here; clone metadata holds the remote URL and the operator's identity.
+    await rm(path.join(clone, ".git"), { recursive: true, force: true });
     const realClone = await realpath(clone);
     const scanRoot = await realpath(await resolveScanRoot(realClone, parsed.subpath));
     const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone });
@@ -442,6 +444,8 @@ async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
   return withStaging(async (stage) => {
     const clone = path.join(stage, "repo");
     const sha = await gitClone(url, rec.ref, clone);
+    // The store serves files from here; clone metadata holds the remote URL and the operator's identity.
+    await rm(path.join(clone, ".git"), { recursive: true, force: true });
     const realClone = await realpath(clone);
     const scanRoot = await realpath(await resolveScanRoot(realClone, rec.subpath));
     const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone });

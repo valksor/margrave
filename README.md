@@ -119,11 +119,12 @@ A spec or `--ref` that starts with `-` is refused. A `..` subpath segment is ref
 A skill is a directory with a `SKILL.md` whose frontmatter (YAML) has `name` and `description`. A `SKILL.md` without both is skipped with a warning on stderr. The walk skips `.git` and `node_modules`.
 
 - Git sources follow no symlink. A symlinked skill directory or `SKILL.md` is skipped with a warning.
+- The stored copy of a git source keeps no `.git` directory. A copy installed by an earlier version drops it at the next `margrave update`.
 - Local sources follow directory symlinks. A symlinked `SKILL.md` is skipped. A set of visited real paths stops cycles.
 
 ### Path guard
 
-`load --file` and the MCP `read_skill_file` tool refuse absolute paths and any path whose real path does not start with the real path of the skill directory plus a path separator. A symlink out of the skill directory is refused.
+`load --file` and the MCP `read_skill_file` tool refuse absolute paths and any path whose real path does not start with the real path of the skill directory plus a path separator. A symlink out of the skill directory is refused. A path that has a `.git` component is refused.
 
 ### Terminal output
 
