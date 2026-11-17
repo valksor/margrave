@@ -10,7 +10,7 @@ Skills are not loaded into the agent by default, so 1000+ installed skills cost 
 
 ## 1. Install margrave itself
 
-Node 26 or newer. The repo pins `26.13.0` in `.nvmrc`.
+Node 27 or newer. The repo pins `27.0.0-alpha.0.1.0` in `.nvmrc`. nvm hides alpha builds by default, so install it with `nvm install --only=alpha 27.0.0-alpha.0.1.0` before `nvm use`.
 
 ```sh
 nvm use && npm ci && npm run build && npm link
