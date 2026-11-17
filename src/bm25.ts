@@ -33,6 +33,8 @@ const MIN_STEM = 3;
 
 function stem(word: string): string {
   let w = word;
+  // "policies"/"queried" -> "policy"/"query", the same stem as the base word.
+  if (/(ies|ied)$/u.test(w) && w.length - 2 >= MIN_STEM) return `${w.slice(0, -3)}y`;
   // Plural first, so "strings" and "string" end at the same stem.
   if (/(sses|xes|ches|shes|zes)$/u.test(w) && w.length - 2 >= MIN_STEM) {
     w = w.slice(0, -2);
@@ -44,6 +46,8 @@ function stem(word: string): string {
   } else if (w.endsWith("ed") && w.length - 2 >= MIN_STEM) {
     w = w.slice(0, -2);
   }
+  // "compromise" and "compromised" both end at "compromis".
+  if (w.endsWith("e") && w.length - 1 >= MIN_STEM) w = w.slice(0, -1);
   return w;
 }
 

@@ -19,12 +19,25 @@ test("tokenizer keeps two-letter tech tokens and drops one-letter tokens", () =>
   assert.deepEqual(tokenize("go js x ci"), ["go", "js", "ci"]);
 });
 
+test("tokenizer maps e-final and y-final base words to the same stem as their inflections", () => {
+  for (const group of [
+    ["compromise", "compromised", "compromising", "compromises"],
+    ["analyze", "analyzed", "analyzing", "analyzes"],
+    ["image", "imaging", "images"],
+    ["policy", "policies"],
+    ["query", "queried", "queries"],
+  ]) {
+    const stems = new Set(group.map((w) => tokenize(w).join(" ")));
+    assert.equal(stems.size, 1, `${group.join(", ")} -> ${[...stems].join(" | ")}`);
+  }
+});
+
 test("tokenizer stems -ing, -ed, -es, -s consistently", () => {
   assert.deepEqual(tokenize("testing"), ["test"]);
   assert.deepEqual(tokenize("tested"), ["test"]);
   assert.deepEqual(tokenize("tests"), ["test"]);
   assert.deepEqual(tokenize("boxes"), ["box"]);
-  assert.deepEqual(tokenize("files"), ["file"]);
+  assert.deepEqual(tokenize("files"), tokenize("file"));
   assert.deepEqual(tokenize("string strings"), tokenize("strings string"));
   assert.deepEqual(tokenize("class"), ["class"]);
 });
