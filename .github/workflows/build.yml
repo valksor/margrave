@@ -131,9 +131,10 @@ jobs:
           tar -xzf "$RUNNER_TEMP/pack/margrave-$VERSION.tgz" -C "$STAGE"
           mv "$STAGE/package" "$STAGE/margrave"
 
-          cp package.json pnpm-lock.yaml "$STAGE/margrave/"
+          cp package.json pnpm-lock.yaml pnpm-workspace.yaml "$STAGE/margrave/"
           (cd "$STAGE/margrave" && pnpm install --prod --frozen-lockfile --config.node-linker=hoisted)
           rm "$STAGE/margrave/pnpm-lock.yaml"
+          rm "$STAGE/margrave/pnpm-workspace.yaml"
 
           mkdir -p "$STAGE/margrave/vendor"
           cp -R vendor/ripwire "$STAGE/margrave/vendor/ripwire"

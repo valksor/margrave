@@ -1,0 +1,7 @@
+# c8 -> test-exclude@8 pins glob ^13 and minimatch ^10. Both have advisories
+# fixed only in the next major (glob >=14.0.2, minimatch >=11.0.1). Exact
+# pins: minimatch 11.0.9 is newer than the 3-day cooldown in dependabot.yml.
+# Remove these when test-exclude depends on the fixed majors.
+overrides:
+  glob: "14.0.6"
+  minimatch: "11.0.8"
