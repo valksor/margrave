@@ -885,7 +885,7 @@ jobs:
 
             Upgrading a bundle or Homebrew install from 0.1.2 or earlier: first, if you symlinked a bundle, point that symlink at `margrave/bin/margrave` (`ln -sf`). Then run `margrave wrap <agent>` again and apply its output, because old agent configs start `node .../dist/cli.js`, which no longer exists. The README section "Upgrading from 0.1.2 or earlier" has the exact commands.
 
-            The macOS bundle's `margrave` and ripwire are signed with a Developer ID. Each release is published as a pre-release first and becomes the latest release once Apple's notarization accepts them (usually minutes, sometimes hours); Homebrew follows the latest release. Until then macOS blocks a browser download of the macOS bundle; `curl` and `gh release download` are not affected. Offline, see the README.
+            The macOS bundle's `margrave` and ripwire are signed with a Developer ID. Each release is published as a pre-release first and becomes the latest release once Apple's notarization accepts them (usually minutes, sometimes hours); a release Apple rejects stays a pre-release. Homebrew follows the latest release. Until then macOS blocks a browser download of the macOS bundle; `curl` and `gh release download` are not affected. Offline, see the README.
 
             ### Build Info
             - Commit: ${{ github.sha }}
