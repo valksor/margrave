@@ -50,6 +50,36 @@ test("headings skip fenced code blocks", () => {
   assert.deepEqual(extractHeadings(body), ["One", "Two"]);
 });
 
+for (const marker of ["`", "~"]) {
+  const other = marker === "`" ? "~" : "`";
+  for (const [name, inside, closer] of [
+    ["shorter run", marker.repeat(3), marker.repeat(4)],
+    ["opposite marker", other.repeat(4), marker.repeat(4)],
+    ["suffix text", `${marker.repeat(4)} suffix`, marker.repeat(4)],
+    ["longer closer with whitespace", marker.repeat(3), `   ${marker.repeat(5)} \t`],
+  ]) {
+    test(`headings: ${marker} fence ignores ${name}`, () => {
+      assert.deepEqual(extractHeadings(`${marker.repeat(4)}info\n${inside}\n# hidden\n${closer}\n# visible`), ["visible"]);
+    });
+  }
+  test(`headings: unclosed ${marker} fence hides the rest`, () => {
+    assert.deepEqual(extractHeadings(`   ${marker.repeat(3)} language\n# hidden`), []);
+  });
+}
+
+test("headings: a backtick in a backtick opener info string prevents opening", () => {
+  assert.deepEqual(extractHeadings("```lang`extra\n# visible"), ["visible"]);
+});
+
+for (const marker of ["`", "~"]) {
+  test(`headings: ${marker} fence accepts info and an equal closer with whitespace`, () => {
+    assert.deepEqual(extractHeadings(`   ${marker.repeat(3)} language info\n# hidden\n${marker.repeat(3)} \t\n# visible`), ["visible"]);
+  });
+  test(`headings: four leading spaces do not open a ${marker} fence`, () => {
+    assert.deepEqual(extractHeadings(`    ${marker.repeat(3)} language\n# visible`), ["visible"]);
+  });
+}
+
 test("the walk skips .git and node_modules", async () => {
   const root = await tmp();
   await writeSkill(path.join(root, "node_modules"), "hidden", "x");

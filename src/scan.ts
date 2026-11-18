@@ -67,12 +67,12 @@ export function extractHeadings(body: string): string[] {
   const out: string[] = [];
   let fence: string | null = null;
   for (const line of body.split(/\r?\n/u)) {
-    const f = /^\s{0,3}(`{3,}|~{3,})/u.exec(line);
+    // Backtick info strings cannot contain backticks; group 2 marks a whitespace-only suffix.
+    const f = /^ {0,3}(`{3,}(?=[^`]*$)|~{3,})(?:([ \t]*$)|)/u.exec(line);
     if (f !== null) {
-      // Group 1 is one or more fence characters, so its first character exists.
-      const marker = (f[1] as string)[0] as string;
+      const marker = f[1] as string;
       if (fence === null) fence = marker;
-      else if (fence === marker) fence = null;
+      else if (f[2] !== undefined && marker.startsWith(fence)) fence = null;
       continue;
     }
     if (fence !== null) continue;
