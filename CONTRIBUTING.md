@@ -33,12 +33,15 @@ Thank you for your interest in contributing to margrave. Contributions are welco
 ### Available scripts
 
 - `pnpm build` - Compile `src/` to `dist/` with tsrs, then make sure `vendor/ripwire/` holds the pinned ripwire
-- `pnpm test` - Run the tests under c8 (`node --test test/`; no network, temporary `MARGRAVE_HOME`). It fails when line, branch, function, or statement coverage of `src/` is below 100%. The coverage gate needs a non-root user, because the tests that need unreadable files skip as root
+- `pnpm test` - Run the tests under c8 (`node --test test/`; no network, temporary `MARGRAVE_HOME`). It fails when line, branch, function, or statement coverage of `src/` is below 100%. The coverage gate needs a non-root user, because the tests that need unreadable files skip as root. The run also writes `coverage/lcov.info`, which CI uploads to Coveralls
 - `pnpm lint` - Check the code with oxlint, including type-aware rules and type errors in the linted files (via tsrs-lint)
+- `pnpm lint:fix` - Apply oxlint's automatic fixes
 - `pnpm format` - Format all files with prettier
 - `pnpm format:check` - Check formatting without writing
 - `pnpm typecheck` - Type-check with `tsrs --noEmit`
 - `pnpm knip` - Find unused files, exports, and dependencies
+
+`pnpm install` also sets up a lefthook pre-commit hook. The hook runs oxlint `--fix` and prettier on the staged files and stages the fixed files again. If you stage only some changes of a file, the commit holds only those changes, with the fixes applied. The other changes stay unstaged in your working tree. After an install with `--ignore-scripts`, run `pnpm run prepare` to set up the hook. Do not run `lefthook install` directly: it reads a global `core.hooksPath`.
 
 CI runs the audit of production dependencies, lint, format check, typecheck, tests, and knip on every push and pull request. Run them locally before you open a pull request.
 
