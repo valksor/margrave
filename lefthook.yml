@@ -7,9 +7,9 @@ pre-commit:
   commands:
     oxlint:
       glob: "*.{ts,mts,cts,mjs}"
-      run: pnpm exec oxlint --type-aware --fix --no-error-on-unmatched-pattern {staged_files}
+      run: pnpm exec oxlint --type-aware --fix --no-error-on-unmatched-pattern -- {staged_files}
       stage_fixed: true
     prettier:
       glob: "*.{ts,mts,cts,mjs,json,md,yml,yaml}"
-      run: pnpm exec prettier --write {staged_files}
+      run: pnpm exec prettier --write -- {staged_files}
       stage_fixed: true
