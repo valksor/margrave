@@ -50,7 +50,7 @@ Package:
 pnpm add -g ./margrave-v<version>.tgz
 ```
 
-On macOS, download with `gh release download` or `curl`. A download in a browser is quarantined, and macOS then blocks the bundled ripwire, which is ad-hoc signed. If you used a browser, run `gh attestation verify` on the file first, then `xattr -dr com.apple.quarantine margrave/` after you extract it.
+On macOS, download with `gh release download` or `curl`. A download in a browser is quarantined, and macOS then blocks the bundled ripwire, which is ad-hoc signed. If you used a browser, run `gh attestation verify` on the file first, extract that same file, then clear the flag on the bundled ripwire only: `xattr -d com.apple.quarantine margrave/vendor/ripwire/ripwire`.
 
 ## 2. Install a skill source
 
