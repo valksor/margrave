@@ -132,6 +132,9 @@ jobs:
           mv "$STAGE/package" "$STAGE/margrave"
 
           cp package.json pnpm-lock.yaml pnpm-workspace.yaml "$STAGE/margrave/"
+          # prepare installs git hooks for contributors. The staged copy is no git repo
+          # and has no devDependencies, so the script must not run here.
+          (cd "$STAGE/margrave" && pnpm pkg delete scripts.prepare)
           (cd "$STAGE/margrave" && pnpm install --prod --frozen-lockfile --config.node-linker=hoisted)
           rm "$STAGE/margrave/pnpm-lock.yaml"
           rm "$STAGE/margrave/pnpm-workspace.yaml"

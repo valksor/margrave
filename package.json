@@ -32,6 +32,7 @@
   },
   "packageManager": "pnpm@12.21.0",
   "scripts": {
+    "prepare": "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 lefthook install",
     "build": "tsrs && chmod +x dist/cli.js && node scripts/ensure-ripwire.mjs",
     "test": "c8 --check-coverage --100 --all --src src --include 'src/**/*.ts' --reporter=text node --import ./test/no-vendored-ripwire.ts --test test/",
     "lint": "oxlint --type-aware --type-check",
@@ -50,6 +51,7 @@
     "@types/node": "26.6.6",
     "c8": "12.0.0",
     "knip": "6.45.1",
+    "lefthook": "2.2.2",
     "oxlint": "1.94.0",
     "prettier": "3.10.1",
     "tsrs": "0.25.0-ts7.1.0-beta"
