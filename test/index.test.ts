@@ -1,7 +1,5 @@
 // index.db: ranking, the upgrade and validity guard, locking, and concurrent writes.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { once } from "node:events";
 import { readFileSync, writeFileSync } from "node:fs";
 import fsp, { chmod, mkdir, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
@@ -19,6 +17,7 @@ import {
   holdWriteLock,
   indexIds,
   indexRows,
+  leaveHotJournal,
   newEntry,
   realClose,
   realExec,
@@ -323,7 +322,7 @@ interface BadDb {
   make: (file: string) => Promise<void> | void;
 }
 
-/** Not ours: NOTADB, or a user_version other than 0 and 1 (a negative one too). Every command refuses it, reindex included. */
+/** Not ours: NOTADB, a user_version other than 0 and 1 (a negative one too), or user_version 0 with a table. Every command refuses it, reindex included. */
 const FOREIGN_DBS: BadDb[] = [
   {
     why: "a wrong user_version",
@@ -342,19 +341,35 @@ const FOREIGN_DBS: BadDb[] = [
     },
   },
   {
+    why: "a database with an unrelated table and user_version 0",
+    make: (file) => {
+      const db = new DatabaseSync(file);
+      db.exec("CREATE TABLE other(x)");
+      db.close();
+    },
+  },
+  {
+    why: "a database with only a view and user_version 0",
+    make: (file) => {
+      const db = new DatabaseSync(file);
+      db.exec("CREATE VIEW v AS SELECT 42");
+      db.close();
+    },
+  },
+  {
     why: "a garbage file",
     make: (file) => writeFile(file, "this is not a database, but it is longer than a header would need to be ".repeat(4)),
   },
 ];
 
-/** Schema-less (user_version 0): reads refuse it; reindex and the first install initialize it in place. */
+/** Schema-less (user_version 0, no tables): reads refuse it; reindex and the first install initialize it in place. */
 const SCHEMALESS_DBS: BadDb[] = [
   { why: "a 0-byte file", make: (file) => writeFile(file, "") },
   {
-    why: "a database with an unrelated table and user_version 0",
+    why: "an empty database with user_version 0",
     make: (file) => {
       const db = new DatabaseSync(file);
-      db.exec("CREATE TABLE other(x)");
+      db.exec("CREATE TABLE t(x); DROP TABLE t");
       db.close();
     },
   },
@@ -499,18 +514,46 @@ test("a damaged index.db (SQLITE_CORRUPT) keeps the open error and adds how to r
   assert.deepEqual(await readFile(file), before);
 });
 
-/** A child that starts a write transaction on index.db with a tiny page cache, so SQLite writes a journal, and then waits. */
-const JOURNAL_WRITER = `
-const { DatabaseSync } = require("node:sqlite");
-const db = new DatabaseSync(process.argv[1], { timeout: 5000 });
-db.exec("PRAGMA cache_size = 10");
-db.exec("BEGIN IMMEDIATE");
-db.exec("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000) " +
-  "INSERT INTO skills(id, id_lc, name, name_lc, description, source, dir, hash) " +
-  "SELECT 'k' || i, 'k' || i, 'n', 'n', hex(randomblob(400)), 'zz', '/x', 'h' FROM n");
-process.stdout.write("ready\\n");
-setInterval(() => {}, 1000);
-`;
+test("an extended SQLITE_CORRUPT code (SQLITE_CORRUPT_INDEX, 779) gets the recovery hint, and a code that is not corrupt does not", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  await seedIndex([newEntry("s", "a")]);
+  let errcode = 779;
+  mock.method(DatabaseSync.prototype, "prepare", () => {
+    throw Object.assign(new Error("mock: database disk image is malformed"), { errcode });
+  });
+  t.after(() => mock.restoreAll());
+  await assert.rejects(openIndexRead(), CORRUPT);
+  errcode = 1;
+  await assert.rejects(
+    openIndexRead(),
+    (err: Error) => /cannot open .*index\.db: mock: /u.test(err.message) && !/move it aside/u.test(err.message),
+  );
+});
+
+test("a foreign index.db that appears between the lstat and the open in create mode is a foreign index, and is not changed", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  const file = path.join(home, "index.db");
+  await writeFile(file, "this is not a database, but it is longer than a header would need to be ".repeat(4));
+  const before = await readFile(file);
+  const real = fsp.lstat;
+  // The lstat sees no index.db, as if the file arrived right after it.
+  let hidden = 0;
+  mock.method(fsp, "lstat", (p: string, ...rest: never[]) => {
+    if (p !== file) return real(p, ...rest);
+    hidden += 1;
+    return Promise.reject(Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" }));
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  await assert.rejects(openIndexWrite("create"), FOREIGN);
+  // The create path saw no file, so the error came from the open, not from the probe of an existing file.
+  assert.ok(hidden >= 1, "the lstat of index.db was hidden");
+  assert.deepEqual(await readFile(file), before);
+});
 
 test(
   "a hot journal from a killed writer: every reader says so, margrave deletes nothing, and reindex recovers",
@@ -518,15 +561,7 @@ test(
   async () => {
     const s = await setup();
     const file = path.join(s.home, "index.db");
-    const child = spawn(process.execPath, ["-e", JOURNAL_WRITER, file], { stdio: ["ignore", "pipe", "inherit"] });
-    const exited = once(child, "exit");
-    try {
-      const ready = await Promise.race([once(child.stdout, "data").then(() => true), exited.then(() => false)]);
-      assert.equal(ready, true, "the writer exited before its transaction was open");
-    } finally {
-      child.kill("SIGKILL");
-      await exited;
-    }
+    await leaveHotJournal(file);
     assert.equal((await readdir(s.home)).includes("index.db-journal"), true, "the killed writer left a hot journal");
 
     const message = /index\.db has an unfinished write from a stopped margrave process; run: margrave reindex/u;

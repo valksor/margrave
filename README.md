@@ -215,7 +215,7 @@ To upgrade (see also [Upgrading](#upgrading)):
 2. Run `margrave reindex`.
 3. Restart the host app, and any running `margrave mcp` sessions.
 
-Known limit: if a CLI write is killed during its transaction, a hot `index.db-journal` stays next to `index.db`. A read-only connection cannot roll it back, so every reader (`margrave find`, `load`, and `list`, the stdio MCP server, and the hosted handler) returns `<path> has an unfinished write from a stopped margrave process; run: margrave reindex` until the next CLI write or `margrave reindex` rolls the journal back. This happens in a writable directory too, not only on a read-only mount. margrave never deletes the journal.
+Known limit: if a CLI write is killed during its transaction, a hot `index.db-journal` stays next to `index.db`. A read-only connection cannot roll it back, so every reader fails until the next CLI write or `margrave reindex` rolls the journal back. `margrave find`, `load`, and `list` and the stdio MCP server return `<path> has an unfinished write from a stopped margrave process; run: margrave reindex`; the hosted handler logs it and returns the generic server error. This happens in a writable directory too, not only on a read-only mount. margrave never deletes the journal.
 
 A remote client sees these differences:
 
@@ -279,7 +279,7 @@ Scores have a different scale from earlier versions (per-column BM25 replaced BM
   index.db               SQLite FTS5 index: one row per skill
 ```
 
-A missing `sources.json` is an empty list. A malformed one is an error, and margrave writes nothing. A missing, legacy, or schema-less `index.db` (`user_version` 0) is an error that tells you to run `margrave reindex`; `reindex` and the first `install` into an empty store initialize a `user_version` 0 file in place. margrave never deletes `index.db`. A file that is not a margrave index (not a SQLite database, a `user_version` other than 0 and 1, or `user_version` 1 with the `skills` or `fts` table missing) is refused by every command, including `reindex`: move it aside, then run `margrave reindex`. `sources.json` is written by an atomic rename (temp file in the same directory, then rename). `index.db` is written in SQLite transactions with the `DELETE` journal, so readers need only read access. An `install`, `update`, `remove`, or `reindex` takes the write lock, re-reads `sources.json` under it, and writes both; a second writer waits up to 30 seconds.
+A missing `sources.json` is an empty list. A malformed one is an error, and margrave writes nothing. A missing, legacy, or schema-less `index.db` (`user_version` 0 and an empty schema) is an error that tells you to run `margrave reindex`; `reindex` and the first `install` into an empty store initialize such a file in place. margrave never deletes `index.db`. A file that is not a margrave index (not a SQLite database, a `user_version` other than 0 and 1, `user_version` 0 with any table, view, index, or trigger, or `user_version` 1 with the `skills` or `fts` table missing) is refused by every command, including `reindex`: move it aside, then run `margrave reindex`. `sources.json` is written by an atomic rename (temp file in the same directory, then rename). `index.db` is written in SQLite transactions with the `DELETE` journal, so readers need only read access. An `install`, `update`, `remove`, or `reindex` takes the write lock, re-reads `sources.json` under it, and writes both; a second writer waits up to 30 seconds.
 
 ## Upgrading
 
@@ -291,7 +291,7 @@ From a version that stored `index.json`:
 
 A `margrave mcp` session that an older version started says `index.json is missing; run: margrave reindex` after the upgrade. Restart that session.
 
-margrave never deletes `index.db`. If `index.db` is not a margrave index (for example another program wrote it, or its `user_version` is not 0 or 1), every command stops with `<path> is not a margrave index; move it aside, then run: margrave reindex`. Move the file aside yourself, then run `margrave reindex`.
+margrave never deletes `index.db`. If `index.db` is not a margrave index (for example another program wrote it, or its `user_version` is not 0 or 1, or it is 0 and the file already has a schema), every command stops with `<path> is not a margrave index; move it aside, then run: margrave reindex`. Move the file aside yourself, then run `margrave reindex`.
 
 ## Exit codes
 

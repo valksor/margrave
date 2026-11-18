@@ -14,7 +14,7 @@ import {
   HOSTED_SERVER_ERROR,
   createServer,
 } from "../src/mcp.ts";
-import { fakeRipwire, git, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
+import { fakeRipwire, git, leaveHotJournal, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
 
 interface ToolText {
   isError: boolean;
@@ -217,6 +217,24 @@ test("hosted: a store failure returns a generic error and logs the cause", async
     assert.ok(logged instanceof Error, tool);
     assert.match(logged.message, /is not a margrave index; move it aside, then run: margrave reindex/u, tool);
   }
+});
+
+test("hosted: a hot journal returns the generic error and logs the unfinished-write message", { timeout: 60_000 }, async (t) => {
+  const home = await useHome(t);
+  const dir = await tmp("mg-localsrc-");
+  await writeSkill(dir, "terraform-modules", "Design reusable Terraform modules");
+  const inst = await runCli(["install", dir], { home, fakeBin: await fakeRipwire() });
+  assert.equal(inst.code, 0, inst.stderr);
+  const client = await connectHosted(t);
+  await leaveHotJournal(path.join(home, "index.db"));
+  const log = mock.method(console, "error", () => {});
+
+  const r = await call(client, "find_skills", { task: "terraform" });
+  assert.deepEqual(r, { isError: true, text: HOSTED_SERVER_ERROR });
+  assert.equal(log.mock.callCount(), 1);
+  const logged: unknown = log.mock.calls[0]?.arguments[0];
+  assert.ok(logged instanceof Error);
+  assert.match(logged.message, /index\.db has an unfinished write from a stopped margrave process; run: margrave reindex/u);
 });
 
 test("hosted: only POST is served", async () => {

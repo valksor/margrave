@@ -1,4 +1,6 @@
-import { execFile } from "node:child_process";
+import assert from "node:assert/strict";
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
 import { constants } from "node:fs";
 import { chmod, mkdir, mkdtemp, open, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -239,6 +241,32 @@ export function holdWriteLock(home: string, mode: "IMMEDIATE" | "EXCLUSIVE" = "I
       db.close();
     },
   };
+}
+
+/** A child that starts a write transaction on index.db with a tiny page cache, so SQLite writes a journal, and then waits. */
+const JOURNAL_WRITER = `
+const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync(process.argv[1], { timeout: 5000 });
+db.exec("PRAGMA cache_size = 10");
+db.exec("BEGIN IMMEDIATE");
+db.exec("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000) " +
+  "INSERT INTO skills(id, id_lc, name, name_lc, description, source, dir, hash) " +
+  "SELECT 'k' || i, 'k' || i, 'n', 'n', hex(randomblob(400)), 'zz', '/x', 'h' FROM n");
+process.stdout.write("ready\\n");
+setInterval(() => {}, 1000);
+`;
+
+/** Leave a hot rollback journal next to `file`: a writer opens a transaction, writes a journal, and is killed with SIGKILL. */
+export async function leaveHotJournal(file: string): Promise<void> {
+  const child = spawn(process.execPath, ["-e", JOURNAL_WRITER, file], { stdio: ["ignore", "pipe", "inherit"] });
+  const exited = once(child, "exit");
+  try {
+    const ready = await Promise.race([once(child.stdout, "data").then(() => true), exited.then(() => false)]);
+    assert.equal(ready, true, "the writer exited before its transaction was open");
+  } finally {
+    child.kill("SIGKILL");
+    await exited;
+  }
 }
 
 /**
