@@ -2,6 +2,7 @@
 
 [![Test](https://github.com/valksor/margrave/actions/workflows/test.yml/badge.svg)](https://github.com/valksor/margrave/actions/workflows/test.yml)
 [![CodeQL](https://github.com/valksor/margrave/actions/workflows/codeql.yml/badge.svg)](https://github.com/valksor/margrave/actions/workflows/codeql.yml)
+[![Coverage Status](https://coveralls.io/repos/github/valksor/margrave/badge.svg?branch=master)](https://coveralls.io/github/valksor/margrave?branch=master)
 
 margrave keeps agent skills (folders with a `SKILL.md`) in one store. It does not install them into any agent. An agent asks for what it needs in plain words, gets ranked suggestions, and loads one skill from the store.
 

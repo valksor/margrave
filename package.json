@@ -34,7 +34,7 @@
   "scripts": {
     "prepare": "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 lefthook install",
     "build": "tsrs && chmod +x dist/cli.js && node scripts/ensure-ripwire.mjs",
-    "test": "c8 --check-coverage --100 --all --src src --include 'src/**/*.ts' --reporter=text node --import ./test/no-vendored-ripwire.ts --test test/",
+    "test": "c8 --check-coverage --100 --all --src src --include 'src/**/*.ts' --reporter=text --reporter=lcov node --import ./test/no-vendored-ripwire.ts --test test/",
     "lint": "oxlint --type-aware --type-check",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

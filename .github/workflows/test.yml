@@ -55,5 +55,22 @@ jobs:
       - name: Run tests
         run: pnpm test
 
+      # Upload only. A Coveralls outage never fails the run. GITHUB_TOKEN
+      # identifies the repo to Coveralls, so no repo token secret is needed.
+      # build.yml calls this workflow on master pushes while this workflow's own
+      # push trigger also runs. In a called workflow, github.workflow is the
+      # caller's name, so this condition keeps one Coveralls build per commit.
+      # The action's SHA pin does not cover the reporter binary it downloads, so
+      # coverage-reporter-version pins it. Dependabot does not bump that input.
+      - name: Upload coverage to Coveralls
+        if: github.workflow == 'Test'
+        uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file: coverage/lcov.info
+          format: lcov
+          coverage-reporter-version: v0.6.22
+          fail-on-error: false
+
       - name: Find unused code and dependencies
         run: pnpm knip
