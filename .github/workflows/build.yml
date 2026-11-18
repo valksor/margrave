@@ -346,8 +346,15 @@ jobs:
   # fails and so does the whole release. Secrets are set only on the steps that
   # use them. No step runs code from the bundle while key material (keychain,
   # p12, p8) exists.
+  # It runs on the dedicated self-hosted runner `Vairogs-signing` (label
+  # macos-signing, org runner group `signing`). That group lets only listed
+  # workflows use the runner; this build.yml on master is listed. The hosted
+  # macOS pool queued this job for 10 minutes and more. The runner is not
+  # ephemeral and runs as the Mac's user, so the job starts /bin/bash by
+  # absolute path and uses a system-only PATH: a tool planted in a
+  # user-writable PATH directory by another job cannot read the key material.
   sign-macos:
-    runs-on: macos-latest
+    runs-on: [self-hosted, macOS, ARM64, macos-signing]
     timeout-minutes: 30
     needs: [bundle]
     # Holds the signing secrets. Restrict this environment to `master` in
@@ -355,7 +362,11 @@ jobs:
     environment: release-signing
     permissions:
       contents: read
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
     env:
+      PATH: /usr/bin:/bin:/usr/sbin:/sbin
       # SHA-256 of Apple's "Developer ID Certification Authority G2"
       # intermediate certificate, taken from
       # https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
@@ -503,8 +514,10 @@ jobs:
           umask 077
           KC="$RUNNER_TEMP/signing.keychain-db"
 
-          # Save the current user search list (one path per line) for the cleanup step.
-          security list-keychains -d user | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//' > "$RUNNER_TEMP/keychains.saved"
+          # Save the current user search list (one path per line) for the
+          # cleanup step. Leave out this job's keychain path: a killed earlier
+          # run can leave it on the list, and cleanup must not put it back.
+          security list-keychains -d user | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//' | { grep -vxF "$KC" || true; } > "$RUNNER_TEMP/keychains.saved"
 
           KCPASS=$(openssl rand -hex 32)
           security create-keychain -p "$KCPASS" "$KC"
@@ -522,6 +535,7 @@ jobs:
 
           printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KCPASS" "$KC" > /dev/null
 
           # Put the temporary keychain on the search list, keeping the old entries.
@@ -608,6 +622,7 @@ jobs:
           BIN="$RUNNER_TEMP/sign/margrave/vendor/ripwire/ripwire"
           MARGRAVE_BIN="$RUNNER_TEMP/sign/margrave/bin/margrave"
           KEY="$RUNNER_TEMP/AuthKey.p8"
+          trap 'rm -f "$KEY"' EXIT
           ZIP="$RUNNER_TEMP/notarize.zip"
           RESULT="$RUNNER_TEMP/notary.json"
           printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$KEY"
@@ -631,15 +646,30 @@ jobs:
             exit 1
           fi
 
+          rm -f "$KEY"
+
           for target in "$BIN" "$MARGRAVE_BIN"; do
-            ASSESS=$(spctl --assess --type install -vv "$target" 2>&1 || true)
             if spctl --status 2>&1 | grep -q 'assessments enabled'; then
+              # The first assessment comes seconds after `Accepted`, and a bare
+              # Mach-O has no stapled ticket, so spctl asks Apple online. Retry
+              # for up to a minute before failing.
+              ASSESS=""
+              for attempt in 1 2 3 4 5 6; do
+                ASSESS=$(spctl --assess --type install -vv "$target" 2>&1 || true)
+                if grep -q 'source=Notarized Developer ID' <<< "$ASSESS"; then
+                  break
+                fi
+                if [[ "$attempt" -lt 6 ]]; then
+                  sleep 10
+                fi
+              done
               echo "$ASSESS"
               if ! grep -q 'source=Notarized Developer ID' <<< "$ASSESS"; then
-                echo "::error::spctl does not report source=Notarized Developer ID for the signed $target"
+                echo "::error::spctl does not report source=Notarized Developer ID for the signed $target after 6 attempts"
                 exit 1
               fi
             else
+              ASSESS=$(spctl --assess --type install -vv "$target" 2>&1 || true)
               echo "::warning::Gatekeeper assessments are disabled on this runner, so the notarization of $target was not re-checked with spctl. spctl output: $ASSESS"
             fi
           done
