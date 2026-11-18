@@ -41,7 +41,7 @@ Thank you for your interest in contributing to margrave. Contributions are welco
 - `pnpm typecheck` - Type-check with `tsrs --noEmit`
 - `pnpm knip` - Find unused files, exports, and dependencies
 
-`pnpm install` also sets up a lefthook pre-commit hook. The hook runs oxlint `--fix` and prettier on the staged files and stages the fixed files again. If you stage only some changes of a file, the commit holds only those changes, with the fixes applied. The other changes stay unstaged in your working tree. After an install with `--ignore-scripts`, run `pnpm run prepare` to set up the hook. Do not run `lefthook install` directly: it reads a global `core.hooksPath`. The repo accepts only pnpm: `devEngines` in `package.json` makes npm refuse to install.
+`pnpm install` also sets up a lefthook pre-commit hook. The hook runs oxlint `--fix` and prettier on the staged files and stages the fixed files again. If you stage only some changes of a file, the commit holds only those changes, with the fixes applied. The other changes stay unstaged in your working tree. After an install with `--ignore-scripts`, run `pnpm run prepare` to set up the hook. Do not run `lefthook install` directly: it reads a global `core.hooksPath`.
 
 CI runs the audit of production dependencies, lint, format check, typecheck, tests, and knip on every push and pull request. Run them locally before you open a pull request.
 

@@ -31,13 +31,6 @@
     "node": ">=27.0.0-0"
   },
   "packageManager": "pnpm@12.21.0",
-  "devEngines": {
-    "packageManager": {
-      "name": "pnpm",
-      "version": "12.21.0",
-      "onFail": "download"
-    }
-  },
   "scripts": {
     "prepare": "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 lefthook install",
     "build": "tsrs && chmod +x dist/cli.js && node scripts/ensure-ripwire.mjs",
