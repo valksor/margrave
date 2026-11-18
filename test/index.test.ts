@@ -30,6 +30,16 @@ import {
 } from "./helpers.ts";
 import type { Run } from "./helpers.ts";
 
+/** Read a file's bytes and inode through one handle, so the pair cannot straddle a replace (js/file-system-race). */
+async function snapshot(file: string): Promise<{ data: Buffer; ino: number }> {
+  const fh = await fsp.open(file, "r");
+  try {
+    return { data: await fh.readFile(), ino: (await fh.stat()).ino };
+  } finally {
+    await fh.close();
+  }
+}
+
 /** Point MARGRAVE_HOME at `h` for this test only. */
 function useHome(t: { after: (fn: () => void) => void }, h: string): void {
   const prev = process.env["MARGRAVE_HOME"];
@@ -417,15 +427,15 @@ const readArgs = (s: { id: string; other: string }): string[][] => [
 test("a foreign index.db is refused by every command, reindex included, and margrave never changes or deletes it", async () => {
   for (const bad of FOREIGN_DBS) {
     const s = await withBadDb(bad);
-    const before = await readFile(s.file);
-    const inode = (await stat(s.file)).ino;
+    const before = await snapshot(s.file);
     for (const args of [...readArgs(s), ["reindex"]]) {
       const r = await s.mg(args);
       assert.equal(r.code, 1, `${bad.why}: ${args.join(" ")}`);
       assert.match(r.stderr, FOREIGN, `${bad.why}: ${args.join(" ")}`);
     }
-    assert.deepEqual(await readFile(s.file), before, `${bad.why}: the file is unchanged`);
-    assert.equal((await stat(s.file)).ino, inode, bad.why);
+    const after = await snapshot(s.file);
+    assert.deepEqual(after.data, before.data, `${bad.why}: the file is unchanged`);
+    assert.equal(after.ino, before.ino, bad.why);
     assert.deepEqual((await readdir(s.home)).filter((n) => n.startsWith("index")).sort(), ["index.db"], `${bad.why}: no side file`);
     // The user moves it aside, then reindex builds a new one.
     await rename(s.file, `${s.file}.aside`);
@@ -477,18 +487,17 @@ test("an install into a store with no sources: a schema-less index.db is initial
     await writeSkill(dir, "alpha", "alpha skill");
     const file = path.join(home, "index.db");
     await bad.make(file);
-    const before = await readFile(file);
-    const inode = (await stat(file)).ino;
+    const before = await snapshot(file);
     const r = await runCli(["install", dir], { home, fakeBin: await fakeRipwire() });
     if (ok) {
       assert.equal(r.code, 0, `${bad.why}: ${r.stderr}`);
       assert.equal(indexIds(home).length, 1, bad.why);
-      assert.equal((await stat(file)).ino, inode, `${bad.why}: opened in place`);
+      assert.equal((await snapshot(file)).ino, before.ino, `${bad.why}: opened in place`);
       assert.equal((await runCli(["find", "alpha"], { home })).code, 0, bad.why);
     } else {
       assert.equal(r.code, 1, bad.why);
       assert.match(r.stderr, message, bad.why);
-      assert.deepEqual(await readFile(file), before, `${bad.why}: the file is unchanged`);
+      assert.deepEqual((await snapshot(file)).data, before.data, `${bad.why}: the file is unchanged`);
       assert.equal((await readdir(home)).includes("sources.json"), false, `${bad.why}: no source was recorded`);
     }
   }
@@ -504,14 +513,14 @@ test("a damaged index.db (SQLITE_CORRUPT) keeps the open error and adds how to r
   } finally {
     await fh.close();
   }
-  const before = await readFile(file);
+  const before = await snapshot(file);
   for (const args of [["find", "alpha"], ["list"], ["reindex"]]) {
     const r = await s.mg(args);
     assert.equal(r.code, 1, args.join(" "));
     assert.match(r.stderr, CORRUPT, args.join(" "));
     assert.doesNotMatch(r.stderr, /not a valid margrave index|not a margrave index/u, args.join(" "));
   }
-  assert.deepEqual(await readFile(file), before);
+  assert.deepEqual((await snapshot(file)).data, before.data);
 });
 
 test("an extended SQLITE_CORRUPT code (SQLITE_CORRUPT_INDEX, 779) gets the recovery hint, and a code that is not corrupt does not", async (t) => {
