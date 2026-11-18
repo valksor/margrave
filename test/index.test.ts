@@ -1,6 +1,7 @@
 // index.db: ranking, the upgrade and validity guard, locking, and concurrent writes.
 import assert from "node:assert/strict";
-import { chmod, mkdir, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import fsp, { chmod, mkdir, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
@@ -297,52 +298,90 @@ test("an index.json newer than index.db means an older margrave wrote it: the le
   assert.equal((await readdir(s.home)).includes("index.json"), false);
 });
 
-/** An index.db that is not ours, in four shapes. */
-const INVALID_DBS: Record<string, (file: string) => Promise<void> | void> = {
-  "a wrong user_version": (file) => {
-    const db = new DatabaseSync(file);
-    db.exec("CREATE TABLE skills(id TEXT); CREATE VIRTUAL TABLE fts USING fts5(a); PRAGMA user_version = 2");
-    db.close();
+/**
+ * An index.db that is not a complete margrave index, in four shapes. `invalid` ones are not ours at all (NOTADB, or a
+ * user_version other than 0 and 1): reindex unlinks them. The others are schema-less, and may be a creator's file that
+ * is not initialized yet: reindex and install open them in place.
+ */
+const BAD_DBS: { why: string; invalid: boolean; make: (file: string) => Promise<void> | void }[] = [
+  {
+    why: "a wrong user_version",
+    invalid: true,
+    make: (file) => {
+      const db = new DatabaseSync(file);
+      db.exec("CREATE TABLE skills(id TEXT); CREATE VIRTUAL TABLE fts USING fts5(a); PRAGMA user_version = 7");
+      db.close();
+    },
   },
-  "a garbage file": (file) => writeFile(file, "this is not a database, but it is longer than a header would need to be ".repeat(4)),
-  "a 0-byte file": (file) => writeFile(file, ""),
-  "a database with no schema": (file) => {
-    const db = new DatabaseSync(file);
-    db.exec("PRAGMA user_version = 1");
-    db.close();
+  {
+    why: "a garbage file",
+    invalid: true,
+    make: (file) => writeFile(file, "this is not a database, but it is longer than a header would need to be ".repeat(4)),
   },
-};
+  { why: "a 0-byte file", invalid: false, make: (file) => writeFile(file, "") },
+  {
+    why: "a database with no schema",
+    invalid: false,
+    make: (file) => {
+      const db = new DatabaseSync(file);
+      db.exec("PRAGMA user_version = 1");
+      db.close();
+    },
+  },
+];
 
-test("an invalid index.db is an error on every command; reindex rebuilds it, and drops a stale journal", async () => {
-  for (const [why, make] of Object.entries(INVALID_DBS)) {
+test("a bad index.db is an error on every command; reindex rebuilds it, and unlinks only a file that is not ours", async () => {
+  for (const { why, invalid, make } of BAD_DBS) {
     const s = await setup();
     const file = path.join(s.home, "index.db");
     const other = await localSource("beta");
     await rm(file);
     await make(file);
+    const inode = (await stat(file)).ino;
     for (const args of [["find", "alpha"], ["list"], ["load", "alpha"], ["install", other.dir], ["update", s.id], ["remove", s.id]]) {
       const r = await s.mg(args);
       assert.equal(r.code, 1, `${why}: ${args.join(" ")}`);
       assert.match(r.stderr, INVALID, `${why}: ${args.join(" ")}`);
     }
-    // A stale journal next to an invalid index.db is removed with it.
-    await writeFile(`${file}-journal`, "stale");
+    // A stale journal next to a file that is not ours is removed with it.
+    if (invalid) await writeFile(`${file}-journal`, "stale");
     const re = await s.mg(["reindex"]);
     assert.equal(re.code, 0, `${why}: ${re.stderr}`);
     assert.deepEqual(indexIds(s.home), [`${s.id}/alpha`], why);
-    assert.equal((await readdir(s.home)).includes("index.db-journal"), false, why);
+    if (invalid) assert.equal((await readdir(s.home)).includes("index.db-journal"), false, why);
+    else assert.equal((await stat(file)).ino, inode, `${why}: a schema-less file is opened in place, not unlinked`);
     assert.equal((await s.mg(["find", "alpha"])).code, 0, why);
   }
 });
 
-test("an install into a store with no sources replaces an invalid index.db", async () => {
-  const home = await tmp("mg-home-");
-  const dir = await tmp("mg-localsrc-");
-  await writeSkill(dir, "alpha", "alpha skill");
-  await writeFile(path.join(home, "index.db"), "garbage");
-  const r = await runCli(["install", dir], { home, fakeBin: await fakeRipwire() });
-  assert.equal(r.code, 0, r.stderr);
-  assert.equal(indexIds(home).length, 1);
+test("an install into a store with no sources initializes a schema-less index.db in place, and replaces one that is not ours", async () => {
+  for (const { why, invalid, make } of BAD_DBS) {
+    const home = await tmp("mg-home-");
+    const dir = await tmp("mg-localsrc-");
+    await writeSkill(dir, "alpha", "alpha skill");
+    const file = path.join(home, "index.db");
+    await make(file);
+    const inode = (await stat(file)).ino;
+    const r = await runCli(["install", dir], { home, fakeBin: await fakeRipwire() });
+    assert.equal(r.code, 0, `${why}: ${r.stderr}`);
+    assert.equal(indexIds(home).length, 1, why);
+    if (!invalid) assert.equal((await stat(file)).ino, inode, `${why}: opened in place`);
+    assert.equal((await runCli(["find", "alpha"], { home })).code, 0, why);
+  }
+});
+
+test("two first-time installs of different sources into an empty store both survive", { timeout: 60_000 }, async () => {
+  for (let round = 0; round < 3; round++) {
+    const home = await tmp("mg-home-");
+    const fakeBin = await fakeRipwire();
+    const [one, two] = [await localSource("beta"), await localSource("gamma")];
+    assert.deepEqual(await readdir(home), [], "no sources.json and no index.db yet");
+    const runs = await Promise.all([runCli(["install", one.dir], { home, fakeBin }), runCli(["install", two.dir], { home, fakeBin })]);
+    for (const r of runs) assert.equal(r.code, 0, r.stderr);
+    const sources = JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { id: string }[];
+    assert.deepEqual(sources.map((x) => x.id).sort(), runs.map(installedId).sort(), `round ${round}`);
+    assert.deepEqual(indexIds(home), [`${installedId(runs[0])}/beta`, `${installedId(runs[1])}/gamma`].sort(), `round ${round}`);
+  }
 });
 
 test("a locked database is not called invalid, and reindex does not delete it", { timeout: 60_000 }, async () => {
@@ -408,6 +447,27 @@ test("a store directory that cannot be inspected is an error that names index.db
   await assert.rejects(openIndexRead(), /cannot read .*index\.db: /u);
 });
 
+test("an index.json that cannot be inspected is an error, not taken as absent: the legacy check never passes on EACCES", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  await seedIndex([newEntry("s", "a")]);
+  const real = fsp.lstat;
+  mock.method(fsp, "lstat", (p: string, ...rest: never[]) =>
+    p.endsWith("index.json") ? Promise.reject(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })) : real(p, ...rest),
+  );
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  await assert.rejects(openIndexRead(), /cannot read .*index\.json: EACCES/u);
+  await assert.rejects(openIndexWrite("existing"), /cannot read .*index\.json: EACCES/u);
+  // Only ENOENT means "no legacy file".
+  mock.restoreAll();
+  syncBuiltinESMExports();
+  (await openIndexRead()).close();
+});
+
 test("a missing index.db with sources says to run reindex", async () => {
   const s = await setup();
   await rm(path.join(s.home, "index.db"));
@@ -430,7 +490,7 @@ test("a schema that cannot be created is an error that names index.db, and the h
   useHome(t, home);
   let closed = 0;
   mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
-    if (sql.includes("CREATE TABLE skills")) throw new Error("mock: no schema");
+    if (sql.includes("CREATE TABLE IF NOT EXISTS skills")) throw new Error("mock: no schema");
     return realExec.call(this, sql);
   });
   mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
