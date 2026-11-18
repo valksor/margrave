@@ -345,7 +345,9 @@ jobs:
   # fallback: when the signing setup is missing or notarization fails, this job
   # fails and so does the whole release. Secrets are set only on the steps that
   # use them. No step runs code from the bundle while key material (keychain,
-  # p12, p8) exists.
+  # p12, p8) exists. The smoke test, after cleanup, does run the signed
+  # binaries on the runner's machine as its user, whose login keychain holds
+  # the Developer ID key (see "macOS signing" in CONTRIBUTING.md).
   # It runs on the dedicated self-hosted runner `Vairogs-signing` (label
   # macos-signing, org runner group `signing`). That group lets only listed
   # workflows use the runner; this build.yml on master is listed. The hosted
@@ -353,6 +355,8 @@ jobs:
   # ephemeral and runs as the Mac's user, so the job starts /bin/bash by
   # absolute path and uses a system-only PATH: a tool planted in a
   # user-writable PATH directory by another job cannot read the key material.
+  # notarytool is called by its root-owned Command Line Tools path, not through
+  # xcrun, whose per-user cache and DEVELOPER_DIR the same user can change.
   sign-macos:
     runs-on: [self-hosted, macOS, ARM64, macos-signing]
     timeout-minutes: 30
@@ -625,6 +629,11 @@ jobs:
           trap 'rm -f "$KEY"' EXIT
           ZIP="$RUNNER_TEMP/notarize.zip"
           RESULT="$RUNNER_TEMP/notary.json"
+          NOTARYTOOL=/Library/Developer/CommandLineTools/usr/bin/notarytool
+          if [[ ! -x "$NOTARYTOOL" ]]; then
+            echo "::error::$NOTARYTOOL not found. Install the Xcode Command Line Tools on the signing runner (xcode-select --install)."
+            exit 1
+          fi
           printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$KEY"
           rm -f "$ZIP"
           # One submission for the whole bundle directory, so both binaries
@@ -633,7 +642,7 @@ jobs:
 
           # notarytool can exit non-zero for a rejected submission; the status
           # below decides, so keep going to read it and the log.
-          xcrun notarytool submit "$ZIP" --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait --output-format json > "$RESULT" || true
+          "$NOTARYTOOL" submit "$ZIP" --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait --output-format json > "$RESULT" || true
           if ! STATUS=$(plutil -extract status raw -o - "$RESULT") || ! SUBMISSION_ID=$(plutil -extract id raw -o - "$RESULT"); then
             echo "::error::notarytool returned no status and submission id. Output follows."
             cat "$RESULT"
@@ -642,7 +651,7 @@ jobs:
           echo "notarytool status: $STATUS (submission $SUBMISSION_ID)"
           if [[ "$STATUS" != "Accepted" ]]; then
             echo "::error::Notarization status is '$STATUS', not 'Accepted'. Log follows."
-            xcrun notarytool log "$SUBMISSION_ID" --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" || true
+            "$NOTARYTOOL" log "$SUBMISSION_ID" --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" || true
             exit 1
           fi
 
