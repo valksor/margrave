@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { PINNED_RIPWIRE, VERSION_TIMEOUT_MS, esc, parseScanXml, runRipwire, scanWithRipwire } from "../src/safety.ts";
 import { MargraveError } from "../src/store.ts";
-import { ROOT, fakeRipwire, mkfifo, tmp } from "./helpers.ts";
+import { ROOT, fakeRipwire, mkfifo, releaseFifo, tmp } from "./helpers.ts";
 
 // ---- parser ----
 
@@ -742,13 +742,15 @@ printf '<skillscan files="1" findings="%s" skipped="0" verdict="warn">%s</skills
 exit 1
 `;
 
-test("baseline: a flagged FIFO is unreadable and counts as new, and does not block the read", { timeout: 10_000 }, async () => {
+test("baseline: a flagged FIFO is unreadable and counts as new, and does not block the read", { timeout: 10_000 }, async (t) => {
   const bin = await tmp("mg-fifo-ripwire-");
   await writeFile(path.join(bin, "ripwire"), FIFO_RIPWIRE.replace("@VERSION@", PINNED_RIPWIRE));
   await chmod(path.join(bin, "ripwire"), 0o755);
   const base = await scanDir({ "a/SKILL.md": "x\n" });
   const next = await scanDir({ "a/SKILL.md": "x\n" });
-  await mkfifo(path.join(next, "a", "pipe.md"));
+  const fifo = path.join(next, "a", "pipe.md");
+  await mkfifo(fifo);
+  t.after(() => releaseFifo(fifo));
   await assert.rejects(
     withScripted(bin, () => scanWithRipwire(next, opts([], { baselineDir: base }))),
     /refused: [\s\S]*a\/pipe\.md:1 {2}INJECTION:eval {2}warn \(unreadable\)/u,

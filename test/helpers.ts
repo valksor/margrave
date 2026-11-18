@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, mkdir, mkdtemp, open, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +17,15 @@ const execFileAsync = promisify(execFile);
 /** Make a FIFO (named pipe) at `file`. Node has no mkfifo API. */
 export async function mkfifo(file: string): Promise<void> {
   await execFileAsync("mkfifo", [file]);
+}
+
+/** Open and close the write end of a FIFO, so a reader that is blocked in open() returns. The test's after hook calls this, because the test body cannot reach a finally block while the open blocks. Without a waiting reader the open fails with ENXIO, which is ignored. */
+export async function releaseFifo(file: string): Promise<void> {
+  try {
+    await (await open(file, constants.O_WRONLY | constants.O_NONBLOCK)).close();
+  } catch {
+    // no reader is waiting
+  }
 }
 
 export async function tmp(prefix = "mg-"): Promise<string> {
