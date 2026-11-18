@@ -1,0 +1,152 @@
+# Waits for Apple's notarization of a release and then promotes the release.
+#
+# build.yml submits the macOS binaries to Apple without waiting and publishes
+# the release as a pre-release at once. This workflow runs after that build run
+# ends. It reads the submission id from the build run's `notary-submission`
+# artifact, waits for Apple's verdict, and on `Accepted` turns the pre-release
+# into a normal release. It is a separate workflow so that the build run's
+# concurrency group (`release-<ref>`) is not held while Apple works, which can
+# take hours.
+name: Notarize release
+
+on:
+  workflow_run:
+    workflows: [Build and Release]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  notarize:
+    # Under `workflow_run`, github.ref is always master, so the `release-signing`
+    # branch rule never blocks this workflow. This `if:` is the only gate that
+    # keeps fork PRs and other branches away from the p8 key. Do not loosen it.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'master' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: macos-latest
+    timeout-minutes: 360
+    environment: release-signing
+    permissions:
+      actions: read # download the artifact from the build run
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+
+    steps:
+      - name: Download the notarization submission
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notary-submission
+          path: ${{ runner.temp }}/notary
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      # The values reach the script only through the two files, and are
+      # validated before they are used anywhere else.
+      - name: Read the submission id and version
+        id: read
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/notary"
+          SUBMISSION_ID=$(<"$DIR/submission-id")
+          VERSION=$(<"$DIR/version")
+          if [[ ! "$SUBMISSION_ID" =~ ^[0-9a-f-]{36}$ ]]; then
+            echo "::error::The notary-submission artifact has no valid submission id."
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The notary-submission artifact has no valid version."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          {
+            echo "SUBMISSION_ID=$SUBMISSION_ID"
+            echo "VERSION=$VERSION"
+          } >> "$GITHUB_ENV"
+
+      # `wait` does not document its output on a timeout, so a status other
+      # than `Accepted` is checked again with `info`, which is authoritative.
+      - name: Wait for Apple's notarization
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KEY="$RUNNER_TEMP/AuthKey.p8"
+          trap 'rm -f "$KEY"' EXIT
+          RESULT="$RUNNER_TEMP/notary-wait.json"
+          INFO="$RUNNER_TEMP/notary-info.json"
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$KEY"
+
+          set +e
+          xcrun notarytool wait "$SUBMISSION_ID" --timeout 350m --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --output-format json > "$RESULT"
+          RC=$?
+          set -e
+
+          STATUS=$(plutil -extract status raw -o - "$RESULT" 2>/dev/null) || STATUS=""
+          if [[ "$STATUS" == "Accepted" ]]; then
+            echo "Apple accepted submission $SUBMISSION_ID."
+            exit 0
+          fi
+
+          echo "notarytool wait exit code: $RC. Output follows."
+          cat "$RESULT"
+          echo
+          xcrun notarytool info "$SUBMISSION_ID" --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --output-format json > "$INFO" || true
+          INFO_STATUS=$(plutil -extract status raw -o - "$INFO" 2>/dev/null) || INFO_STATUS=""
+          case "$INFO_STATUS" in
+            "In Progress")
+              echo "::error::Apple is still processing submission $SUBMISSION_ID after the wait timeout. v$VERSION stays a pre-release. Re-run the failed jobs of this run within 7 days to wait on the same submission."
+              ;;
+            Invalid | Rejected)
+              echo "::error::Apple rejected submission $SUBMISSION_ID (status $INFO_STATUS). v$VERSION stays a pre-release; the latest release and Homebrew are not affected. Log follows."
+              xcrun notarytool log "$SUBMISSION_ID" --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" || true
+              ;;
+            "")
+              echo "notarytool info output follows."
+              cat "$INFO"
+              echo
+              echo "::error::notarytool info returned no status for submission $SUBMISSION_ID. This is a key or API error, not a timeout. Check the three Apple API key secrets of the release-signing environment and Apple's system status, then re-run the failed jobs of this run. v$VERSION stays a pre-release."
+              ;;
+            *)
+              echo "::error::Unexpected status '$INFO_STATUS' for submission $SUBMISSION_ID. v$VERSION stays a pre-release."
+              ;;
+          esac
+          exit 1
+
+  # Holds the write token and nothing else: no p8, no Apple output. It can be
+  # re-run on its own without decoding the key.
+  promote:
+    needs: [notarize]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # promote the release
+
+    steps:
+      # make_latest=legacy lets GitHub choose "latest" by creation date and
+      # semantic version, so a late promotion of an older release does not take
+      # "latest" back from a newer one.
+      - name: Promote the release
+        env:
+          VERSION: ${{ needs.notarize.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The notarize job gave no valid version."
+            exit 1
+          fi
+          RID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$VERSION" --jq .id)
+          RELEASE=$(gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RID" -F prerelease=false -f make_latest=legacy --jq '"tag=\(.tag_name) prerelease=\(.prerelease)"')
+          LATEST=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          echo "Promoted: $RELEASE"
+          if [[ "$LATEST" == "v$VERSION" ]]; then
+            echo "v$VERSION is the latest release."
+          else
+            echo "v$VERSION is not the latest release; the latest is $LATEST."
+          fi

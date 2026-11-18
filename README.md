@@ -62,7 +62,7 @@ Package:
 pnpm add -g ./margrave-v<version>.tgz
 ```
 
-On macOS, the bundle's `margrave` and ripwire are signed with a Developer ID and notarized. Gatekeeper checks the notarization online at the first run, so a browser download that you use offline can still be blocked. In that case, run `gh attestation verify` on the file first, extract that same file, then clear the quarantine flag on the bundled `margrave` and ripwire only: `xattr -d com.apple.quarantine margrave/bin/margrave margrave/vendor/ripwire/ripwire`.
+On macOS, the bundle's `margrave` and ripwire are signed with a Developer ID. A new release stays a pre-release until Apple's notarization accepts it (usually minutes, sometimes hours), then becomes the latest release. Gatekeeper checks the notarization online at the first run, so a browser download made before that, or used offline, can be blocked. In that case, run `gh attestation verify` on the file first, extract that same file, then clear the quarantine flag on the bundled `margrave` and ripwire only: `xattr -d com.apple.quarantine margrave/bin/margrave margrave/vendor/ripwire/ripwire`.
 
 #### Upgrading from 0.1.2 or earlier
 

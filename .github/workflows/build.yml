@@ -342,12 +342,13 @@ jobs:
   # Team ID vouches for this repo's build; `attest` attests its build
   # provenance. It is built with execArgvExtension none and carries only the
   # two entitlements in .github/entitlements.plist. There is no unsigned
-  # fallback: when the signing setup is missing or notarization fails, this job
-  # fails and so does the whole release. Secrets are set only on the steps that
-  # use them. No step runs code from the bundle while key material (keychain,
-  # p12, p8) exists. The smoke test, after cleanup, does run the signed
-  # binaries on the runner's machine as its user, whose login keychain holds
-  # the Developer ID key (see "macOS signing" in CONTRIBUTING.md).
+  # fallback: a missing signing setup or a failed upload to Apple fails this
+  # job and so the whole release. Apple's verdict is checked later by
+  # notarize.yml, which promotes the pre-release. Secrets are set only on the
+  # steps that use them. No step runs code from the bundle while key material
+  # (keychain, p12, p8) exists. The smoke test, after cleanup, does run the
+  # signed binaries on the runner's machine as its user, whose login keychain
+  # holds the Developer ID key (see "macOS signing" in CONTRIBUTING.md).
   # It runs on the dedicated self-hosted runner `Vairogs-signing` (label
   # macos-signing, org runner group `signing`). That group lets only listed
   # workflows use the runner; this build.yml on master is listed. The hosted
@@ -612,10 +613,12 @@ jobs:
             exit 1
           fi
 
-      # The gate is notarytool's status `Accepted`. Any other status prints the
-      # notarization log and fails. Gatekeeper only assesses a binary when
-      # assessments are enabled on the runner, so a disabled spctl is a warning.
-      - name: Notarize ripwire and margrave
+      # Submits the bundle to Apple and does not wait for the verdict: Apple's
+      # queue can take minutes or hours, and the release must not wait for it.
+      # The submission id and the version go into the `notary-submission`
+      # artifact. The `Notarize release` workflow (notarize.yml) checks Apple's
+      # result and promotes the release.
+      - name: Submit ripwire and margrave for notarization
         env:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
@@ -623,8 +626,6 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          BIN="$RUNNER_TEMP/sign/margrave/vendor/ripwire/ripwire"
-          MARGRAVE_BIN="$RUNNER_TEMP/sign/margrave/bin/margrave"
           KEY="$RUNNER_TEMP/AuthKey.p8"
           trap 'rm -f "$KEY"' EXIT
           ZIP="$RUNNER_TEMP/notarize.zip"
@@ -640,48 +641,25 @@ jobs:
           # are notarized together.
           ditto -c -k --keepParent "$RUNNER_TEMP/sign/margrave" "$ZIP"
 
-          # notarytool can exit non-zero for a rejected submission; the status
-          # below decides, so keep going to read it and the log.
-          "$NOTARYTOOL" submit "$ZIP" --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait --output-format json > "$RESULT" || true
-          if ! STATUS=$(plutil -extract status raw -o - "$RESULT") || ! SUBMISSION_ID=$(plutil -extract id raw -o - "$RESULT"); then
-            echo "::error::notarytool returned no status and submission id. Output follows."
+          if ! "$NOTARYTOOL" submit "$ZIP" --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --output-format json > "$RESULT"; then
+            echo "::error::notarytool submit failed. Output follows."
             cat "$RESULT"
             exit 1
           fi
-          echo "notarytool status: $STATUS (submission $SUBMISSION_ID)"
-          if [[ "$STATUS" != "Accepted" ]]; then
-            echo "::error::Notarization status is '$STATUS', not 'Accepted'. Log follows."
-            "$NOTARYTOOL" log "$SUBMISSION_ID" --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" || true
+          rm -f "$KEY"
+          if ! SUBMISSION_ID=$(plutil -extract id raw -o - "$RESULT") || [[ ! "$SUBMISSION_ID" =~ ^[0-9a-f-]{36}$ ]]; then
+            echo "::error::notarytool returned no valid submission id. Output follows."
+            cat "$RESULT"
             exit 1
           fi
-
-          rm -f "$KEY"
-
-          for target in "$BIN" "$MARGRAVE_BIN"; do
-            if spctl --status 2>&1 | grep -q 'assessments enabled'; then
-              # The first assessment comes seconds after `Accepted`, and a bare
-              # Mach-O has no stapled ticket, so spctl asks Apple online. Retry
-              # for up to a minute before failing.
-              ASSESS=""
-              for attempt in 1 2 3 4 5 6; do
-                ASSESS=$(spctl --assess --type install -vv "$target" 2>&1 || true)
-                if grep -q 'source=Notarized Developer ID' <<< "$ASSESS"; then
-                  break
-                fi
-                if [[ "$attempt" -lt 6 ]]; then
-                  sleep 10
-                fi
-              done
-              echo "$ASSESS"
-              if ! grep -q 'source=Notarized Developer ID' <<< "$ASSESS"; then
-                echo "::error::spctl does not report source=Notarized Developer ID for the signed $target after 6 attempts"
-                exit 1
-              fi
-            else
-              ASSESS=$(spctl --assess --type install -vv "$target" 2>&1 || true)
-              echo "::warning::Gatekeeper assessments are disabled on this runner, so the notarization of $target was not re-checked with spctl. spctl output: $ASSESS"
-            fi
-          done
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::VERSION '$VERSION' is not a plain x.y.z version."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/notary"
+          printf '%s\n' "$SUBMISSION_ID" > "$RUNNER_TEMP/notary/submission-id"
+          printf '%s\n' "$VERSION" > "$RUNNER_TEMP/notary/version"
+          echo "Submitted for notarization: $SUBMISSION_ID (v$VERSION). The Notarize release workflow waits for Apple's result."
 
       # Removes all key material. It runs on failure too, and must not fail
       # when an earlier step stopped before it created these files.
@@ -778,6 +756,14 @@ jobs:
           name: bundle-macos-arm64
           path: ${{ runner.temp }}/out/*
           retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload the notarization submission
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: notary-submission
+          path: ${{ runner.temp }}/notary/
+          retention-days: 7
           if-no-files-found: error
 
   attest:
@@ -899,7 +885,7 @@ jobs:
 
             Upgrading a bundle or Homebrew install from 0.1.2 or earlier: first, if you symlinked a bundle, point that symlink at `margrave/bin/margrave` (`ln -sf`). Then run `margrave wrap <agent>` again and apply its output, because old agent configs start `node .../dist/cli.js`, which no longer exists. The README section "Upgrading from 0.1.2 or earlier" has the exact commands.
 
-            The macOS bundle's `margrave` and ripwire are signed with a Developer ID and notarized, so a browser download works when the Mac is online at its first run. Offline, see the README.
+            The macOS bundle's `margrave` and ripwire are signed with a Developer ID. Each release is published as a pre-release first and becomes the latest release once Apple's notarization accepts them (usually minutes, sometimes hours); Homebrew follows the latest release. Until then macOS blocks a browser download of the macOS bundle; `curl` and `gh release download` are not affected. Offline, see the README.
 
             ### Build Info
             - Commit: ${{ github.sha }}
@@ -907,7 +893,8 @@ jobs:
             - Version Bump Type: ${{ needs.version-bump.outputs.bump-type }}
             - Verify a download (GitHub CLI, signed in): `gh attestation verify <file> --repo valksor/margrave --signer-workflow valksor/margrave/.github/workflows/build.yml`
           draft: false
-          prerelease: false
+          prerelease: true
+          make_latest: false
           # Keep this glob in sync with the attest job's subject-path.
           files: artifacts/bundle-*/margrave-v*
         env:
