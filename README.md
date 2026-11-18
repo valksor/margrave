@@ -32,6 +32,16 @@ Every push to `master` publishes a release at https://github.com/valksor/margrav
 | `margrave-v<version>-linux-x64.tar.gz`, `-linux-arm64.tar.gz`, `-macos-arm64.tar.gz` | A `margrave/` directory with the built CLI, its production `node_modules`, and ripwire in `vendor/ripwire/`. Nothing else to install.                                                                                            |
 | `margrave-v<version>.tgz`                                                            | The npm package. It does not carry ripwire: run `node <package dir>/scripts/ensure-ripwire.mjs` once to fetch the pinned one. Without it, margrave falls back to `ripwire` on `PATH`, which must be at least the pinned version. |
 
+Homebrew (macOS arm64, Linux):
+
+```sh
+brew install valksor/tap/margrave
+```
+
+The formula does not install Node. margrave needs Node 27 or newer on `PATH`, and Homebrew's own `node` is 26, which does not work. Install Node 27 with the nvm command from [section 1](#1-install-margrave-itself): `nvm install --only=alpha 27.0.0-alpha.0.1.0`. nvm puts `node` on `PATH` only in interactive shells.
+
+The tap checks for new releases every 6 hours, so `brew upgrade` can trail a release by up to 6 hours. If you installed a bundle before, remove its `~/.local/bin/margrave` symlink: the first `margrave` on `PATH` wins.
+
 Bundle:
 
 ```sh
@@ -50,7 +60,7 @@ Package:
 pnpm add -g ./margrave-v<version>.tgz
 ```
 
-On macOS, download with `gh release download` or `curl`. A download in a browser is quarantined, and macOS then blocks the bundled ripwire, which is ad-hoc signed. If you used a browser, run `gh attestation verify` on the file first, extract that same file, then clear the flag on the bundled ripwire only: `xattr -d com.apple.quarantine margrave/vendor/ripwire/ripwire`.
+On macOS, the bundle's ripwire is signed with a Developer ID and notarized. Gatekeeper checks the notarization online at the first run, so a browser download that you use offline can still be blocked. In that case, run `gh attestation verify` on the file first, extract that same file, then clear the quarantine flag on the bundled ripwire only: `xattr -d com.apple.quarantine margrave/vendor/ripwire/ripwire`.
 
 ## 2. Install a skill source
 

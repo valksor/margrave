@@ -74,6 +74,22 @@ Every push to `master` publishes a release. The first line of the commit message
 
 Only the first line counts. A token in the body of the message, such as in a squashed commit, does not change the bump. The release workflow commits the new version to `master` itself, so do not bump the version in `package.json` by hand.
 
+### macOS signing
+
+Releases sign and notarize the macOS ripwire in the `sign-macos` job. A release fails until the signing setup below exists. A failed or unavailable notarization blocks the whole release, Linux included.
+
+1. Create the GitHub Environment `release-signing` (Settings → Environments). Add a deployment-branch rule that allows `master` only, with no tags. A required reviewer is optional.
+2. Add these five secrets to that environment:
+   - `MACOS_CERT_P12`: export the Developer ID Application certificate with its private key as a `.p12` file from Keychain Access, then run `base64 -i cert.p12 | pbcopy`.
+   - `MACOS_CERT_PASSWORD`: the password you set for that export.
+   - `APPLE_API_KEY_P8`: create an App Store Connect API key (Users and Access → Integrations → Team Keys, role Developer) and download the `.p8` file. You can download it only once. Then run `base64 -i AuthKey_XXXX.p8 | pbcopy`.
+   - `APPLE_API_KEY_ID`: the key ID of that API key.
+   - `APPLE_API_ISSUER_ID`: the issuer ID shown on the same page.
+
+Rotation: when the certificate expires or the API key is revoked, replace the secrets. The next release uses them.
+
+Trust: the valksor Team ID now vouches for upstream ripwire. The job signs only a binary that is byte-identical to the pinned upstream tarball (`scripts/ensure-ripwire.mjs`), which limits that risk.
+
 ## Reporting issues and conduct
 
 - Report bugs and feature requests with the issue template.
