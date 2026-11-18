@@ -899,6 +899,27 @@ test("update of all sources reports the one that fails and still updates the res
   assert.match(re.stderr, new RegExp(`warning: ${goneId}: ${gone} is not readable[^\\n]*; skipped`, "u"));
 });
 
+test("update of all sources strips terminal control bytes from the path in a per-source error", async () => {
+  const env = await setup();
+  const parent = await tmp("mg-ctl-");
+  const gone = path.join(parent, "bad\u001b]0;T\u0007dir");
+  await mkdir(gone);
+  await writeSkill(gone, "alpha", "alpha skill");
+  const kept = await tmp("mg-kept-");
+  await writeSkill(kept, "beta", "beta skill");
+  const goneId = await installLocalDir(env, gone);
+  const keptId = await installLocalDir(env, kept);
+  await rm(gone, { recursive: true });
+
+  const all = await mg(env, ["update"]);
+  assert.equal(all.code, 1);
+  assert.ok(!all.stderr.includes("\u001b") && !all.stderr.includes("\u0007"), JSON.stringify(all.stderr));
+  // cleanBlock drops the whole OSC sequence, so only "bad" and "dir" remain.
+  const shown = path.join(parent, "baddir").replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  assert.match(all.stderr, new RegExp(`update ${goneId} failed: ${shown} is not readable`, "u"));
+  assert.ok(all.stdout.includes(`${keptId}: reindexed`), all.stdout);
+});
+
 test("git source: reindex rescans the stored copy, and skips it when the copy is gone", async () => {
   const env = await setup();
   const repo = await makeRepo();
@@ -1024,6 +1045,20 @@ syncBuiltinESMExports();`);
   const r = await runCli(["list"], { home: env.home, nodeArgs: fail });
   assert.equal(r.code, 1);
   assert.equal(r.stderr, "margrave: boom, not an Error\n");
+  assert.equal(r.stdout, "");
+});
+
+test("terminal control bytes in an error message never reach stderr", async () => {
+  const env = await setup();
+  // The doubled backslashes make the preload source hold JS escapes, which the preload turns into the real bytes.
+  const fail = preloadArgs(`import fsp from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const real = fsp.readFile;
+fsp.readFile = (p, ...rest) => (String(p).endsWith("sources.json") ? Promise.reject(new Error("bad \\u001b[31mred\\u001b[0m\\u0007 name\\nsecond line")) : real(p, ...rest));
+syncBuiltinESMExports();`);
+  const r = await runCli(["list"], { home: env.home, nodeArgs: fail });
+  assert.equal(r.code, 1);
+  assert.equal(r.stderr, "margrave: bad red name\nsecond line\n");
   assert.equal(r.stdout, "");
 });
 

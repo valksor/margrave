@@ -5,6 +5,7 @@ import { runMcp } from "./mcp.ts";
 import {
   NO_SOURCES_MESSAGE,
   clean,
+  cleanBlock,
   findSkills,
   formatFind,
   formatLoad,
@@ -52,7 +53,8 @@ const out = (s: string): void => {
   process.stdout.write(s.endsWith("\n") ? s : `${s}\n`);
 };
 const err = (s: string): void => {
-  process.stderr.write(s.endsWith("\n") ? s : `${s}\n`);
+  const t = cleanBlock(s);
+  process.stderr.write(t.endsWith("\n") ? t : `${t}\n`);
 };
 const json = (v: unknown): void => out(JSON.stringify(v, null, 2));
 
