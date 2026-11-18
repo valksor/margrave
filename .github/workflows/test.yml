@@ -74,3 +74,24 @@ jobs:
 
       - name: Find unused code and dependencies
         run: pnpm knip
+
+  # Node 24 is the engines floor. This job has no c8 gate because V8 coverage
+  # ranges differ between majors. Node 24 does not expand a directory argument
+  # to `--test`, so it uses a glob.
+  test-node24:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build
+        with:
+          node-version: "24"
+
+      - name: Run tests
+        run: node --import ./test/no-vendored-ripwire.ts --test 'test/**/*.test.ts'
