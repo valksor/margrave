@@ -28,7 +28,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=27.0.0-0"
+    "node": ">=24"
   },
   "packageManager": "pnpm@12.21.0",
   "scripts": {
@@ -40,6 +40,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "tsrs --noEmit",
+    "build:sea": "pnpm run build && node scripts/build-sea.mjs",
     "knip": "knip"
   },
   "dependencies": {
@@ -51,6 +52,7 @@
   "devDependencies": {
     "@types/node": "26.6.6",
     "c8": "12.0.0",
+    "esbuild": "0.28.2",
     "knip": "6.45.1",
     "lefthook": "2.2.2",
     "oxlint": "1.94.0",

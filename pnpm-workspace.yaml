@@ -9,3 +9,5 @@ allowBuilds:
   # lefthook's only build script is a convenience that auto-runs `lefthook install`;
   # our `prepare` script does that explicitly, so no lifecycle script is needed here.
   lefthook: false
+  # esbuild's platform binary comes from optionalDependencies, so the postinstall is not needed.
+  esbuild: false

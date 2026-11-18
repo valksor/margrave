@@ -1,0 +1,7 @@
+{
+  "main": "build/margrave.mjs",
+  "mainFormat": "module",
+  "output": "build/margrave",
+  "disableExperimentalSEAWarning": true,
+  "execArgvExtension": "none"
+}

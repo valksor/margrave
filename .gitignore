@@ -30,3 +30,6 @@ yarn.lock
 .claude/scheduled_tasks.lock
 .claude/worktrees/
 .claude/memory/
+
+# SEA build output
+build/
