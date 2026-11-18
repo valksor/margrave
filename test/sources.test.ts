@@ -383,6 +383,26 @@ test("a COMMIT that fails restores the old sources.json, rolls back the rows, an
   });
 });
 
+test("a ROLLBACK that fails does not replace the error that caused it", async (t) => {
+  await inStore(t, async (home) => {
+    const first = await tmp("mg-localsrc-");
+    await writeSkill(first, "alpha", "alpha skill");
+    const second = await tmp("mg-localsrc2-");
+    await writeSkill(second, "beta", "beta skill");
+    await installSource(first, null, quiet);
+    const ids = indexIds(home);
+
+    mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+      if (sql === "COMMIT") throw new Error("mock: COMMIT failed");
+      if (sql === "ROLLBACK") throw new Error("mock: ROLLBACK failed");
+      return realExec.call(this, sql);
+    });
+    await assert.rejects(installSource(second, null, quiet), /mock: COMMIT failed/u);
+    mock.restoreAll();
+    assert.deepEqual(indexIds(home), ids, "closing the connection rolled the rows back");
+  });
+});
+
 test("install of a git source: when sources.json cannot be written, the stored copy is removed", async (t) => {
   await inStore(t, async (home) => {
     const repo = await makeRepo();

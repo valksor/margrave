@@ -209,9 +209,13 @@ Limit: the baseline compares the flagged line, not the lines around it. A known 
 
 It has the same three tools and the same inputs as `margrave mcp`. It reads the store in `MARGRAVE_HOME` of the host process on every call. It needs read access to `MARGRAVE_HOME`; it does not need write access, so a read-only mount or a separate user works. It is stateless and POST-only. Other methods get 405.
 
-After you upgrade margrave, restart the host app, and upgrade the `margrave` CLI and the package together: the host app and the CLI must use the same index format (see [Upgrading](#upgrading)).
+To upgrade (see also [Upgrading](#upgrading)):
 
-Known limit: if a CLI write is killed during its commit, a hot `index.db-journal` stays next to `index.db`. A process that can write must roll it back. A reader on a read-only mount returns an error until the next CLI write or `margrave reindex`.
+1. Upgrade the `margrave` CLI and the `margrave` package that the host app uses.
+2. Run `margrave reindex`.
+3. Restart the host app, and any running `margrave mcp` sessions.
+
+Known limit: if a CLI write is killed during its transaction, a hot `index.db-journal` stays next to `index.db`. A read-only connection cannot roll it back, so every reader (`margrave find`, `load`, and `list`, the stdio MCP server, and the hosted handler) returns `<path> has an unfinished write from a stopped margrave process; run: margrave reindex` until the next CLI write or `margrave reindex` rolls the journal back. This happens in a writable directory too, not only on a read-only mount. margrave never deletes the journal.
 
 A remote client sees these differences:
 
@@ -231,21 +235,27 @@ import { createServer } from "node:http";
 import { handleHostedMcp } from "margrave/hosted";
 
 createServer(async (incoming, outgoing) => {
-  if (new URL(incoming.url ?? "/", "http://localhost").pathname !== "/mcp") {
-    outgoing.writeHead(404).end("not found");
-    return;
+  try {
+    if (new URL(incoming.url ?? "/", "http://localhost").pathname !== "/mcp") {
+      outgoing.writeHead(404).end("not found");
+      return;
+    }
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(incoming.headers)) {
+      if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(", ") : value);
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of incoming) chunks.push(chunk as Buffer);
+    const method = incoming.method ?? "GET";
+    const body = method === "GET" || method === "HEAD" ? undefined : Buffer.concat(chunks);
+    const res = await handleHostedMcp(new Request("http://localhost/mcp", { method, headers, body }));
+    outgoing.writeHead(res.status, Object.fromEntries(res.headers));
+    outgoing.end(Buffer.from(await res.arrayBuffer()));
+  } catch (err) {
+    console.error(err);
+    if (!outgoing.headersSent) outgoing.writeHead(500);
+    outgoing.end();
   }
-  const headers = new Headers();
-  for (const [name, value] of Object.entries(incoming.headers)) {
-    if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(", ") : value);
-  }
-  const chunks: Buffer[] = [];
-  for await (const chunk of incoming) chunks.push(chunk as Buffer);
-  const method = incoming.method ?? "GET";
-  const body = method === "GET" || method === "HEAD" ? undefined : Buffer.concat(chunks);
-  const res = await handleHostedMcp(new Request("http://localhost/mcp", { method, headers, body }));
-  outgoing.writeHead(res.status, Object.fromEntries(res.headers));
-  outgoing.end(Buffer.from(await res.arrayBuffer()));
 }).listen(8080);
 ```
 
@@ -254,6 +264,8 @@ createServer(async (incoming, outgoing) => {
 The index is a SQLite FTS5 table in `index.db` (the built-in `node:sqlite` module). Ranking is FTS5 BM25 per column, with k1 = 1.2 and b = 0.75 fixed by FTS5. Column weights: name 3, description 2, headings 1, body 0.3. The first 2000 body tokens are indexed. Tokens are lowercased, split on non-alphanumerics, stripped of stopwords, and stemmed with the Porter algorithm (the `stemmer` package). The stopword check runs on the word and again on its stem. margrave builds the tokens itself, so FTS5 only splits on spaces.
 
 An exact match of the query to a name or id (case-insensitive) ranks first. Its shown score has a fixed bonus of 10. Ties break by id in byte order (the UTF-8 bytes of the id). A query uses at most 32 distinct tokens, in the order they appear; later tokens are dropped.
+
+FTS5 sets the IDF of a term that is in half or more of the skills to almost zero. On a small store, or for a common word, scores can show as `0.000`. Scores rank the results of one query; do not use them as absolute thresholds.
 
 Scores have a different scale from earlier versions (per-column BM25 replaced BM25F), so re-tune any score threshold that you apply to `find --json`.
 
@@ -267,11 +279,19 @@ Scores have a different scale from earlier versions (per-column BM25 replaced BM
   index.db               SQLite FTS5 index: one row per skill
 ```
 
-A missing `sources.json` is an empty list. A malformed one is an error, and margrave writes nothing. A missing, legacy, or invalid `index.db` is an error that tells you to run `margrave reindex`. `sources.json` is written by an atomic rename (temp file in the same directory, then rename). `index.db` is written in SQLite transactions with the `DELETE` journal, so readers need only read access. An `install`, `update`, `remove`, or `reindex` takes the write lock, re-reads `sources.json` under it, and writes both; a second writer waits up to 30 seconds.
+A missing `sources.json` is an empty list. A malformed one is an error, and margrave writes nothing. A missing, legacy, or schema-less `index.db` (`user_version` 0) is an error that tells you to run `margrave reindex`; `reindex` and the first `install` into an empty store initialize a `user_version` 0 file in place. margrave never deletes `index.db`. A file that is not a margrave index (not a SQLite database, a `user_version` other than 0 and 1, or `user_version` 1 with the `skills` or `fts` table missing) is refused by every command, including `reindex`: move it aside, then run `margrave reindex`. `sources.json` is written by an atomic rename (temp file in the same directory, then rename). `index.db` is written in SQLite transactions with the `DELETE` journal, so readers need only read access. An `install`, `update`, `remove`, or `reindex` takes the write lock, re-reads `sources.json` under it, and writes both; a second writer waits up to 30 seconds.
 
 ## Upgrading
 
-From a version that stored `index.json`: run `margrave reindex` once. It builds `index.db` and removes `index.json`. Until then, `find`, `load`, `list`, `install`, `update`, and `remove` stop with `index.json is from an older margrave; run: margrave reindex`. Then restart running `margrave mcp` sessions and any host app that mounts the hosted handler, and upgrade the CLI and the package together.
+From a version that stored `index.json`:
+
+1. Upgrade the margrave CLI and the `margrave` package that the host app uses, so that they are on the same version.
+2. Run `margrave reindex` once. It builds `index.db` and removes `index.json`. Until then, `find`, `load`, `list`, `install`, `update`, and `remove` stop with `index.json is from an older margrave; run: margrave reindex`.
+3. Restart running `margrave mcp` sessions and the host app that mounts the hosted handler.
+
+A `margrave mcp` session that an older version started says `index.json is missing; run: margrave reindex` after the upgrade. Restart that session.
+
+margrave never deletes `index.db`. If `index.db` is not a margrave index (for example another program wrote it, or its `user_version` is not 0 or 1), every command stops with `<path> is not a margrave index; move it aside, then run: margrave reindex`. Move the file aside yourself, then run `margrave reindex`.
 
 ## Exit codes
 

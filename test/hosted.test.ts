@@ -215,7 +215,7 @@ test("hosted: a store failure returns a generic error and logs the cause", async
     assert.equal(log.mock.callCount(), 1, tool);
     const logged: unknown = log.mock.calls[0]?.arguments[0];
     assert.ok(logged instanceof Error, tool);
-    assert.match(logged.message, /is not a valid margrave index; run: margrave reindex/u, tool);
+    assert.match(logged.message, /is not a margrave index; move it aside, then run: margrave reindex/u, tool);
   }
 });
 

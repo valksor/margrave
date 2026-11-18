@@ -134,6 +134,9 @@ const SCHEMA_VERSION = 1;
 const READ_TIMEOUT_MS = 5000;
 const WRITE_TIMEOUT_MS = 30000;
 const SQLITE_NOTADB = 26;
+const SQLITE_CORRUPT = 11;
+// A hot rollback journal that a read-only connection cannot roll back.
+const SQLITE_READONLY_ROLLBACK = 776;
 
 // Idempotent, so a second creator that waited for the lock changes nothing. The caller owns the transaction.
 const SCHEMA = `
@@ -156,7 +159,12 @@ PRAGMA user_version = ${SCHEMA_VERSION};
 `;
 
 const legacyMessage = (): string => "index.json is from an older margrave; run: margrave reindex";
+// A schema-less file (user_version 0): reindex can fill it.
 const invalidMessage = (file: string): string => `${file} is not a valid margrave index; run: margrave reindex`;
+// Not ours, or damaged (including user_version 1 with a table missing): margrave never deletes it, so the user moves it aside.
+const foreignMessage = (file: string): string => `${file} is not a margrave index; move it aside, then run: margrave reindex`;
+const unfinishedWriteMessage = (file: string): string =>
+  `${file} has an unfinished write from a stopped margrave process; run: margrave reindex`;
 
 /** lstat that reads only ENOENT as "not there". Any other error (EACCES, EIO) is reported, never taken as absence. */
 async function lstatIfExists(file: string): Promise<Stats | null> {
@@ -180,12 +188,7 @@ async function requireCurrentIndex(file: string, st: Stats | null): Promise<void
     throw new MargraveError(legacy === null ? "index.db is missing; run: margrave reindex" : legacyMessage());
   }
   // An older margrave wrote index.json after the upgrade: its skills are not in index.db.
-  if (legacy !== null && legacy.mtimeMs > st.mtimeMs) throw new MargraveError(legacyMessage());
-}
-
-/** Only these cases count as an invalid index. Any other SQLite error (busy, I/O, permissions) must never lead to a delete. */
-function isNotADb(err: unknown): boolean {
-  return (err as { errcode?: unknown }).errcode === SQLITE_NOTADB;
+  if (legacy !== null && legacy.mtimeMs >= st.mtimeMs) throw new MargraveError(legacyMessage());
 }
 
 interface OpenOptions {
@@ -200,30 +203,44 @@ interface Probe {
   tables: number;
 }
 
-/** Opens a database and reads its version and tables. Returns null for NOTADB. Any other SQLite error is reported, never taken as "invalid". */
-function openProbed(file: string, options: OpenOptions): { db: DatabaseSync; probe: Probe } | null {
+/** Reads the version and the table count of an open database. A version other than 0 and 1 is a file that is not ours. */
+function readProbe(db: DatabaseSync, file: string): Probe {
+  const version = Number((db.prepare("PRAGMA user_version").get() as { user_version: number | bigint }).user_version);
+  if (version !== 0 && version !== SCHEMA_VERSION) throw new MargraveError(foreignMessage(file));
+  const tables = Number(
+    (db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name IN ('skills', 'fts')").get() as { n: number | bigint }).n,
+  );
+  return { version, tables };
+}
+
+/** Names the SQLite error. Only NOTADB means "not ours", and 776 means a hot journal. Nothing here leads to a delete. */
+function openError(file: string, err: unknown): MargraveError {
+  const code = (err as { errcode?: unknown }).errcode;
+  if (code === SQLITE_NOTADB) return new MargraveError(foreignMessage(file));
+  if (code === SQLITE_READONLY_ROLLBACK) return new MargraveError(unfinishedWriteMessage(file));
+  const hint = code === SQLITE_CORRUPT ? "; if the file is damaged, move it aside, then run: margrave reindex" : "";
+  return new MargraveError(`cannot open ${file}: ${(err as Error).message}${hint}`);
+}
+
+/** Opens a database and probes it. Throws for a file that is not ours and for any other SQLite error. */
+function openProbed(file: string, options: OpenOptions): { db: DatabaseSync; probe: Probe } {
   let db: DatabaseSync | undefined;
   try {
     db = new DatabaseSync(file, options);
-    const version = Number((db.prepare("PRAGMA user_version").get() as { user_version: number | bigint }).user_version);
-    const tables = Number(
-      (db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name IN ('skills', 'fts')").get() as { n: number | bigint }).n,
-    );
-    return { db, probe: { version, tables } };
+    return { db, probe: readProbe(db, file) };
   } catch (err) {
     if (db?.isOpen === true) db.close();
-    if (isNotADb(err)) return null;
-    throw new MargraveError(`cannot open ${file}: ${(err as Error).message}`);
+    throw err instanceof MargraveError ? err : openError(file, err);
   }
 }
 
-/** Opens a database that must be a complete margrave index (user_version 1 with both tables). Returns null otherwise. */
-function openCurrent(file: string, options: OpenOptions): DatabaseSync | null {
-  const opened = openProbed(file, options);
-  if (opened === null) return null;
-  if (opened.probe.version === SCHEMA_VERSION && opened.probe.tables === 2) return opened.db;
-  opened.db.close();
-  return null;
+/** Opens a database that must be a complete margrave index (user_version 1 with both tables). */
+function openCurrent(file: string, options: OpenOptions): DatabaseSync {
+  const { db, probe } = openProbed(file, options);
+  if (probe.version === SCHEMA_VERSION && probe.tables === 2) return db;
+  db.close();
+  // user_version 0 is a file that reindex can fill. Version 1 with a table missing is not something reindex can fix.
+  throw new MargraveError(probe.version === 0 ? invalidMessage(file) : foreignMessage(file));
 }
 
 /**
@@ -233,16 +250,14 @@ function openCurrent(file: string, options: OpenOptions): DatabaseSync | null {
 export async function openIndexRead(): Promise<DatabaseSync> {
   const file = indexDbFile();
   await requireCurrentIndex(file, await statIndexDb(file));
-  const db = openCurrent(file, { readOnly: true, timeout: READ_TIMEOUT_MS });
-  if (db === null) throw new MargraveError(invalidMessage(file));
-  return db;
+  return openCurrent(file, { readOnly: true, timeout: READ_TIMEOUT_MS });
 }
 
 /**
- * Open index.db for writing. The caller closes it.
+ * Open index.db for writing. The caller closes it. margrave never deletes index.db.
  * "existing": the index must exist and be complete (a store that has sources).
- * "create": reindex, or a write into a store with no sources. A missing or schema-less file is initialized in place
- * under the write lock. Only a file that is truly invalid (NOTADB, or a user_version other than 0 and 1) is unlinked.
+ * "create": reindex, or a write into a store with no sources. A missing file, or a file with user_version 0 (including
+ * 0 bytes), is initialized in place under the write lock. A file that is not ours is refused.
  */
 export async function openIndexWrite(mode: "existing" | "create"): Promise<DatabaseSync> {
   const file = indexDbFile();
@@ -250,35 +265,23 @@ export async function openIndexWrite(mode: "existing" | "create"): Promise<Datab
   if (mode === "existing") await requireCurrentIndex(file, st);
   // The first open waits as long as a reader would. Then the busy timeout goes up for the write lock.
   const options = { readBigInts: true, timeout: READ_TIMEOUT_MS };
-  if (mode === "existing") {
-    // requireCurrentIndex() threw for a missing file, so the file is there.
-    const db = openCurrent(file, options);
-    if (db === null) throw new MargraveError(invalidMessage(file));
-    return setWriterPragmas(db);
-  }
-  let opened = st === null ? null : openProbed(file, options);
-  if (st !== null && (opened === null || opened.probe.version > SCHEMA_VERSION)) {
-    // Another process may be creating the schema right now, but that leaves user_version 0 or 1. This file is not ours.
-    opened?.db.close();
-    await rm(file, { force: true });
-    await rm(`${file}-journal`, { force: true });
-    opened = null;
-  }
+  // requireCurrentIndex() threw for a missing file, so the file is there.
+  if (mode === "existing") return setWriterPragmas(openCurrent(file, options));
   let db: DatabaseSync | undefined;
   try {
-    db = setWriterPragmas(opened?.db ?? new DatabaseSync(file, options));
+    await mkdir(home(), { recursive: true });
+    db = setWriterPragmas(st === null ? new DatabaseSync(file, options) : openProbed(file, options).db);
     // The schema is checked again under the lock: a second creator that waited finds it complete and changes nothing.
     db.exec("BEGIN IMMEDIATE");
-    const tables = Number(
-      (db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name IN ('skills', 'fts')").get() as { n: number | bigint }).n,
-    );
-    if (tables !== 2) db.exec(SCHEMA);
+    const now = readProbe(db, file);
+    if (now.version === 0) db.exec(SCHEMA);
+    else if (now.tables !== 2) throw new MargraveError(foreignMessage(file));
     db.exec("COMMIT");
     return db;
   } catch (err) {
     // Closing the connection rolls back an open transaction. There is none to close when the open itself failed.
     db?.close();
-    throw new MargraveError(`cannot create ${file}: ${(err as Error).message}`);
+    throw err instanceof MargraveError ? err : new MargraveError(`cannot create ${file}: ${(err as Error).message}`);
   }
 }
 

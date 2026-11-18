@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { mock } from "node:test";
 import { promisify } from "node:util";
 import { buildFieldTokens } from "../src/bm25.ts";
 import { PINNED_RIPWIRE } from "../src/safety.ts";
@@ -238,6 +239,44 @@ export function holdWriteLock(home: string, mode: "IMMEDIATE" | "EXCLUSIVE" = "I
       db.close();
     },
   };
+}
+
+/**
+ * A second connection to home's index.db: runs `fn` in one transaction, then closes. Synchronous, and it bypasses any
+ * exec mock, so a test can use it as "another process changed the store".
+ */
+export function writeIndexRows(home: string, fn: (db: DatabaseSync) => void): void {
+  const db = new DatabaseSync(path.join(home, "index.db"), { readBigInts: true, timeout: 5000 });
+  try {
+    realExec.call(db, "BEGIN IMMEDIATE");
+    fn(db);
+    realExec.call(db, "COMMIT");
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Mock DatabaseSync.exec so that `change` runs synchronously right before the `nth` BEGIN IMMEDIATE, then the real exec
+ * runs. The counters show whether that statement was reached, which tells a check under the lock from one before it.
+ * The caller undoes the mock with mock.restoreAll() or at the end of the test.
+ */
+export function changeAtLock(
+  t: { after: (fn: () => void) => void },
+  nth: number,
+  change: () => void,
+): { begins: () => number; fired: () => boolean } {
+  let begins = 0;
+  let fired = false;
+  mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && ++begins === nth) {
+      fired = true;
+      change();
+    }
+    return realExec.call(this, sql);
+  });
+  t.after(() => mock.restoreAll());
+  return { begins: () => begins, fired: () => fired };
 }
 
 export const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));

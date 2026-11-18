@@ -249,7 +249,7 @@ async function checkIndex(sources: readonly SourceRecord[]): Promise<void> {
 /**
  * The one write path. Takes the write lock, re-reads sources.json, lets `change` edit the rows and return the next
  * source list, writes sources.json, then commits. Any failure leaves the index as it was.
- * `mode` is "create" for a store with no sources or a reindex: a missing or invalid index is replaced.
+ * `mode` is "create" for a store with no sources or a reindex: a missing index, or one with user_version 0, is initialized.
  */
 async function commit(mode: "existing" | "create", change: (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[]): Promise<void> {
   const db = await openIndexWrite(mode);
@@ -265,7 +265,13 @@ async function commit(mode: "existing" | "create", change: (fresh: SourceRecord[
       throw err;
     }
   } catch (err) {
-    if (db.isTransaction) db.exec("ROLLBACK");
+    if (db.isTransaction) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // The original error is the one to report. close() below rolls the transaction back as well.
+      }
+    }
     throw err;
   } finally {
     db.close();
@@ -424,6 +430,8 @@ export async function updateSources(
   ctx: Ctx,
 ): Promise<{ results: UpdateResult[]; errors: { id: string; message: string }[] }> {
   const sources = await readSources();
+  // A missing, legacy, or invalid index fails once here, not once per source.
+  if (arg === null) await checkIndex(sources);
   const targets = arg === null ? sources : [findSource(sources, arg)];
   const results: UpdateResult[] = [];
   const errors: { id: string; message: string }[] = [];

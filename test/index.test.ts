@@ -1,5 +1,8 @@
 // index.db: ranking, the upgrade and validity guard, locking, and concurrent writes.
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { readFileSync, writeFileSync } from "node:fs";
 import fsp, { chmod, mkdir, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
@@ -7,10 +10,11 @@ import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { MAX_QUERY_TERMS } from "../src/bm25.ts";
 import { findSkills, resolveSkill } from "../src/skills.ts";
-import { localId } from "../src/sources.ts";
-import { deleteSourceSkills, home as storeHome, insertSkills, openIndexRead, openIndexWrite, writeSources } from "../src/store.ts";
+import { installSource, localId, reindexAll, removeSource, updateSources } from "../src/sources.ts";
+import { deleteSourceSkills, home as storeHome, insertSkills, openIndexRead, openIndexWrite } from "../src/store.ts";
 import type { NewEntry, SourceRecord } from "../src/store.ts";
 import {
+  changeAtLock,
   fakeRipwire,
   holdWriteLock,
   indexIds,
@@ -22,6 +26,7 @@ import {
   seedIndex,
   sleep,
   tmp,
+  writeIndexRows,
   writeSkill,
 } from "./helpers.ts";
 import type { Run } from "./helpers.ts";
@@ -168,6 +173,13 @@ test("a 10,000-term task uses at most 32 terms and returns fast", async (t) => {
   }
 });
 
+test("the term cap is exact: the 32nd distinct token matches and the 33rd does not", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  const task = Array.from({ length: 40 }, (_, i) => `word${i}`).join(" ");
+  const entries = [newEntry("s", "inside", "has word31 in it"), newEntry("s", "outside", "has word32 in it")];
+  assert.deepEqual(ids(await ranked(entries, task)), ["s/inside"]);
+});
+
 test("query text never reaches the SQL: quotes, operators, and FTS syntax are plain tokens or dropped", async (t) => {
   useHome(t, await tmp("mg-home-"));
   const entries = [newEntry("s", "alpha", "alpha near beta"), newEntry("s", "it's", "quote name")];
@@ -291,6 +303,11 @@ test("an index.json newer than index.db means an older margrave wrote it: the le
     assert.equal(r.code, 1, args.join(" "));
     assert.match(r.stderr, LEGACY, args.join(" "));
   }
+  // The same mtime counts as newer: an older margrave that wrote index.json in the same instant must not go unnoticed.
+  const same = new Date(Date.now() - 120_000);
+  await utimes(json, same, same);
+  await utimes(path.join(s.home, "index.db"), same, same);
+  assert.match((await s.mg(["find", "alpha"])).stderr, LEGACY);
   const past = new Date(Date.now() - 3_600_000);
   await utimes(json, past, past);
   assert.equal((await s.mg(["find", "alpha"])).code, 0);
@@ -298,15 +315,18 @@ test("an index.json newer than index.db means an older margrave wrote it: the le
   assert.equal((await readdir(s.home)).includes("index.json"), false);
 });
 
-/**
- * An index.db that is not a complete margrave index, in four shapes. `invalid` ones are not ours at all (NOTADB, or a
- * user_version other than 0 and 1): reindex unlinks them. The others are schema-less, and may be a creator's file that
- * is not initialized yet: reindex and install open them in place.
- */
-const BAD_DBS: { why: string; invalid: boolean; make: (file: string) => Promise<void> | void }[] = [
+const FOREIGN = /index\.db is not a margrave index; move it aside, then run: margrave reindex/u;
+const CORRUPT = /cannot open .*index\.db: .*; if the file is damaged, move it aside, then run: margrave reindex/u;
+
+interface BadDb {
+  why: string;
+  make: (file: string) => Promise<void> | void;
+}
+
+/** Not ours: NOTADB, or a user_version other than 0 and 1 (a negative one too). Every command refuses it, reindex included. */
+const FOREIGN_DBS: BadDb[] = [
   {
     why: "a wrong user_version",
-    invalid: true,
     make: (file) => {
       const db = new DatabaseSync(file);
       db.exec("CREATE TABLE skills(id TEXT); CREATE VIRTUAL TABLE fts USING fts5(a); PRAGMA user_version = 7");
@@ -314,14 +334,44 @@ const BAD_DBS: { why: string; invalid: boolean; make: (file: string) => Promise<
     },
   },
   {
+    why: "a negative user_version",
+    make: (file) => {
+      const db = new DatabaseSync(file);
+      db.exec("PRAGMA user_version = -1");
+      db.close();
+    },
+  },
+  {
     why: "a garbage file",
-    invalid: true,
     make: (file) => writeFile(file, "this is not a database, but it is longer than a header would need to be ".repeat(4)),
   },
-  { why: "a 0-byte file", invalid: false, make: (file) => writeFile(file, "") },
+];
+
+/** Schema-less (user_version 0): reads refuse it; reindex and the first install initialize it in place. */
+const SCHEMALESS_DBS: BadDb[] = [
+  { why: "a 0-byte file", make: (file) => writeFile(file, "") },
   {
-    why: "a database with no schema",
-    invalid: false,
+    why: "a database with an unrelated table and user_version 0",
+    make: (file) => {
+      const db = new DatabaseSync(file);
+      db.exec("CREATE TABLE other(x)");
+      db.close();
+    },
+  },
+];
+
+/** user_version 1 with a table missing: reindex cannot fill it, so every command says to move it aside. */
+const PARTIAL_DBS: BadDb[] = [
+  {
+    why: "user_version 1 with the fts table missing",
+    make: (file) => {
+      const db = new DatabaseSync(file);
+      db.exec("CREATE TABLE skills(id TEXT); PRAGMA user_version = 1");
+      db.close();
+    },
+  },
+  {
+    why: "user_version 1 with no schema",
     make: (file) => {
       const db = new DatabaseSync(file);
       db.exec("PRAGMA user_version = 1");
@@ -330,44 +380,187 @@ const BAD_DBS: { why: string; invalid: boolean; make: (file: string) => Promise<
   },
 ];
 
-test("a bad index.db is an error on every command; reindex rebuilds it, and unlinks only a file that is not ours", async () => {
-  for (const { why, invalid, make } of BAD_DBS) {
-    const s = await setup();
-    const file = path.join(s.home, "index.db");
-    const other = await localSource("beta");
-    await rm(file);
-    await make(file);
-    const inode = (await stat(file)).ino;
-    for (const args of [["find", "alpha"], ["list"], ["load", "alpha"], ["install", other.dir], ["update", s.id], ["remove", s.id]]) {
+/** A store set up with alpha, whose index.db is replaced by the bad one. */
+async function withBadDb(bad: BadDb): Promise<Awaited<ReturnType<typeof setup>> & { file: string; other: string }> {
+  const s = await setup();
+  const file = path.join(s.home, "index.db");
+  await rm(file);
+  await bad.make(file);
+  return { ...s, file, other: (await localSource("beta")).dir };
+}
+
+const readArgs = (s: { id: string; other: string }): string[][] => [
+  ["find", "alpha"],
+  ["list"],
+  ["load", "alpha"],
+  ["install", s.other],
+  ["update", s.id],
+  ["update"],
+  ["remove", s.id],
+];
+
+test("a foreign index.db is refused by every command, reindex included, and margrave never changes or deletes it", async () => {
+  for (const bad of FOREIGN_DBS) {
+    const s = await withBadDb(bad);
+    const before = await readFile(s.file);
+    const inode = (await stat(s.file)).ino;
+    for (const args of [...readArgs(s), ["reindex"]]) {
       const r = await s.mg(args);
-      assert.equal(r.code, 1, `${why}: ${args.join(" ")}`);
-      assert.match(r.stderr, INVALID, `${why}: ${args.join(" ")}`);
+      assert.equal(r.code, 1, `${bad.why}: ${args.join(" ")}`);
+      assert.match(r.stderr, FOREIGN, `${bad.why}: ${args.join(" ")}`);
     }
-    // A stale journal next to a file that is not ours is removed with it.
-    if (invalid) await writeFile(`${file}-journal`, "stale");
+    assert.deepEqual(await readFile(s.file), before, `${bad.why}: the file is unchanged`);
+    assert.equal((await stat(s.file)).ino, inode, bad.why);
+    assert.deepEqual((await readdir(s.home)).filter((n) => n.startsWith("index")).sort(), ["index.db"], `${bad.why}: no side file`);
+    // The user moves it aside, then reindex builds a new one.
+    await rename(s.file, `${s.file}.aside`);
     const re = await s.mg(["reindex"]);
-    assert.equal(re.code, 0, `${why}: ${re.stderr}`);
-    assert.deepEqual(indexIds(s.home), [`${s.id}/alpha`], why);
-    if (invalid) assert.equal((await readdir(s.home)).includes("index.db-journal"), false, why);
-    else assert.equal((await stat(file)).ino, inode, `${why}: a schema-less file is opened in place, not unlinked`);
-    assert.equal((await s.mg(["find", "alpha"])).code, 0, why);
+    assert.equal(re.code, 0, `${bad.why}: ${re.stderr}`);
+    assert.deepEqual(indexIds(s.home), [`${s.id}/alpha`], bad.why);
   }
 });
 
-test("an install into a store with no sources initializes a schema-less index.db in place, and replaces one that is not ours", async () => {
-  for (const { why, invalid, make } of BAD_DBS) {
+test("a schema-less index.db is an error for reads; reindex initializes it in place", async () => {
+  for (const bad of SCHEMALESS_DBS) {
+    const s = await withBadDb(bad);
+    const inode = (await stat(s.file)).ino;
+    for (const args of readArgs(s)) {
+      const r = await s.mg(args);
+      assert.equal(r.code, 1, `${bad.why}: ${args.join(" ")}`);
+      assert.match(r.stderr, INVALID, `${bad.why}: ${args.join(" ")}`);
+    }
+    const re = await s.mg(["reindex"]);
+    assert.equal(re.code, 0, `${bad.why}: ${re.stderr}`);
+    assert.deepEqual(indexIds(s.home), [`${s.id}/alpha`], bad.why);
+    assert.equal((await stat(s.file)).ino, inode, `${bad.why}: opened in place, not unlinked`);
+    assert.equal((await s.mg(["find", "alpha"])).code, 0, bad.why);
+  }
+});
+
+test("user_version 1 with a table missing gives the move-it-aside message for every command, reindex included, and the file is unchanged", async () => {
+  for (const bad of PARTIAL_DBS) {
+    const s = await withBadDb(bad);
+    const before = await readFile(s.file);
+    for (const args of [...readArgs(s), ["reindex"]]) {
+      const r = await s.mg(args);
+      assert.equal(r.code, 1, `${bad.why}: ${args.join(" ")}`);
+      assert.match(r.stderr, FOREIGN, `${bad.why}: ${args.join(" ")}`);
+    }
+    assert.deepEqual(await readFile(s.file), before, bad.why);
+  }
+});
+
+test("an install into a store with no sources: a schema-less index.db is initialized in place; a foreign or partial one is refused and unchanged", async () => {
+  const cases = [
+    ...SCHEMALESS_DBS.map((bad) => ({ bad, ok: true, message: INVALID })),
+    ...FOREIGN_DBS.map((bad) => ({ bad, ok: false, message: FOREIGN })),
+    ...PARTIAL_DBS.map((bad) => ({ bad, ok: false, message: FOREIGN })),
+  ];
+  for (const { bad, ok, message } of cases) {
     const home = await tmp("mg-home-");
     const dir = await tmp("mg-localsrc-");
     await writeSkill(dir, "alpha", "alpha skill");
     const file = path.join(home, "index.db");
-    await make(file);
+    await bad.make(file);
+    const before = await readFile(file);
     const inode = (await stat(file)).ino;
     const r = await runCli(["install", dir], { home, fakeBin: await fakeRipwire() });
-    assert.equal(r.code, 0, `${why}: ${r.stderr}`);
-    assert.equal(indexIds(home).length, 1, why);
-    if (!invalid) assert.equal((await stat(file)).ino, inode, `${why}: opened in place`);
-    assert.equal((await runCli(["find", "alpha"], { home })).code, 0, why);
+    if (ok) {
+      assert.equal(r.code, 0, `${bad.why}: ${r.stderr}`);
+      assert.equal(indexIds(home).length, 1, bad.why);
+      assert.equal((await stat(file)).ino, inode, `${bad.why}: opened in place`);
+      assert.equal((await runCli(["find", "alpha"], { home })).code, 0, bad.why);
+    } else {
+      assert.equal(r.code, 1, bad.why);
+      assert.match(r.stderr, message, bad.why);
+      assert.deepEqual(await readFile(file), before, `${bad.why}: the file is unchanged`);
+      assert.equal((await readdir(home)).includes("sources.json"), false, `${bad.why}: no source was recorded`);
+    }
   }
+});
+
+test("a damaged index.db (SQLITE_CORRUPT) keeps the open error and adds how to recover; nothing is deleted", async () => {
+  const s = await setup();
+  const file = path.join(s.home, "index.db");
+  // Keep the 100-byte header (it holds user_version), then overwrite the start of the schema page.
+  const fh = await fsp.open(file, "r+");
+  try {
+    await fh.write(Buffer.alloc(200, 0xff), 0, 200, 100);
+  } finally {
+    await fh.close();
+  }
+  const before = await readFile(file);
+  for (const args of [["find", "alpha"], ["list"], ["reindex"]]) {
+    const r = await s.mg(args);
+    assert.equal(r.code, 1, args.join(" "));
+    assert.match(r.stderr, CORRUPT, args.join(" "));
+    assert.doesNotMatch(r.stderr, /not a valid margrave index|not a margrave index/u, args.join(" "));
+  }
+  assert.deepEqual(await readFile(file), before);
+});
+
+/** A child that starts a write transaction on index.db with a tiny page cache, so SQLite writes a journal, and then waits. */
+const JOURNAL_WRITER = `
+const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync(process.argv[1], { timeout: 5000 });
+db.exec("PRAGMA cache_size = 10");
+db.exec("BEGIN IMMEDIATE");
+db.exec("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000) " +
+  "INSERT INTO skills(id, id_lc, name, name_lc, description, source, dir, hash) " +
+  "SELECT 'k' || i, 'k' || i, 'n', 'n', hex(randomblob(400)), 'zz', '/x', 'h' FROM n");
+process.stdout.write("ready\\n");
+setInterval(() => {}, 1000);
+`;
+
+test(
+  "a hot journal from a killed writer: every reader says so, margrave deletes nothing, and reindex recovers",
+  { timeout: 60_000 },
+  async () => {
+    const s = await setup();
+    const file = path.join(s.home, "index.db");
+    const child = spawn(process.execPath, ["-e", JOURNAL_WRITER, file], { stdio: ["ignore", "pipe", "inherit"] });
+    const exited = once(child, "exit");
+    try {
+      const ready = await Promise.race([once(child.stdout, "data").then(() => true), exited.then(() => false)]);
+      assert.equal(ready, true, "the writer exited before its transaction was open");
+    } finally {
+      child.kill("SIGKILL");
+      await exited;
+    }
+    assert.equal((await readdir(s.home)).includes("index.db-journal"), true, "the killed writer left a hot journal");
+
+    const message = /index\.db has an unfinished write from a stopped margrave process; run: margrave reindex/u;
+    for (const args of [["find", "alpha"], ["list"], ["load", `${s.id}/alpha`]]) {
+      const r = await s.mg(args);
+      assert.equal(r.code, 1, args.join(" "));
+      assert.match(r.stderr, message, args.join(" "));
+      assert.doesNotMatch(r.stderr, /not a valid margrave index|not a margrave index|cannot open/u, args.join(" "));
+    }
+    assert.equal((await readdir(s.home)).includes("index.db-journal"), true, "a reader never deletes the journal");
+
+    const re = await s.mg(["reindex"]);
+    assert.equal(re.code, 0, re.stderr);
+    assert.deepEqual(indexIds(s.home), [`${s.id}/alpha`], "the killed write was rolled back");
+    assert.equal((await s.mg(["find", "alpha"])).code, 0);
+  },
+);
+
+test("reindex creates MARGRAVE_HOME when it does not exist", async () => {
+  const home = path.join(await tmp("mg-parent-"), "not", "there", "yet");
+  const r = await runCli(["reindex"], { home });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(indexIds(home), []);
+});
+
+test("update with no argument prints a guard error once, not once per source", async () => {
+  const s = await setup();
+  const second = await localSource("beta");
+  assert.equal((await s.mg(["install", second.dir])).code, 0);
+  await rm(path.join(s.home, "index.db"));
+  await writeFile(path.join(s.home, "index.json"), "{}");
+  const r = await s.mg(["update"]);
+  assert.equal(r.code, 1);
+  assert.equal(r.stderr.match(/index\.json is from an older margrave/gu)?.length, 1, r.stderr);
 });
 
 test("two first-time installs of different sources into an empty store both survive", { timeout: 60_000 }, async () => {
@@ -563,73 +756,102 @@ test("two installs of different sources that wait for the same lock both survive
   assert.match(list.stdout, /gamma skill/u);
 });
 
-test("a reindex that waited while another write changed the sources reports it, and loses nothing", { timeout: 60_000 }, async (t) => {
+// ---- a write that changes the store between a command's checks and its lock, in this process ----
+
+const quiet = { log: (): void => undefined, allowUnsafe: false };
+
+/** Put the fake ripwire first on PATH for this test, so an in-process install can scan. */
+async function useFakeRipwire(t: { after: (fn: () => void) => void }): Promise<void> {
+  const prev = process.env["PATH"] ?? "";
+  process.env["PATH"] = `${await fakeRipwire()}:${prev}`;
+  t.after(() => {
+    process.env["PATH"] = prev;
+  });
+}
+
+const sourcesFilePath = (home: string): string => path.join(home, "sources.json");
+const readSourceRecords = (home: string): SourceRecord[] => JSON.parse(readFileSync(sourcesFilePath(home), "utf8")) as SourceRecord[];
+
+test("a reindex whose sources change after its scan reports it under the lock, and loses nothing", async (t) => {
   const s = await setup();
   useHome(t, s.home);
   const extra = await localSource("beta");
-  const lock = holdWriteLock(s.home);
-  let re: Run;
-  try {
-    const pending = s.mg(["reindex"]);
-    await sleep(CHILD_HEAD_START_MS);
-    // The helper acts as an install that won the lock: new source record and new rows.
-    const record = extra.record("local__extra-abc123");
-    const existing = JSON.parse(await readFile(path.join(s.home, "sources.json"), "utf8")) as SourceRecord[];
-    await writeSources([...existing, record]);
-    insertSkills(lock.db, [newEntry(record.id, "beta")]);
-    lock.release();
-    re = await pending;
-  } finally {
-    lock.release();
-  }
-  assert.equal(re.code, 1);
-  assert.match(re.stderr, /sources changed during reindex; run: margrave reindex/u);
-  const sources = JSON.parse(await readFile(path.join(s.home, "sources.json"), "utf8")) as { id: string }[];
-  assert.deepEqual(sources.map((x) => x.id).sort(), [s.id, "local__extra-abc123"].sort());
+  const record = extra.record("local__extra-abc123");
+  const existing = readSourceRecords(s.home);
+  // BEGIN IMMEDIATE number 1 is the schema check when the connection opens; number 2 is the reindex's own lock.
+  const lock = changeAtLock(t, 2, () => {
+    // The change acts as an install that won the lock: a new source record and new rows.
+    writeIndexRows(s.home, (db) => insertSkills(db, [newEntry(record.id, "beta")]));
+    writeFileSync(sourcesFilePath(s.home), JSON.stringify([...existing, record], null, 2));
+  });
+  await assert.rejects(reindexAll(quiet), /sources changed during reindex; run: margrave reindex/u);
+  assert.equal(lock.fired(), true, "the error came after the reindex's lock was taken");
+  assert.equal(lock.begins(), 2);
+  assert.deepEqual(
+    readSourceRecords(s.home)
+      .map((x) => x.id)
+      .sort(),
+    [s.id, "local__extra-abc123"].sort(),
+  );
   assert.deepEqual(indexIds(s.home), ["local__extra-abc123/beta", `${s.id}/alpha`].sort());
   // The next reindex sees the new set and works.
-  const again = await s.mg(["reindex"]);
-  assert.equal(again.code, 0, again.stderr);
+  mock.restoreAll();
+  assert.deepEqual(await reindexAll(quiet), { skills: 2, sources: 2 });
 });
 
-test(
-  "an update, a remove, and an install that waited while another write changed the sources fail cleanly",
-  { timeout: 60_000 },
-  async (t) => {
-    const s = await setup();
-    useHome(t, s.home);
-    const second = await localSource("beta");
-    const secondInstall = await s.mg(["install", second.dir]);
-    assert.equal(secondInstall.code, 0, secondInstall.stderr);
-    const secondId = installedId(secondInstall);
-    const third = await localSource("gamma");
-    const lock = holdWriteLock(s.home);
-    let runs: Run[];
-    try {
-      const pending = [s.mg(["update", s.id]), s.mg(["remove", secondId]), s.mg(["install", third.dir])];
-      await sleep(CHILD_HEAD_START_MS);
-      // The helper removes both existing sources and adds the third one, as three other commands would have.
-      deleteSourceSkills(lock.db, s.id);
-      deleteSourceSkills(lock.db, secondId);
-      const newId = localId(await realpath(third.dir));
-      insertSkills(lock.db, [newEntry(newId, "gamma")]);
-      await writeSources([third.record(newId)]);
-      lock.release();
-      runs = await Promise.all(pending);
-    } finally {
-      lock.release();
-    }
-    assert.equal(runs[0]?.code, 1);
-    assert.match(runs[0]?.stderr ?? "", new RegExp(`no source "${s.id}"`, "u"), "update: the record is gone");
-    assert.equal(runs[1]?.code, 1);
-    assert.match(runs[1]?.stderr ?? "", new RegExp(`no source "${secondId}"; run: margrave list`, "u"), "remove: the record is gone");
-    assert.equal(runs[2]?.code, 1);
-    assert.match(runs[2]?.stderr ?? "", /is already installed; run: margrave update/u, "install: another install won");
-    const sources = JSON.parse(await readFile(path.join(s.home, "sources.json"), "utf8")) as { id: string }[];
-    assert.equal(sources.length, 1);
-    assert.deepEqual(indexIds(s.home), [`${sources[0]?.id}/gamma`]);
-  },
-);
+/** The change for the next three tests: another command removed `id` (rows and record) before this command took the lock. */
+function removedByAnother(t: { after: (fn: () => void) => void }, home: string, id: string): ReturnType<typeof changeAtLock> {
+  return changeAtLock(t, 1, () => {
+    writeIndexRows(home, (db) => deleteSourceSkills(db, id));
+    writeFileSync(sourcesFilePath(home), "[]\n");
+  });
+}
+
+test("an update whose source another write removed fails under the lock and changes nothing", async (t) => {
+  const s = await setup();
+  useHome(t, s.home);
+  const lock = removedByAnother(t, s.home, s.id);
+  await assert.rejects(updateSources(s.id, quiet), new RegExp(`no source "${s.id}"$`, "u"));
+  // The message is the same before the lock, so the counter tells the two apart.
+  assert.equal(lock.fired(), true, "the error came after the update's lock was taken");
+  assert.equal(lock.begins(), 1);
+  assert.equal(readFileSync(sourcesFilePath(s.home), "utf8"), "[]\n");
+  assert.deepEqual(indexIds(s.home), []);
+});
+
+test("a remove whose source another write removed fails under the lock and changes nothing", async (t) => {
+  const s = await setup();
+  useHome(t, s.home);
+  const lock = removedByAnother(t, s.home, s.id);
+  await assert.rejects(removeSource(s.id), new RegExp(`no source "${s.id}"; run: margrave list`, "u"));
+  assert.equal(lock.fired(), true, "the error came after the remove's lock was taken");
+  assert.equal(lock.begins(), 1);
+  assert.equal(readFileSync(sourcesFilePath(s.home), "utf8"), "[]\n");
+  assert.deepEqual(indexIds(s.home), []);
+});
+
+test("an install of a source that another install added first fails under the lock and keeps one set of rows", async (t) => {
+  const s = await setup();
+  useHome(t, s.home);
+  await useFakeRipwire(t);
+  const third = await localSource("gamma");
+  const newId = localId(await realpath(third.dir));
+  const existing = readSourceRecords(s.home);
+  const lock = changeAtLock(t, 1, () => {
+    writeIndexRows(s.home, (db) => insertSkills(db, [newEntry(newId, "gamma")]));
+    writeFileSync(sourcesFilePath(s.home), JSON.stringify([...existing, third.record(newId)], null, 2));
+  });
+  await assert.rejects(installSource(third.dir, null, quiet), /is already installed; run: margrave update/u);
+  assert.equal(lock.fired(), true, "the error came after the install's lock was taken");
+  assert.equal(lock.begins(), 1);
+  assert.deepEqual(
+    readSourceRecords(s.home)
+      .map((x) => x.id)
+      .sort(),
+    [s.id, newId].sort(),
+  );
+  assert.deepEqual(indexIds(s.home), [`${s.id}/alpha`, `${newId}/gamma`].sort());
+});
 
 test("a reader during an open write transaction gets the old results with no error", { timeout: 30_000 }, async () => {
   const s = await setup();

@@ -90,16 +90,19 @@ const STOPWORDS = new Set([
   "after",
 ]);
 
-/** Lowercase, split on non-alphanumerics, drop stopwords, Porter-stem. Keeps duplicates. */
-export function tokenize(input: string): string[] {
-  const out: string[] = [];
-  for (const raw of input.toLowerCase().split(/[^a-z0-9]+/u)) {
+/** Lazily yields the tokens of `input`: lowercase, split on non-alphanumerics, stopwords dropped, Porter-stemmed. Keeps duplicates. */
+function* tokens(input: string): Generator<string> {
+  for (const [raw] of input.toLowerCase().matchAll(/[a-z0-9]+/gu)) {
     if (raw.length < 2 || STOPWORDS.has(raw)) continue;
     const word = stemmer(raw);
     if (word.length < 2 || STOPWORDS.has(word)) continue;
-    out.push(word);
+    yield word;
   }
-  return out;
+}
+
+/** Lowercase, split on non-alphanumerics, drop stopwords, Porter-stem. Keeps duplicates. */
+export function tokenize(input: string): string[] {
+  return [...tokens(input)];
 }
 
 /** The four space-joined token strings of one skill, one per FTS column. */
@@ -115,9 +118,14 @@ export function buildFieldTokens(parts: { name: string; description: string; hea
   };
 }
 
-/** The unique query tokens in first-seen order, at most MAX_QUERY_TERMS. The only source of the FTS MATCH text. */
+/** The unique query tokens in first-seen order, at most MAX_QUERY_TERMS. Stops tokenizing at the cap. The only source of the FTS MATCH text. */
 export function queryTerms(task: string): string[] {
-  return [...new Set(tokenize(task))].slice(0, MAX_QUERY_TERMS);
+  const seen = new Set<string>();
+  for (const token of tokens(task)) {
+    seen.add(token);
+    if (seen.size === MAX_QUERY_TERMS) break;
+  }
+  return [...seen];
 }
 
 export function clampLimit(limit: unknown): number {

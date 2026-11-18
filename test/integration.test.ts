@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmod, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { atomicWrite } from "../src/store.ts";
@@ -710,7 +710,7 @@ test("usage errors exit 2, unknown commands exit 2, and find/list say when no so
   assert.equal((await mg(env, ["remove", "x"])).code, 1);
 });
 
-test("a malformed index.db is an error that says to run reindex, and reindex repairs it", async () => {
+test("a malformed index.db is an error that says to move it aside, and reindex then rebuilds it", async () => {
   const env = await setup();
   const dir = await tmp("mg-localsrc-");
   await writeSkill(dir, "alpha", "alpha skill");
@@ -718,7 +718,9 @@ test("a malformed index.db is an error that says to run reindex, and reindex rep
   await writeFile(path.join(env.home, "index.db"), "{ broken");
   const r = await mg(env, ["find", "alpha"]);
   assert.equal(r.code, 1);
-  assert.match(r.stderr, /index\.db is not a valid margrave index; run: margrave reindex/u);
+  assert.match(r.stderr, /index\.db is not a margrave index; move it aside, then run: margrave reindex/u);
+  assert.equal((await mg(env, ["reindex"])).code, 1, "reindex does not replace a file that is not ours");
+  await rename(path.join(env.home, "index.db"), path.join(env.home, "index.db.aside"));
   assert.equal((await mg(env, ["reindex"])).code, 0);
   assert.equal((await mg(env, ["find", "alpha"])).code, 0);
   await rm(path.join(env.home, "index.db"));
@@ -857,7 +859,9 @@ test("a missing index.db stops install, update, and remove, and says to run rein
   }
   const all = await mg(env, ["update"]);
   assert.equal(all.code, 1);
-  assert.match(all.stderr, new RegExp(`update ${id} failed: index\\.db is missing`, "u"));
+  // The guard fails once for the whole run, not once per source.
+  assert.equal(all.stderr.match(/index\.db is missing; run: margrave reindex/gu)?.length, 1, all.stderr);
+  assert.doesNotMatch(all.stderr, /failed:/u);
   assert.deepEqual(await snapshot(env.home), before);
 });
 
