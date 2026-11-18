@@ -83,7 +83,7 @@ margrave install https://example.com/team/skills.git --ref v2
 
 ## 3. Connect an agent
 
-`margrave wrap <agent>` prints setup text and writes nothing. It uses absolute paths, so the agent's own PATH and nvm state do not matter. From a release binary it prints the absolute path of that binary (the path you ran it by, so a Homebrew upgrade keeps working). From the npm package or a source build it prints `process.execPath` and the absolute `dist/cli.js`. It passes `MARGRAVE_HOME` when that is set.
+`margrave wrap <agent>` prints setup text and writes nothing. It uses absolute paths, so the agent's own PATH and nvm state do not matter. From a release binary it prints the binary itself: the path you started it by when that contains a `/` (Homebrew's `margrave` command does this, so the output survives `brew upgrade`), otherwise the real location of the binary. From the npm package or a source build it prints `process.execPath` and the absolute `dist/cli.js`. It passes `MARGRAVE_HOME` when that is set.
 
 ```sh
 margrave wrap claude    # a `claude mcp add` command, then the instruction snippet
@@ -95,7 +95,7 @@ margrave wrap generic   # the plain command line, then the snippet
 Example for a release binary (`margrave wrap claude`):
 
 ```sh
-claude mcp add margrave -- /home/you/.local/bin/margrave mcp
+claude mcp add margrave -- /home/you/margrave/bin/margrave mcp
 ```
 
 The same command from the npm package or a source build:
