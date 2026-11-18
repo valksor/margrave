@@ -4,23 +4,27 @@ import { createHash } from "node:crypto";
 import { lstat, mkdtemp, realpath, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { buildStats } from "./bm25.ts";
+import type { DatabaseSync } from "node:sqlite";
 import { isInside, scanSource } from "./scan.ts";
 import type { ScannedSkill } from "./scan.ts";
 import { esc, scanWithRipwire } from "./safety.ts";
 import {
   MargraveError,
   UsageError,
+  deleteAllSkills,
+  deleteSourceSkills,
   ensureDirs,
-  indexFile,
-  readIndex,
+  insertSkills,
+  openIndexRead,
+  openIndexWrite,
   readSources,
+  removeLegacyIndex,
+  skillHashes,
   sourcesRoot,
   stagingRoot,
-  writeIndex,
   writeSources,
 } from "./store.ts";
-import type { IndexEntry, IndexFile, SourceRecord } from "./store.ts";
+import type { NewEntry, SourceRecord } from "./store.ts";
 
 export interface Ctx {
   /** Progress and warnings. The CLI writes these to stderr. */
@@ -223,9 +227,9 @@ export async function resolveScanRoot(clone: string, subpath: string): Promise<s
   return target;
 }
 
-// ---- index assembly ----
+// ---- index writes ----
 
-function toEntries(sourceId: string, skills: readonly ScannedSkill[], mapDir: (dir: string) => string): IndexEntry[] {
+function toEntries(sourceId: string, skills: readonly ScannedSkill[], mapDir: (dir: string) => string): NewEntry[] {
   return skills.map((s) => ({
     id: `${sourceId}/${s.name}`,
     name: s.name,
@@ -233,27 +237,44 @@ function toEntries(sourceId: string, skills: readonly ScannedSkill[], mapDir: (d
     source: sourceId,
     dir: mapDir(s.dir),
     hash: s.hash,
-    frontmatter: s.frontmatter,
-    headings: s.headings,
-    fieldTokens: s.fieldTokens,
+    tokens: s.tokens,
   }));
 }
 
-export function assemble(entries: IndexEntry[]): IndexFile {
-  const skills = [...entries].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  return { version: 1, skills, stats: buildStats(skills) };
+/** The index must be usable before the slow work (clone, scan) starts. A store with no sources has no index to check. */
+async function checkIndex(sources: readonly SourceRecord[]): Promise<void> {
+  if (sources.length > 0) (await openIndexWrite("existing")).close();
 }
 
-/** The current index, which must exist when sources exist. */
-async function currentIndex(sources: readonly SourceRecord[]): Promise<IndexFile | null> {
-  const index = await readIndex();
-  if (index === null && sources.length > 0) throw new MargraveError("index.json is missing; run: margrave reindex");
-  return index;
+/**
+ * The one write path. Takes the write lock, re-reads sources.json, lets `change` edit the rows and return the next
+ * source list, writes sources.json, then commits. Any failure leaves the index as it was.
+ * `mode` is "create" for a store with no sources or a reindex: a missing or invalid index is replaced.
+ */
+async function commit(mode: "existing" | "create", change: (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[]): Promise<void> {
+  const db = await openIndexWrite(mode);
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    const fresh = await readSources();
+    const next = change(fresh, db);
+    await writeSources(next);
+    try {
+      db.exec("COMMIT");
+    } catch (err) {
+      await writeSources(fresh).catch(() => undefined);
+      throw err;
+    }
+  } catch (err) {
+    if (db.isTransaction) db.exec("ROLLBACK");
+    throw err;
+  } finally {
+    db.close();
+  }
 }
 
-async function restoreIndex(old: IndexFile | null): Promise<void> {
-  if (old === null) await rm(indexFile(), { force: true });
-  else await writeIndex(old);
+/** The write mode for an install: a store with no sources has no index to keep. */
+async function installMode(): Promise<"existing" | "create"> {
+  return (await readSources()).length === 0 ? "create" : "existing";
 }
 
 function logWarnings(ctx: Ctx, warnings: readonly string[]): void {
@@ -293,7 +314,7 @@ async function installLocal(spec: string, dir: string, ctx: Ctx): Promise<Instal
   await ensureDirs();
   const sources = await readSources();
   if (sources.some((s) => s.id === id)) throw duplicate(id);
-  const old = await currentIndex(sources);
+  await checkIndex(sources);
 
   const scan = await scanSource(real, { followSymlinks: true });
   logWarnings(ctx, scan.warnings);
@@ -311,19 +332,17 @@ async function installLocal(spec: string, dir: string, ctx: Ctx): Promise<Instal
     commit: null,
     installedAt: new Date().toISOString(),
   };
-  await commit(old, [...(old?.skills ?? []), ...entries], [...sources, record]);
+  await commit(await installMode(), addSource(record, entries));
   return { id, skills: entries.map((e) => e.id) };
 }
 
-/** Write index then sources. If either fails, restore the old index. */
-async function commit(old: IndexFile | null, entries: IndexEntry[], sources: SourceRecord[]): Promise<void> {
-  await writeIndex(assemble(entries));
-  try {
-    await writeSources(sources);
-  } catch (err) {
-    await restoreIndex(old).catch(() => undefined);
-    throw err;
-  }
+/** The change for an install: another install may have added the same source while this one waited for the lock. */
+function addSource(record: SourceRecord, entries: readonly NewEntry[]): (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[] {
+  return (fresh, db) => {
+    if (fresh.some((s) => s.id === record.id)) throw duplicate(record.id);
+    insertSkills(db, entries);
+    return [...fresh, record];
+  };
 }
 
 async function installGit(
@@ -337,7 +356,7 @@ async function installGit(
   await ensureDirs();
   const sources = await readSources();
   if (sources.some((s) => s.id === id) || (await lstat(final).catch(() => null)) !== null) throw duplicate(id);
-  const old = await currentIndex(sources);
+  await checkIndex(sources);
 
   return withStaging(async (stage) => {
     const clone = path.join(stage, "repo");
@@ -369,7 +388,7 @@ async function installGit(
 
     await rename(clone, final);
     try {
-      await commit(old, [...(old?.skills ?? []), ...entries], [...sources, record]);
+      await commit(await installMode(), addSource(record, entries));
     } catch (err) {
       await rm(final, { recursive: true, force: true });
       throw err;
@@ -390,8 +409,7 @@ export interface UpdateResult {
   removed: string[];
 }
 
-function diffEntries(oldEntries: readonly IndexEntry[], next: readonly IndexEntry[]) {
-  const before = new Map(oldEntries.map((e) => [e.id, e.hash]));
+function diffEntries(before: ReadonlyMap<string, string>, next: readonly NewEntry[]) {
   const after = new Map(next.map((e) => [e.id, e.hash]));
   return {
     added: [...after.keys()].filter((k) => !before.has(k)).sort(),
@@ -420,22 +438,40 @@ export async function updateSources(
   return { results, errors };
 }
 
+/**
+ * The change for an update: replace the rows of one source and, for a git source, set its commit.
+ * The old hashes are read inside the transaction, so the diff matches what the update replaced.
+ */
+function replaceSource(
+  id: string,
+  entries: readonly NewEntry[],
+  sha: string | null,
+  diff: { value?: ReturnType<typeof diffEntries> },
+): (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[] {
+  return (fresh, db) => {
+    // A `remove` that ran while this update waited for the lock makes this fire.
+    if (!fresh.some((s) => s.id === id)) throw new MargraveError(`no source "${id}"`);
+    const before = skillHashes(db, id);
+    deleteSourceSkills(db, id);
+    insertSkills(db, entries);
+    diff.value = diffEntries(before, entries);
+    return sha === null ? fresh : fresh.map((s) => (s.id === id ? { ...s, commit: sha } : s));
+  };
+}
+
 async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
   // Re-read state so that several updates in a row see each other's writes.
   const sources = await readSources();
   const rec = sources.find((s) => s.id === id);
   // A `remove` that runs between updateSources() reading the list and this read makes this fire.
   if (rec === undefined) throw new MargraveError(`no source "${id}"`);
-  const old = await currentIndex(sources);
-  // `rec` exists, so sources is not empty, so currentIndex() returned the index or threw.
-  const oldSkills = (old as IndexFile).skills;
-  const oldEntries = oldSkills.filter((e) => e.source === id);
-  const others = oldSkills.filter((e) => e.source !== id);
+  await checkIndex(sources);
+  const diff: { value?: ReturnType<typeof diffEntries> } = {};
 
   if (rec.kind === "local") {
     const entries = await scanLocal(rec, ctx);
-    await commit(old, [...others, ...entries], sources);
-    return { id, kind: "local", oldCommit: null, newCommit: null, ...diffEntries(oldEntries, entries) };
+    await commit("existing", replaceSource(id, entries, null, diff));
+    return { id, kind: "local", oldCommit: null, newCommit: null, ...(diff.value as ReturnType<typeof diffEntries>) };
   }
   // readSources() only returns a git record with a url.
   const url = rec.url as string;
@@ -455,7 +491,6 @@ async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
     const baselineDir = await installedScanRoot(final, rec.subpath);
     await scanWithRipwire(scanRoot, { ...ctx, sourceId: id, skills: scan.skills, baselineDir });
     const entries = toEntries(id, scan.skills, (d) => path.join(final, path.relative(realClone, d)));
-    const nextSources = sources.map((s) => (s.id === id ? { ...s, commit: sha } : s));
 
     // Swap: old dir aside, new dir in, then write. Roll back on failure.
     const aside = path.join(stage, "old");
@@ -468,13 +503,13 @@ async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
       throw err;
     }
     try {
-      await commit(old, [...others, ...entries], nextSources);
+      await commit("existing", replaceSource(id, entries, sha, diff));
     } catch (err) {
       await rm(final, { recursive: true, force: true });
       if (hadOld) await rename(aside, final);
       throw err;
     }
-    return { id, kind: "git" as const, oldCommit: rec.commit, newCommit: sha, ...diffEntries(oldEntries, entries) };
+    return { id, kind: "git" as const, oldCommit: rec.commit, newCommit: sha, ...(diff.value as ReturnType<typeof diffEntries>) };
   });
 }
 
@@ -488,7 +523,7 @@ async function installedScanRoot(final: string, subpath: string): Promise<string
   }
 }
 
-async function scanLocal(rec: SourceRecord, ctx: Ctx): Promise<IndexEntry[]> {
+async function scanLocal(rec: SourceRecord, ctx: Ctx): Promise<NewEntry[]> {
   // readSources() only returns a local record with a path.
   const scan = await scanSource(rec.path as string, { followSymlinks: true }).catch(() => {
     throw new MargraveError(`${rec.path} is not readable; remove the source or restore the directory`);
@@ -502,12 +537,14 @@ async function scanLocal(rec: SourceRecord, ctx: Ctx): Promise<IndexEntry[]> {
 export async function removeSource(arg: string): Promise<SourceRecord> {
   const sources = await readSources();
   const rec = findSource(sources, arg);
-  const old = await currentIndex(sources);
-  // findSource() found `rec`, so sources is not empty, so currentIndex() returned the index or threw.
-  const remaining = (old as IndexFile).skills.filter((e) => e.source !== rec.id);
-  const nextSources = sources.filter((s) => s.id !== rec.id);
+  await checkIndex(sources);
 
-  await commit(old, remaining, nextSources);
+  await commit("existing", (fresh, db) => {
+    // Another `remove` that ran while this one waited for the lock makes this fire.
+    if (!fresh.some((s) => s.id === rec.id)) throw new MargraveError(`no source "${rec.id}"; run: margrave list`);
+    deleteSourceSkills(db, rec.id);
+    return fresh.filter((s) => s.id !== rec.id);
+  });
   // Local sources are only unregistered. The user's directory is never deleted.
   if (rec.kind === "git") {
     // Deletes only sources/<id>, after sourceDir() checked it is a direct child of sources/.
@@ -520,8 +557,7 @@ export async function removeSource(arg: string): Promise<SourceRecord> {
 
 export async function reindexAll(ctx: Ctx): Promise<{ skills: number; sources: number }> {
   const sources = await readSources();
-  const old = await readIndex().catch(() => null);
-  const entries: IndexEntry[] = [];
+  const entries: NewEntry[] = [];
   for (const rec of sources) {
     try {
       if (rec.kind === "local") {
@@ -537,21 +573,47 @@ export async function reindexAll(ctx: Ctx): Promise<{ skills: number; sources: n
       ctx.log(`warning: ${rec.id}: ${esc(err instanceof Error ? err.message : String(err))}; skipped`);
     }
   }
-  try {
-    await writeIndex(assemble(entries));
-  } catch (err) {
-    await restoreIndex(old).catch(() => undefined);
-    throw err;
-  }
+  const scanned = sources.map((s) => s.id).sort();
+  await commit("create", (fresh, db) => {
+    // A source that was added or removed while this reindex scanned or waited would be lost or kept without rows.
+    const now = fresh.map((s) => s.id).sort();
+    if (now.length !== scanned.length || now.some((id, i) => id !== scanned[i])) {
+      throw new MargraveError("sources changed during reindex; run: margrave reindex");
+    }
+    deleteAllSkills(db);
+    insertSkills(db, entries);
+    return fresh;
+  });
+  // After the commit only: if the reindex fails, the old index stays.
+  await removeLegacyIndex();
   return { skills: entries.length, sources: sources.length };
 }
 
 // ---- list ----
 
-export async function listSources(): Promise<{ sources: (SourceRecord & { skillCount: number })[]; index: IndexFile | null }> {
+export interface ListedSkill {
+  id: string;
+  name: string;
+  description: string;
+  source: string;
+}
+
+export async function listSources(
+  withSkills: boolean,
+): Promise<{ sources: (SourceRecord & { skillCount: number })[]; skills: ListedSkill[] }> {
   const sources = await readSources();
-  const index = sources.length === 0 ? null : await readIndex();
-  const counts = new Map<string, number>();
-  for (const e of index?.skills ?? []) counts.set(e.source, (counts.get(e.source) ?? 0) + 1);
-  return { sources: sources.map((s) => ({ ...s, skillCount: counts.get(s.id) ?? 0 })), index };
+  if (sources.length === 0) return { sources: [], skills: [] };
+  const db = await openIndexRead();
+  try {
+    const counts = new Map<string, number>();
+    for (const r of db.prepare("SELECT source, count(*) AS n FROM skills GROUP BY source").all() as { source: string; n: number }[]) {
+      counts.set(r.source, r.n);
+    }
+    const skills = withSkills
+      ? (db.prepare("SELECT id, name, description, source FROM skills ORDER BY id").all() as unknown as ListedSkill[])
+      : [];
+    return { sources: sources.map((s) => ({ ...s, skillCount: counts.get(s.id) ?? 0 })), skills };
+  } finally {
+    db.close();
+  }
 }

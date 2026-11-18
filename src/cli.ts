@@ -107,12 +107,12 @@ async function run(argv: string[]): Promise<void> {
     case "list": {
       const p = parse(rest, { skills: { type: "boolean" }, json: { type: "boolean" } });
       positionals(p, 0, 0, "list [--skills] [--json]");
-      const { sources, index } = await listSources();
       const withSkills = p.values["skills"] === true;
+      const { sources, skills } = await listSources(withSkills);
       if (p.values["json"] === true) {
         json({
           sources,
-          ...(withSkills ? { skills: (index?.skills ?? []).map((s) => ({ id: s.id, name: s.name, description: s.description })) } : {}),
+          ...(withSkills ? { skills: skills.map((s) => ({ id: s.id, name: s.name, description: s.description })) } : {}),
         });
         return;
       }
@@ -123,7 +123,7 @@ async function run(argv: string[]): Promise<void> {
       for (const s of sources) {
         out(`${clean(s.id)}  ${s.kind}  ref=${s.ref === null ? "-" : clean(s.ref)}  commit=${short(s.commit)}  skills=${s.skillCount}`);
         if (withSkills) {
-          for (const e of index?.skills ?? []) {
+          for (const e of skills) {
             if (e.source === s.id) out(`  ${clean(e.id)}: ${clean(e.description)}`);
           }
         }
@@ -140,9 +140,13 @@ async function run(argv: string[]): Promise<void> {
         else out(NO_SOURCES_MESSAGE);
         return;
       }
-      const hits = findSkills(c.index, task, p.values["limit"]);
-      if (p.values["json"] === true) json({ task, results: hits });
-      else out(formatFind(hits));
+      try {
+        const hits = findSkills(c.db, task, p.values["limit"]);
+        if (p.values["json"] === true) json({ task, results: hits });
+        else out(formatFind(hits));
+      } finally {
+        c.db.close();
+      }
       return;
     }
     case "load": {
@@ -150,7 +154,12 @@ async function run(argv: string[]): Promise<void> {
       const [id] = positionals(p, 1, 1, "load <id>");
       const c = await loadContext();
       if (c === null) throw new MargraveError(NO_SOURCES_MESSAGE);
-      const entry = resolveSkill(c.index, id as string);
+      let entry;
+      try {
+        entry = resolveSkill(c.db, id as string);
+      } finally {
+        c.db.close();
+      }
       if (typeof p.values["file"] === "string") {
         const content = await readSkillFile(entry.dir, p.values["file"]);
         if (p.values["json"] === true) json({ id: entry.id, path: p.values["file"], content });

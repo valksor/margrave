@@ -1,10 +1,11 @@
 // find / load / read-file, id resolution, path guard, terminal-safe text.
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
-import { clampLimit, rank } from "./bm25.ts";
+import type { DatabaseSync } from "node:sqlite";
+import { FIELD_WEIGHTS, NAME_BONUS, clampLimit, queryTerms } from "./bm25.ts";
 import { READ_NO_FOLLOW, splitSkillMd } from "./scan.ts";
-import { MargraveError, RequestError, readIndex, readSources } from "./store.ts";
-import type { IndexEntry, IndexFile, SourceRecord } from "./store.ts";
+import { MargraveError, RequestError, openIndexRead, readSources } from "./store.ts";
+import type { IndexEntry, SourceRecord } from "./store.ts";
 
 export const NO_SOURCES_MESSAGE = "no skill sources installed; run: margrave install <owner/repo|path>";
 
@@ -31,25 +32,26 @@ export function shellQuote(s: string): string {
   return /^[A-Za-z0-9_/.:=@%+,~-]+$/u.test(s) ? s : `'${s.replace(/'/gu, `'\\''`)}'`;
 }
 
+/** The sources and one read-only handle on index.db. The caller closes `db` in `finally`. */
 export interface Context {
   sources: SourceRecord[];
-  index: IndexFile;
+  db: DatabaseSync;
 }
 
 /** Returns null when no sources are installed. */
 export async function loadContext(): Promise<Context | null> {
   const sources = await readSources();
   if (sources.length === 0) return null;
-  const index = await readIndex();
-  if (index === null) throw new MargraveError("index.json is missing; run: margrave reindex");
-  return { sources, index };
+  return { sources, db: await openIndexRead() };
 }
 
+const SKILL_COLUMNS = "id, name, description, source, dir, hash";
+
 /** Find a skill by qualified id, or by bare name when exactly one source has it. */
-export function resolveSkill(index: IndexFile, input: string): IndexEntry {
-  const exact = index.skills.find((s) => s.id === input);
+export function resolveSkill(db: DatabaseSync, input: string): IndexEntry {
+  const exact = db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE id = ?`).get(input) as IndexEntry | undefined;
   if (exact !== undefined) return exact;
-  const byName = index.skills.filter((s) => s.name === input);
+  const byName = db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE name = ?`).all(input) as unknown as IndexEntry[];
   if (byName.length === 1 && byName[0] !== undefined) return byName[0];
   if (byName.length > 1) {
     const ids = byName
@@ -68,15 +70,31 @@ export interface FindHit {
   score: number;
 }
 
-export function findSkills(index: IndexFile, task: string, limit: unknown): FindHit[] {
-  const byId = new Map(index.skills.map((s) => [s.id, s]));
-  const ranked = rank(index.skills, index.stats, task, clampLimit(limit));
-  const hits: FindHit[] = [];
-  for (const r of ranked) {
-    const e = byId.get(r.id);
-    if (e !== undefined) hits.push({ id: e.id, name: e.name, description: e.description, score: r.score });
-  }
-  return hits;
+// The FTS part is MATERIALIZED: without it SQLite re-runs the FTS query per row (4.4 s per call at 8k skills).
+// Numbers in the SQL are the constants above; text only ever arrives as bound parameters.
+const FIND_FTS = `WITH hits AS MATERIALIZED (
+  SELECT rowid, -bm25(fts, ${FIELD_WEIGHTS.name}, ${FIELD_WEIGHTS.description}, ${FIELD_WEIGHTS.headings}, ${FIELD_WEIGHTS.body}) AS s
+  FROM fts WHERE fts MATCH ?
+), cand AS (
+  SELECT rowid, s FROM hits
+  UNION ALL SELECT rowid, 0 FROM skills WHERE (name_lc = ? OR id_lc = ?) AND rowid NOT IN (SELECT rowid FROM hits)
+)`;
+const FIND_EXACT_ONLY = "WITH cand AS (SELECT rowid, 0 AS s FROM skills WHERE name_lc = ? OR id_lc = ?)";
+const FIND_TAIL = `SELECT k.id, k.name, k.description, (k.name_lc = ? OR k.id_lc = ?) AS exact,
+  c.s + CASE WHEN k.name_lc = ? OR k.id_lc = ? THEN ${NAME_BONUS} ELSE 0 END AS score
+FROM cand c JOIN skills k ON k.rowid = c.rowid ORDER BY exact DESC, score DESC, k.id LIMIT ?`;
+
+/** BM25 over the FTS columns. An exact name or id match ranks first. Ties break by id in byte order. */
+export function findSkills(db: DatabaseSync, task: string, limit: unknown): FindHit[] {
+  // The MATCH text comes only from tokenize() output, never from the raw task.
+  const terms = queryTerms(task);
+  const q = task.trim().toLowerCase();
+  const exact = [q, q, q, q, q, q];
+  const rows =
+    terms.length === 0
+      ? db.prepare(`${FIND_EXACT_ONLY} ${FIND_TAIL}`).all(q, q, q, q, q, q, clampLimit(limit))
+      : db.prepare(`${FIND_FTS} ${FIND_TAIL}`).all(terms.map((t) => `"${t}"`).join(" OR "), ...exact, clampLimit(limit));
+  return (rows as unknown as FindHit[]).map((r) => ({ id: r.id, name: r.name, description: r.description, score: r.score }));
 }
 
 export interface FindText {

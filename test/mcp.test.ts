@@ -115,11 +115,11 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   assert.equal(unknown.isError, true);
   assert.match(unknown.text, /no skill "nope"/u);
 
-  // a corrupt index.json is a tool error that says how to repair it
-  await writeFile(path.join(home, "index.json"), "{ not json");
+  // a corrupt index.db is a tool error that says how to repair it
+  await writeFile(path.join(home, "index.db"), "garbage that is not a database");
   const corrupt = await call(client, "find_skills", { task: "terraform" });
   assert.equal(corrupt.isError, true);
-  assert.match(corrupt.text, /not valid JSON; run: margrave reindex/u);
+  assert.match(corrupt.text, /is not a valid margrave index; run: margrave reindex/u);
 
   // the server is read-only: only the three tools exist
   assert.equal(tools.length, 3);
@@ -208,8 +208,8 @@ test("MCP in-process: load_skill and read_skill_file work, and every tool turns 
   assert.equal(escape.isError, true);
   assert.match(escape.text, /outside/u);
 
-  // A corrupt index.json is a tool error for all three tools.
-  await writeFile(path.join(home, "index.json"), "{ not json");
+  // A corrupt index.db is a tool error for all three tools.
+  await writeFile(path.join(home, "index.db"), "garbage that is not a database");
   for (const [tool, args] of [
     ["find_skills", { task: "terraform" }],
     ["load_skill", { id }],
@@ -217,6 +217,36 @@ test("MCP in-process: load_skill and read_skill_file work, and every tool turns 
   ] as const) {
     const r = await call(client, tool, args);
     assert.equal(r.isError, true, tool);
-    assert.match(r.text, /not valid JSON; run: margrave reindex/u, tool);
+    assert.match(r.text, /is not a valid margrave index; run: margrave reindex/u, tool);
   }
+});
+
+test("many failing tool calls leave no open index handle: reindex rebuilds the database afterwards", async (t) => {
+  const home = await tmp("mg-home-");
+  const prev = process.env["MARGRAVE_HOME"];
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(() => {
+    if (prev === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prev;
+  });
+  const dir = await tmp("mg-localsrc-");
+  await writeSkill(dir, "alpha", "alpha skill");
+  const fakeBin = await fakeRipwire();
+  assert.equal((await runCli(["install", dir], { home, fakeBin })).code, 0);
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await createServer().connect(serverSide);
+  const client = new Client({ name: "margrave-test", version: "0.0.0" });
+  await client.connect(clientSide);
+  t.after(() => client.close());
+
+  for (let i = 0; i < 300; i++) {
+    assert.equal((await call(client, "load_skill", { id: `nope-${i}` })).isError, true);
+    assert.equal((await call(client, "read_skill_file", { id: `nope-${i}`, path: "SKILL.md" })).isError, true);
+  }
+  assert.equal((await call(client, "find_skills", { task: "alpha" })).isError, false);
+  assert.equal((await runCli(["reindex"], { home, fakeBin })).code, 0);
+  assert.equal((await call(client, "find_skills", { task: "alpha" })).isError, false);
+  // 600 failing calls would leave 600 open descriptors if a call did not close its handle; the usual limit is 256.
+  const open = (await fsp.readdir("/dev/fd").catch(() => [])).length;
+  assert.ok(open < 200, `${open} open file descriptors`);
 });

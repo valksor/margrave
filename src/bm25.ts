@@ -1,4 +1,4 @@
-// Tokenizer and BM25F ranking. Pure and deterministic: no I/O, no clock, no randomness.
+// Tokenizer and query terms for the FTS5 index. Pure and deterministic: no I/O, no clock, no randomness.
 import { stemmer } from "stemmer";
 
 export const FIELDS = ["name", "description", "headings", "body"] as const;
@@ -11,12 +11,12 @@ export const FIELD_WEIGHTS: Readonly<Record<Field, number>> = {
   body: 0.3,
 };
 
-export const K1 = 1.2;
-export const B = 0.75;
 export const BODY_TOKEN_LIMIT = 2000;
 export const NAME_BONUS = 10;
 export const DEFAULT_LIMIT = 5;
 export const MAX_LIMIT = 25;
+/** Cap on OR terms in one FTS query: 20k terms took 33 s, which would block a hosted event loop. */
+export const MAX_QUERY_TERMS = 32;
 
 // Two-letter tech tokens (go, js, ci, db) are meaningful, so the minimum token
 // length is 2. These grammar words are dropped instead.
@@ -102,106 +102,26 @@ export function tokenize(input: string): string[] {
   return out;
 }
 
-/** Term frequencies for one field. */
-export type TermFreqs = Record<string, number>;
-export type FieldTokens = Record<Field, TermFreqs>;
+/** The four space-joined token strings of one skill, one per FTS column. */
+export type TokenStrings = Record<Field, string>;
 
-export function countTerms(tokens: readonly string[]): TermFreqs {
-  const tf: TermFreqs = Object.create(null) as TermFreqs;
-  for (const t of tokens) tf[t] = own(tf, t) + 1;
-  return tf;
-}
-
-/** Build the per-field term frequencies for one skill. Body is cut to its first 2000 tokens. */
-export function buildFieldTokens(parts: { name: string; description: string; headings: readonly string[]; body: string }): FieldTokens {
+/** Build the token strings for one skill. Body is cut to its first 2000 tokens; duplicates stay, so term frequency is kept. */
+export function buildFieldTokens(parts: { name: string; description: string; headings: readonly string[]; body: string }): TokenStrings {
   return {
-    name: countTerms(tokenize(parts.name)),
-    description: countTerms(tokenize(parts.description)),
-    headings: countTerms(tokenize(parts.headings.join("\n"))),
-    body: countTerms(tokenize(parts.body).slice(0, BODY_TOKEN_LIMIT)),
+    name: tokenize(parts.name).join(" "),
+    description: tokenize(parts.description).join(" "),
+    headings: tokenize(parts.headings.join("\n")).join(" "),
+    body: tokenize(parts.body).slice(0, BODY_TOKEN_LIMIT).join(" "),
   };
 }
 
-/** Own-property lookup: after a JSON round trip, "constructor" must not resolve to Object.prototype. */
-function own(map: Record<string, number>, key: string): number {
-  // hasOwn says the key is there, so the value is a number.
-  return Object.hasOwn(map, key) ? (map[key] as number) : 0;
-}
-
-function fieldLength(tf: TermFreqs): number {
-  let n = 0;
-  for (const k of Object.keys(tf)) n += own(tf, k);
-  return n;
-}
-
-export interface CorpusStats {
-  docCount: number;
-  avgLength: Record<Field, number>;
-  /** Number of documents containing the term in any field. */
-  docFreq: Record<string, number>;
-}
-
-export interface Doc {
-  id: string;
-  name: string;
-  fieldTokens: FieldTokens;
-}
-
-export function buildStats(docs: readonly { fieldTokens: FieldTokens }[]): CorpusStats {
-  const totals: Record<Field, number> = { name: 0, description: 0, headings: 0, body: 0 };
-  const docFreq: Record<string, number> = Object.create(null) as Record<string, number>;
-  for (const d of docs) {
-    const seen = new Set<string>();
-    for (const f of FIELDS) {
-      const tf = d.fieldTokens[f];
-      totals[f] += fieldLength(tf);
-      for (const t of Object.keys(tf)) seen.add(t);
-    }
-    for (const t of seen) docFreq[t] = own(docFreq, t) + 1;
-  }
-  const n = docs.length;
-  const avgLength = {} as Record<Field, number>;
-  for (const f of FIELDS) avgLength[f] = n === 0 ? 0 : totals[f] / n;
-  return { docCount: n, avgLength, docFreq };
+/** The unique query tokens in first-seen order, at most MAX_QUERY_TERMS. The only source of the FTS MATCH text. */
+export function queryTerms(task: string): string[] {
+  return [...new Set(tokenize(task))].slice(0, MAX_QUERY_TERMS);
 }
 
 export function clampLimit(limit: unknown): number {
   const n = Math.trunc(Number(limit));
   if (!Number.isFinite(n)) return DEFAULT_LIMIT;
   return Math.min(Math.max(n, 1), MAX_LIMIT);
-}
-
-export interface Ranked {
-  id: string;
-  score: number;
-}
-
-/** BM25F over name, description, headings, and body. Ties break by id ascending. */
-export function rank(docs: readonly Doc[], stats: CorpusStats, query: string, limit: number): Ranked[] {
-  const terms = [...new Set(tokenize(query))];
-  const q = query.trim().toLowerCase();
-  const scored: Ranked[] = [];
-  for (const d of docs) {
-    let score = 0;
-    for (const t of terms) {
-      const df = own(stats.docFreq, t);
-      if (df === 0) continue;
-      let weighted = 0;
-      for (const f of FIELDS) {
-        const tf = own(d.fieldTokens[f], t);
-        if (tf === 0) continue;
-        const avg = stats.avgLength[f];
-        const len = fieldLength(d.fieldTokens[f]);
-        const norm = avg > 0 ? 1 - B + (B * len) / avg : 1;
-        weighted += (FIELD_WEIGHTS[f] * tf) / norm;
-      }
-      if (weighted === 0) continue;
-      const idf = Math.log(1 + (stats.docCount - df + 0.5) / (df + 0.5));
-      score += (idf * weighted) / (K1 + weighted);
-    }
-    if (q !== "" && (q === d.name.toLowerCase() || q === d.id.toLowerCase())) score += NAME_BONUS;
-    if (score > 0) scored.push({ id: d.id, score });
-  }
-  scored.sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  return scored.slice(0, limit);
 }

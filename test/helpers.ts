@@ -4,8 +4,12 @@ import { chmod, mkdir, mkdtemp, open, realpath, symlink, writeFile } from "node:
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
+import { buildFieldTokens } from "../src/bm25.ts";
 import { PINNED_RIPWIRE } from "../src/safety.ts";
+import { insertSkills, openIndexWrite } from "../src/store.ts";
+import type { NewEntry } from "../src/store.ts";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const CLI = path.join(ROOT, "src", "cli.ts");
@@ -182,3 +186,66 @@ export async function link(target: string, at: string): Promise<void> {
   await mkdir(path.dirname(at), { recursive: true });
   await symlink(target, at);
 }
+
+/** Every row of index.db in `home`, by id. Opens its own read-only connection. */
+export function indexRows(home: string): { id: string; name: string; source: string; hash: string }[] {
+  const db = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+  try {
+    return db.prepare("SELECT id, name, source, hash FROM skills ORDER BY id").all() as unknown as {
+      id: string;
+      name: string;
+      source: string;
+      hash: string;
+    }[];
+  } finally {
+    db.close();
+  }
+}
+
+export const indexIds = (home: string): string[] => indexRows(home).map((r) => r.id);
+
+export function newEntry(source: string, name: string, description = `desc ${name}`, body = ""): NewEntry {
+  return {
+    id: `${source}/${name}`,
+    name,
+    description,
+    source,
+    dir: `/x/${source}/${name}`,
+    hash: "h",
+    tokens: buildFieldTokens({ name, description, headings: [], body }),
+  };
+}
+
+/** Create index.db under the current MARGRAVE_HOME with these entries. Writes no sources.json. */
+export async function seedIndex(entries: NewEntry[]): Promise<void> {
+  const db = await openIndexWrite("create");
+  try {
+    insertSkills(db, entries);
+  } finally {
+    db.close();
+  }
+}
+
+/** A second connection that holds the write lock of `home`'s index.db until `release()`. In-process: the caller must not touch the lock holder's database synchronously. */
+export function holdWriteLock(home: string, mode: "IMMEDIATE" | "EXCLUSIVE" = "IMMEDIATE"): { db: DatabaseSync; release: () => void } {
+  const db = new DatabaseSync(path.join(home, "index.db"), { timeout: 100 });
+  db.exec(`BEGIN ${mode}`);
+  return {
+    db,
+    release: () => {
+      if (!db.isOpen) return;
+      if (db.isTransaction) db.exec("COMMIT");
+      db.close();
+    },
+  };
+}
+
+export const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** The real DatabaseSync methods, captured before any test mocks them. */
+const methods = DatabaseSync.prototype as unknown as {
+  exec: (this: DatabaseSync, sql: string) => void;
+  close: (this: DatabaseSync) => void;
+};
+export const realExec = methods.exec;
+export const realClose = methods.close;

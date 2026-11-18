@@ -3,10 +3,9 @@ import fsp, { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { homedir } from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
-import { buildFieldTokens, buildStats } from "../src/bm25.ts";
 import {
-  assemble,
   checkRef,
   findSource,
   installSource,
@@ -17,10 +16,10 @@ import {
   sourceDir,
   updateSources,
 } from "../src/sources.ts";
-import { MargraveError, UsageError, home as storeHome, readIndex, readSources } from "../src/store.ts";
-import type { IndexEntry, SourceRecord } from "../src/store.ts";
+import { MargraveError, UsageError, home as storeHome, openIndexRead, readSources } from "../src/store.ts";
+import type { SourceRecord } from "../src/store.ts";
 import { resolveSkill } from "../src/skills.ts";
-import { fakeRipwire, git, makeRepo, runCli, tmp, writeSkill } from "./helpers.ts";
+import { fakeRipwire, git, indexIds, makeRepo, newEntry, realExec, runCli, seedIndex, tmp, writeSkill } from "./helpers.ts";
 
 test("spec parsing is checked in order: local, git URL, GitHub", () => {
   assert.deepEqual(parseSpec("./skills"), { kind: "local", path: path.resolve("./skills") });
@@ -123,45 +122,37 @@ test("sourceDir only returns a direct child of sources/", async () => {
   for (const bad of ["..", ".", "", "a/b", "../x", "a b"]) assert.throws(() => sourceDir(bad), UsageError, bad);
 });
 
-function entry(source: string, name: string): IndexEntry {
-  return {
-    id: `${source}/${name}`,
-    name,
-    description: `desc ${name}`,
-    source,
-    dir: `/x/${source}/${name}`,
-    hash: "h",
-    frontmatter: {},
-    headings: [],
-    fieldTokens: buildFieldTokens({ name, description: `desc ${name}`, headings: [], body: "" }),
-  };
-}
+test("qualified ids stay stable after a second source adds the same name; the bare alias works only while unique", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  await seedIndex([newEntry("src-a", "react"), newEntry("src-a", "docker")]);
+  const first = await openIndexRead();
+  try {
+    assert.equal(resolveSkill(first, "react").id, "src-a/react");
+    assert.equal(resolveSkill(first, "src-a/react").id, "src-a/react");
+  } finally {
+    first.close();
+  }
 
-test("qualified ids stay stable after a second source adds the same name; the bare alias works only while unique", () => {
-  const first = assemble([entry("src-a", "react"), entry("src-a", "docker")]);
-  assert.deepEqual(
-    first.skills.map((s) => s.id),
-    ["src-a/docker", "src-a/react"],
-  );
-  assert.equal(resolveSkill(first, "react").id, "src-a/react");
-  assert.equal(resolveSkill(first, "src-a/react").id, "src-a/react");
-
-  const second = assemble([...first.skills, entry("src-b", "react")]);
-  assert.ok(
-    second.skills.some((s) => s.id === "src-a/react"),
-    "existing id unchanged",
-  );
-  assert.equal(resolveSkill(second, "src-a/react").id, "src-a/react");
-  assert.equal(resolveSkill(second, "src-b/react").id, "src-b/react");
-  assert.equal(resolveSkill(second, "docker").id, "src-a/docker");
-  assert.throws(
-    () => resolveSkill(second, "react"),
-    (e: unknown) =>
-      e instanceof MargraveError && /ambiguous/u.test(e.message) && e.message.includes("src-a/react") && e.message.includes("src-b/react"),
-  );
-  assert.throws(() => resolveSkill(second, "nope"), /no skill "nope"/u);
-  assert.equal(second.stats.docCount, 3);
-  assert.deepEqual(buildStats(second.skills), second.stats);
+  // A second source with the same name. Rows are replaced here only to build the fixture.
+  useHome(t, await tmp("mg-home-"));
+  await seedIndex([newEntry("src-a", "react"), newEntry("src-a", "docker"), newEntry("src-b", "react")]);
+  const second = await openIndexRead();
+  try {
+    assert.equal(resolveSkill(second, "src-a/react").id, "src-a/react");
+    assert.equal(resolveSkill(second, "src-b/react").id, "src-b/react");
+    assert.equal(resolveSkill(second, "docker").id, "src-a/docker");
+    assert.throws(
+      () => resolveSkill(second, "react"),
+      (e: unknown) =>
+        e instanceof MargraveError &&
+        /ambiguous/u.test(e.message) &&
+        e.message.includes("src-a/react") &&
+        e.message.includes("src-b/react"),
+    );
+    assert.throws(() => resolveSkill(second, "nope"), /no skill "nope"/u);
+  } finally {
+    second.close();
+  }
 });
 
 test("findSource accepts an id or the original spec", () => {
@@ -201,7 +192,7 @@ test("a malformed sources.json is an error and nothing is written", async () => 
     assert.equal(r.code, 1, r.stderr);
     assert.match(r.stderr, /sources\.json/u);
     assert.equal(await readFile(file, "utf8"), content, "sources.json unchanged");
-    assert.equal((await readdir(home)).includes("index.json"), false, "no index.json written");
+    assert.equal((await readdir(home)).includes("index.db"), false, "no index.db written");
     assert.deepEqual(
       (await readdir(home)).filter((n) => n.endsWith(".tmp")),
       [],
@@ -275,27 +266,6 @@ test("every field of a source record is checked", async (t) => {
   await assert.rejects(readSources(), /malformed/u, "not a list");
 });
 
-test("readIndex: a missing file is null; bad JSON or a wrong shape is an error that says to run reindex", async (t) => {
-  const h = await tmp("mg-home-");
-  useHome(t, h);
-  assert.equal(await readIndex(), null);
-  const file = path.join(h, "index.json");
-  await writeFile(file, "{ not json");
-  await assert.rejects(readIndex(), /not valid JSON; run: margrave reindex/u);
-  const shapes: Record<string, unknown> = {
-    "not an object": [],
-    "wrong version": { version: 2, skills: [], stats: {} },
-    "skills is not a list": { version: 1, skills: {}, stats: {} },
-    "stats is not an object": { version: 1, skills: [], stats: [] },
-  };
-  for (const [why, shape] of Object.entries(shapes)) {
-    await writeFile(file, JSON.stringify(shape));
-    await assert.rejects(readIndex(), /is malformed; run: margrave reindex/u, why);
-  }
-  await writeFile(file, JSON.stringify({ version: 1, skills: [], stats: {} }));
-  assert.deepEqual(await readIndex(), { version: 1, skills: [], stats: {} });
-});
-
 test("a git URL that cannot be parsed, a repo name that is only .git, and a URL with no path", () => {
   assert.throws(
     () => parseSpec("git@github.com"),
@@ -311,22 +281,6 @@ test("a git URL that cannot be parsed, a repo name that is only .git, and a URL 
   );
   const bare = parseSpec("https://github.com");
   assert.equal(bare.kind === "git" && bare.id, "github.com");
-});
-
-test("assemble sorts by id, whatever the input order", () => {
-  const ids = (list: IndexEntry[]): string[] => assemble(list).skills.map((s) => s.id);
-  assert.deepEqual(ids([entry("a", "x"), entry("a", "y"), entry("b", "x")]), ["a/x", "a/y", "b/x"]);
-  assert.deepEqual(ids([entry("b", "x"), entry("a", "y"), entry("a", "x")]), ["a/x", "a/y", "b/x"]);
-  // assemble() does not require unique ids: equal ids compare as equal and keep their input order.
-  const same = assemble([{ ...entry("a", "x"), name: "first" }, entry("b", "x"), { ...entry("a", "x"), name: "second" }]);
-  assert.deepEqual(
-    same.skills.map((s) => [s.id, s.name]),
-    [
-      ["a/x", "first"],
-      ["a/x", "second"],
-      ["b/x", "x"],
-    ],
-  );
 });
 
 // ---- a write that fails half way ----
@@ -372,33 +326,60 @@ const passRename = (): void => {
 
 const read = (home: string, file: string): Promise<string | null> => readFile(path.join(home, file), "utf8").catch(() => null);
 
-test("install: when sources.json cannot be written, the old index comes back (or goes away, when there was none)", async (t) => {
+test("install: when sources.json cannot be written, the rows roll back and the old index stays", async (t) => {
   await inStore(t, async (home) => {
     const first = await tmp("mg-localsrc-");
     await writeSkill(first, "alpha", "alpha skill");
     const second = await tmp("mg-localsrc2-");
     await writeSkill(second, "beta", "beta skill");
 
-    // No index before: the half-written one is removed.
+    // A store with no sources: the failed install leaves an empty index and no sources.json.
     failRename((_from, to) => to.endsWith("sources.json"));
     await assert.rejects(installSource(first, null, quiet), /mock: cannot rename to .*sources\.json/u);
-    assert.equal(await read(home, "index.json"), null);
+    assert.deepEqual(indexIds(home), []);
     assert.equal(await read(home, "sources.json"), null);
 
-    // An index before: the old one is written back.
+    // A store with an index: the old rows and the old sources.json stay.
     passRename();
     await installSource(first, null, quiet);
-    const index = await read(home, "index.json");
+    const ids = indexIds(home);
     const sources = await read(home, "sources.json");
-    assert.ok(index?.includes("alpha"));
+    assert.equal(ids.length, 1);
     failRename((_from, to) => to.endsWith("sources.json"));
     await assert.rejects(installSource(second, null, quiet), /mock: cannot rename to .*sources\.json/u);
-    assert.equal(await read(home, "index.json"), index);
+    assert.deepEqual(indexIds(home), ids);
     assert.equal(await read(home, "sources.json"), sources);
+  });
+});
 
-    // The restore fails too: the first error is the one that is reported.
+/** Make the COMMIT statement of any DatabaseSync throw. Other statements run. */
+function failCommit(): void {
+  mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "COMMIT") throw new Error("mock: COMMIT failed");
+    return realExec.call(this, sql);
+  });
+}
+
+test("a COMMIT that fails restores the old sources.json, rolls back the rows, and reports the COMMIT error", async (t) => {
+  await inStore(t, async (home) => {
+    const first = await tmp("mg-localsrc-");
+    await writeSkill(first, "alpha", "alpha skill");
+    const second = await tmp("mg-localsrc2-");
+    await writeSkill(second, "beta", "beta skill");
+    await installSource(first, null, quiet);
+    const ids = indexIds(home);
+    const sources = await read(home, "sources.json");
+
+    failCommit();
+    await assert.rejects(installSource(second, null, quiet), /mock: COMMIT failed/u);
+    assert.deepEqual(indexIds(home), ids);
+    assert.equal(await read(home, "sources.json"), sources, "the old sources.json is back");
+
+    // The restore fails too: the COMMIT error is still the one that is reported. The first rename (the new sources.json) works.
     failRename((_from, _to, nth) => nth > 1);
-    await assert.rejects(installSource(second, null, quiet), /mock: cannot rename to .*sources\.json/u);
+    failCommit();
+    await assert.rejects(installSource(second, null, quiet), /mock: COMMIT failed/u);
+    assert.deepEqual(indexIds(home), ids);
   });
 });
 
@@ -408,7 +389,7 @@ test("install of a git source: when sources.json cannot be written, the stored c
     failRename((_from, to) => to.endsWith("sources.json"));
     await assert.rejects(installSource(repo.url, null, quiet), /mock: cannot rename to .*sources\.json/u);
     assert.deepEqual(await readdir(path.join(home, "sources")), []);
-    assert.equal(await read(home, "index.json"), null);
+    assert.deepEqual(indexIds(home), []);
   });
 });
 
@@ -418,7 +399,7 @@ test("update of a git source rolls the stored copy back when the swap or the wri
     const { id } = await installSource(repo.url, null, quiet);
     const final = path.join(home, "sources", id);
     const stored = async (): Promise<string> => readFile(path.join(final, "skills", "react-perf", "SKILL.md"), "utf8");
-    const before = { sources: await read(home, "sources.json"), index: await read(home, "index.json"), skill: await stored() };
+    const before = { sources: await read(home, "sources.json"), index: indexIds(home), skill: await stored() };
 
     await writeSkill(path.join(repo.dir, "skills"), "react-perf", "Changed description of react perf");
     await git(repo.dir, "add", "-A");
@@ -429,14 +410,14 @@ test("update of a git source rolls the stored copy back when the swap or the wri
     await assert.rejects(updateSources(id, quiet), /mock: cannot rename to /u);
     assert.equal(await stored(), before.skill);
     assert.equal(await read(home, "sources.json"), before.sources);
-    assert.equal(await read(home, "index.json"), before.index);
+    assert.deepEqual(indexIds(home), before.index);
 
     // The new clone is in place, but sources.json cannot be written.
     failRename((_from, to) => to.endsWith("sources.json"));
     await assert.rejects(updateSources(id, quiet), /mock: cannot rename to .*sources\.json/u);
     assert.equal(await stored(), before.skill);
     assert.equal(await read(home, "sources.json"), before.sources);
-    assert.equal(await read(home, "index.json"), before.index);
+    assert.deepEqual(indexIds(home), before.index);
 
     // With the mock gone, the same update works.
     passRename();
@@ -446,24 +427,26 @@ test("update of a git source rolls the stored copy back when the swap or the wri
   });
 });
 
-test("reindex: when the index cannot be written, the old index comes back, and a failed restore does not hide the error", async (t) => {
+test("reindex: when sources.json cannot be written, the rows roll back, and a legacy index.json is kept", async (t) => {
   await inStore(t, async (home) => {
     const dir = await tmp("mg-localsrc-");
     await writeSkill(dir, "alpha", "alpha skill");
     await installSource(dir, null, quiet);
-    const index = await read(home, "index.json");
+    const ids = indexIds(home);
+    const sources = await read(home, "sources.json");
+    await writeFile(path.join(home, "index.json"), "legacy");
+    await writeSkill(dir, "beta", "beta skill");
 
-    // The restore (a second write of the same file) fails too.
-    failRename(() => true);
-    await assert.rejects(reindexAll(quiet), /mock: cannot rename to .*index\.json/u);
-    assert.equal(await read(home, "index.json"), index);
+    failRename((_from, to) => to.endsWith("sources.json"));
+    await assert.rejects(reindexAll(quiet), /mock: cannot rename to .*sources\.json/u);
+    assert.deepEqual(indexIds(home), ids, "the old index stays");
+    assert.equal(await read(home, "sources.json"), sources);
+    assert.equal(await read(home, "index.json"), "legacy", "the legacy file stays after a failed reindex");
 
-    // No index before: the restore removes the file.
     passRename();
-    await fsp.rm(path.join(home, "index.json"));
-    failRename(() => true);
-    await assert.rejects(reindexAll(quiet), /mock: cannot rename to .*index\.json/u);
-    assert.equal(await read(home, "index.json"), null);
+    assert.deepEqual(await reindexAll(quiet), { skills: 2, sources: 1 });
+    assert.equal(indexIds(home).length, 2);
+    assert.equal(await read(home, "index.json"), null, "the legacy file goes after a COMMIT");
   });
 });
 

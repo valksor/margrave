@@ -5,7 +5,7 @@ import { open, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import YAML from "yaml";
 import { buildFieldTokens } from "./bm25.ts";
-import type { FieldTokens } from "./bm25.ts";
+import type { TokenStrings } from "./bm25.ts";
 
 const SKIP_DIRS = new Set([".git", "node_modules"]);
 
@@ -18,9 +18,8 @@ export interface ScannedSkill {
   /** Absolute path of the skill directory as walked (under the scan root). */
   dir: string;
   hash: string;
-  frontmatter: Record<string, unknown>;
-  headings: string[];
-  fieldTokens: FieldTokens;
+  /** Token strings for the FTS columns, built from name, description, headings, and body. */
+  tokens: TokenStrings;
 }
 
 export interface ScanResult {
@@ -111,9 +110,7 @@ export function parseSkillMd(text: string): Parsed {
       name: name.trim(),
       description: description.trim(),
       hash: createHash("sha256").update(text).digest("hex"),
-      frontmatter: rec,
-      headings,
-      fieldTokens: buildFieldTokens({ name: name.trim(), description: description.trim(), headings, body }),
+      tokens: buildFieldTokens({ name: name.trim(), description: description.trim(), headings, body }),
     },
   };
 }

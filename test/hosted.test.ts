@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test, { mock } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -199,7 +199,7 @@ test("hosted: a store failure returns a generic error and logs the cause", async
   assert.equal(inst.code, 0, inst.stderr);
   const id = `${/^installed (\S+)/mu.exec(inst.stdout)?.[1] ?? ""}/terraform-modules`;
   const client = await connectHosted(t);
-  await writeFile(path.join(home, "index.json"), "{ not json");
+  await writeFile(path.join(home, "index.db"), "garbage that is not a database");
   const log = mock.method(console, "error", () => {});
 
   assert.equal(HOSTED_SERVER_ERROR, "the skill store on this server is not available; the server log has details");
@@ -215,7 +215,7 @@ test("hosted: a store failure returns a generic error and logs the cause", async
     assert.equal(log.mock.callCount(), 1, tool);
     const logged: unknown = log.mock.calls[0]?.arguments[0];
     assert.ok(logged instanceof Error, tool);
-    assert.match(logged.message, /not valid JSON/u, tool);
+    assert.match(logged.message, /is not a valid margrave index; run: margrave reindex/u, tool);
   }
 });
 
@@ -226,4 +226,26 @@ test("hosted: only POST is served", async () => {
     assert.equal(res.headers.get("Allow"), "POST", method);
     assert.deepEqual(await res.json(), { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null }, method);
   }
+});
+
+test("hosted: a read-only MARGRAVE_HOME (mode 555) still serves find_skills, load_skill, and read_skill_file", async (t) => {
+  const home = await useHome(t);
+  const dir = await tmp("mg-localsrc-");
+  await writeSkill(dir, "terraform-modules", "Design reusable Terraform modules");
+  const inst = await runCli(["install", dir], { home, fakeBin: await fakeRipwire() });
+  assert.equal(inst.code, 0, inst.stderr);
+  const id = `${/^installed (\S+)/mu.exec(inst.stdout)?.[1] ?? ""}/terraform-modules`;
+  const client = await connectHosted(t);
+  t.after(() => chmod(home, 0o755));
+  await chmod(home, 0o555);
+
+  const found = await call(client, "find_skills", { task: "terraform" });
+  assert.equal(found.isError, false, found.text);
+  assert.match(found.text, /terraform-modules/u);
+  const loaded = await call(client, "load_skill", { id });
+  assert.equal(loaded.isError, false, loaded.text);
+  assert.deepEqual(await call(client, "read_skill_file", { id, path: "SKILL.md" }), {
+    isError: false,
+    text: "---\nname: terraform-modules\ndescription: Design reusable Terraform modules\n---\n# terraform-modules\n\nBody of terraform-modules.\n",
+  });
 });

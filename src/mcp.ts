@@ -1,11 +1,12 @@
-// stdio MCP server. Read-only: it re-reads index.json on every call.
+// stdio MCP server. Read-only: it opens index.db on every call.
 import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { NO_SOURCES_MESSAGE, findSkills, formatFind, formatLoad, loadContext, loadSkill, readSkillFile, resolveSkill } from "./skills.ts";
-import type { FindText } from "./skills.ts";
+import type { Context, FindText } from "./skills.ts";
 import { RequestError } from "./store.ts";
+import type { IndexEntry } from "./store.ts";
 
 export const SERVER_INSTRUCTIONS =
   "This server gives access to installed skills that the agent does not load by default. Before a task in an unfamiliar domain, tool, or framework, call find_skills with the task in plain words. Call load_skill with the best id. Call read_skill_file for a file that the skill names.";
@@ -74,6 +75,15 @@ function version(): string {
   }
 }
 
+/** Resolve an id, then close the handle: nothing else needs the database. */
+function resolveEntry(ctx: Context, id: string): IndexEntry {
+  try {
+    return resolveSkill(ctx.db, id);
+  } finally {
+    ctx.db.close();
+  }
+}
+
 export function createServer(variant: Variant = LOCAL): McpServer {
   const server = new McpServer({ name: "margrave", version: version() }, { instructions: SERVER_INSTRUCTIONS });
 
@@ -87,7 +97,11 @@ export function createServer(variant: Variant = LOCAL): McpServer {
       try {
         const ctx = await loadContext();
         if (ctx === null) return ok(variant.noSources);
-        return ok(formatFind(findSkills(ctx.index, task, limit), variant.findText));
+        try {
+          return ok(formatFind(findSkills(ctx.db, task, limit), variant.findText));
+        } finally {
+          ctx.db.close();
+        }
       } catch (err) {
         return variant.fail(err);
       }
@@ -98,7 +112,7 @@ export function createServer(variant: Variant = LOCAL): McpServer {
     try {
       const ctx = await loadContext();
       if (ctx === null) return variant.fail(new RequestError(variant.noSources));
-      const entry = resolveSkill(ctx.index, id);
+      const entry = resolveEntry(ctx, id);
       return ok(formatLoad(await loadSkill(entry, ctx.sources), { hostPaths: variant.showHostPaths }));
     } catch (err) {
       return variant.fail(err);
@@ -112,7 +126,7 @@ export function createServer(variant: Variant = LOCAL): McpServer {
       try {
         const ctx = await loadContext();
         if (ctx === null) return variant.fail(new RequestError(variant.noSources));
-        const entry = resolveSkill(ctx.index, id);
+        const entry = resolveEntry(ctx, id);
         return ok(await readSkillFile(entry.dir, path));
       } catch (err) {
         return variant.fail(err);

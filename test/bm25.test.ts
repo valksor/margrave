@@ -1,15 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildFieldTokens, buildStats, clampLimit, rank, tokenize } from "../src/bm25.ts";
-import type { Doc } from "../src/bm25.ts";
-
-function doc(id: string, name: string, description: string, body = "", headings: string[] = []): Doc {
-  return { id, name, fieldTokens: buildFieldTokens({ name, description, headings, body }) };
-}
-
-function ranked(docs: Doc[], query: string, limit = 10): string[] {
-  return rank(docs, buildStats(docs), query, limit).map((r) => r.id);
-}
+import { BODY_TOKEN_LIMIT, MAX_QUERY_TERMS, buildFieldTokens, clampLimit, queryTerms, tokenize } from "../src/bm25.ts";
 
 test("tokenizer lowercases, splits on non-alphanumerics, drops stopwords", () => {
   assert.deepEqual(tokenize("The Quick-Brown FOX, and the dog!"), ["quick", "brown", "fox", "dog"]);
@@ -68,62 +59,30 @@ test("tokenizer is deterministic and keeps duplicates for term frequency", () =>
   assert.deepEqual(tokenize("a b c"), []);
 });
 
-test("body is cut to its first 2000 tokens", () => {
-  const body = `${"alpha ".repeat(2000)}omega`;
+test("body is cut to its first 2000 tokens; duplicates stay, so term frequency is kept", () => {
+  const body = `${"alpha ".repeat(BODY_TOKEN_LIMIT)}omega`;
   const ft = buildFieldTokens({ name: "n", description: "d", headings: [], body });
-  assert.equal(ft.body["alpha"], 2000);
-  assert.equal(ft.body["omega"], undefined);
+  assert.equal(ft.body, Array<string>(BODY_TOKEN_LIMIT).fill("alpha").join(" "));
 });
 
-test("BM25 ranks the document that matches the query best first", () => {
-  const docs = [
-    doc("s/react-perf", "react-perf", "Optimize React rendering performance"),
-    doc("s/postgres", "postgres", "Tune PostgreSQL queries and indexes"),
-    doc("s/docker", "docker", "Write Docker Compose files"),
-  ];
-  assert.equal(ranked(docs, "react performance")[0], "s/react-perf");
-  assert.equal(ranked(docs, "postgresql index")[0], "s/postgres");
-  assert.deepEqual(ranked(docs, "kubernetes"), []);
+test("buildFieldTokens returns one space-joined token string per FTS column", () => {
+  const ft = buildFieldTokens({
+    name: "React-Perf",
+    description: "Optimize the rendering",
+    headings: ["Setup tips", "Rules"],
+    body: "see the docs",
+  });
+  assert.deepEqual(ft, { name: "react perf", description: "optim render", headings: "setup tip rule", body: "see doc" });
 });
 
-test("a name match outweighs the same word in the body", () => {
-  const docs = [doc("s/a", "alpha", "Something unrelated", "redis redis redis redis"), doc("s/b", "redis", "Something else")];
-  assert.equal(ranked(docs, "redis")[0], "s/b");
-});
-
-test("an exact name or id match adds a bonus and wins over a stronger text match", () => {
-  const docs = [
-    doc("s/deploy-guide", "deploy-guide", "deploy deploy deploy production deploy checklist", "deploy deploy"),
-    doc("s/prod", "production", "Short note"),
-  ];
-  assert.equal(ranked(docs, "production deploy")[0], "s/deploy-guide");
-  assert.equal(ranked(docs, "production")[0], "s/prod");
-  assert.equal(ranked(docs, "S/PROD")[0], "s/prod");
-});
-
-test("equal scores break by id ascending", () => {
-  const docs = [
-    doc("s/zeta", "same", "identical description text"),
-    doc("s/alpha", "same", "identical description text"),
-    doc("s/mid", "same", "identical description text"),
-  ];
-  assert.deepEqual(ranked(docs, "identical description"), ["s/alpha", "s/mid", "s/zeta"]);
-});
-
-test("the limit cuts the result list", () => {
-  const docs = ["a", "b", "c", "d"].map((x) => doc(`s/${x}`, x, "shared words here"));
-  assert.equal(ranked(docs, "shared words", 2).length, 2);
-});
-
-test("tokens named like Object.prototype members do not break ranking after a JSON round trip", () => {
-  const docs = [doc("s/a", "a-skill", "explains the constructor pattern and toString"), doc("s/b", "b-skill", "other")];
-  const round = JSON.parse(JSON.stringify({ docs, stats: buildStats(docs) })) as { docs: Doc[]; stats: ReturnType<typeof buildStats> };
-  const result = rank(round.docs, round.stats, "constructor valueOf", 5);
-  assert.deepEqual(
-    result.map((r) => r.id),
-    ["s/a"],
-  );
-  assert.ok(Number.isFinite(result[0]?.score));
+test("queryTerms keeps unique tokens in first-seen order and caps them at 32", () => {
+  assert.deepEqual(queryTerms("React the react Docker"), ["react", "docker"]);
+  assert.deepEqual(queryTerms("the and of"), []);
+  const many = Array.from({ length: 10_000 }, (_, i) => `word${i}`).join(" ");
+  const terms = queryTerms(many);
+  assert.equal(terms.length, MAX_QUERY_TERMS);
+  assert.equal(MAX_QUERY_TERMS, 32);
+  assert.deepEqual(terms.slice(0, 2), ["word0", "word1"]);
 });
 
 test("clampLimit defaults to 5 and clamps to 1..25", () => {
@@ -133,28 +92,4 @@ test("clampLimit defaults to 5 and clamps to 1..25", () => {
   assert.equal(clampLimit(-3), 1);
   assert.equal(clampLimit(10), 10);
   assert.equal(clampLimit("100"), 25);
-});
-
-test("a field whose corpus average is zero is not length-normalised", () => {
-  const docs = [doc("a", "react", "render fast")];
-  // Stats from another, empty corpus: the term is known, but every field average is 0.
-  const stats = { ...buildStats([]), docCount: 1, docFreq: { react: 1 } };
-  const r = rank(docs, stats, "react", 10);
-  assert.deepEqual(
-    r.map((x) => x.id),
-    ["a"],
-  );
-  assert.ok((r[0]?.score ?? 0) > 0);
-});
-
-test("equal scores sort by id ascending, in either input order, and a repeated id does not break the sort", () => {
-  const same = (id: string): Doc => doc(id, "x", "widget");
-  for (const order of [
-    ["a", "b", "c"],
-    ["c", "b", "a"],
-    ["b", "c", "a"],
-  ]) {
-    assert.deepEqual(ranked(order.map(same), "widget"), ["a", "b", "c"], order.join());
-  }
-  assert.deepEqual(ranked(["b", "a", "a"].map(same), "widget"), ["a", "a", "b"]);
 });

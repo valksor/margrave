@@ -90,10 +90,10 @@ margrave load <id from the result>
 | `margrave update [source] [--allow-unsafe]`          | Git: fresh `git clone --depth 1` of the stored ref into staging, scan (against the installed copy, see below), then swap. A source installed without `--ref` is pinned to the branch the remote's default pointed to at install time, so `update` never jumps to a new default branch. Prints `old → new` commits and the skill ids added, changed (by `SKILL.md` hash), and removed. On any error the old copy stays untouched. Local: reindex only. With no argument it updates every source. |
 | `margrave remove <source>`                           | Git: deletes `sources/<id>` after checking it is a direct child of `sources/`. Local: unregisters only. It never deletes your directory.                                                                                                                                                                                                                                                                                                                                                        |
 | `margrave list [--skills] [--json]`                  | Sources with kind, ref, commit, and skill count. `--skills` adds every skill id and its description.                                                                                                                                                                                                                                                                                                                                                                                            |
-| `margrave find "<task>" [--limit N] [--json]`        | BM25 top N (default 5, clamped to 1..25). Prints qualified id, score, and description, then `load: margrave load <id>`. With no match it exits 0 and prints `no match`.                                                                                                                                                                                                                                                                                                                         |
+| `margrave find "<task>" [--limit N] [--json]`        | Top N by BM25 (default 5, clamped to 1..25). Prints qualified id, score, and description, then `load: margrave load <id>`. With no match it exits 0 and prints `no match`.                                                                                                                                                                                                                                                                                                                      |
 | `margrave load <id> [--json]`                        | Prints a header and the `SKILL.md` body. The header has `skill:`, `source:`, `commit:`, `base:` (the absolute skill directory, so relative references such as `references/x.md` resolve), the raw frontmatter, and the file list.                                                                                                                                                                                                                                                               |
 | `margrave load <id> --file <rel>`                    | Prints one file in the skill directory. See "Path guard".                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `margrave reindex`                                   | Rescan all sources and rebuild `index.json`.                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `margrave reindex`                                   | Rescan all sources and rebuild `index.db`. It also removes a legacy `index.json`.                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `margrave mcp`                                       | stdio MCP server (see below).                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `margrave wrap <claude\|codex\|bb\|generic>`         | Print setup text.                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
@@ -195,7 +195,7 @@ Limit: the baseline compares the flagged line, not the lines around it. A known 
 
 ## MCP server
 
-`margrave mcp` is read-only. `install`, `update`, and `remove` are not exposed. It reads `index.json` on every call, so a new install shows up without a restart.
+`margrave mcp` is read-only. `install`, `update`, and `remove` are not exposed. It opens `index.db` on every call, so a new install shows up without a restart. After you upgrade margrave, restart running `margrave mcp` sessions: a session started by an older version still reads `index.json`.
 
 | Tool              | Input            | Result                                                                                     |
 | ----------------- | ---------------- | ------------------------------------------------------------------------------------------ |
@@ -207,7 +207,11 @@ Limit: the baseline compares the flagged line, not the lines around it. A known 
 
 `import { handleHostedMcp } from "margrave/hosted"` gives a `(Request) => Promise<Response>` handler for MCP Streamable HTTP. margrave starts no server. The host app mounts the handler on one route.
 
-It has the same three tools and the same inputs as `margrave mcp`. It reads the store in `MARGRAVE_HOME` of the host process on every call. It is stateless and POST-only. Other methods get 405.
+It has the same three tools and the same inputs as `margrave mcp`. It reads the store in `MARGRAVE_HOME` of the host process on every call. It needs read access to `MARGRAVE_HOME`; it does not need write access, so a read-only mount or a separate user works. It is stateless and POST-only. Other methods get 405.
+
+After you upgrade margrave, restart the host app, and upgrade the `margrave` CLI and the package together: the host app and the CLI must use the same index format (see [Upgrading](#upgrading)).
+
+Known limit: if a CLI write is killed during its commit, a hot `index.db-journal` stays next to `index.db`. A process that can write must roll it back. A reader on a read-only mount returns an error until the next CLI write or `margrave reindex`.
 
 A remote client sees these differences:
 
@@ -220,19 +224,38 @@ The handler serves every skill in the store, including any installed with `--all
 
 margrave does no auth, TLS, CORS, Host/Origin checks, or rate limiting. The host app must do them. Do not expose the handler without auth.
 
-Example (Bun):
+Example (Node, `node:http`):
 
 ```ts
+import { createServer } from "node:http";
 import { handleHostedMcp } from "margrave/hosted";
-Bun.serve({
-  port: 8080,
-  fetch: (req) => (new URL(req.url).pathname === "/mcp" ? handleHostedMcp(req) : new Response("not found", { status: 404 })),
-});
+
+createServer(async (incoming, outgoing) => {
+  if (new URL(incoming.url ?? "/", "http://localhost").pathname !== "/mcp") {
+    outgoing.writeHead(404).end("not found");
+    return;
+  }
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(incoming.headers)) {
+    if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(", ") : value);
+  }
+  const chunks: Buffer[] = [];
+  for await (const chunk of incoming) chunks.push(chunk as Buffer);
+  const method = incoming.method ?? "GET";
+  const body = method === "GET" || method === "HEAD" ? undefined : Buffer.concat(chunks);
+  const res = await handleHostedMcp(new Request("http://localhost/mcp", { method, headers, body }));
+  outgoing.writeHead(res.status, Object.fromEntries(res.headers));
+  outgoing.end(Buffer.from(await res.arrayBuffer()));
+}).listen(8080);
 ```
 
 ## Ranking
 
-BM25F with k1 = 1.2 and b = 0.75. Field weights: name 3, description 2, headings 1, body 0.3. The first 2000 body tokens are indexed. Tokens are lowercased, split on non-alphanumerics, stripped of stopwords, and stemmed with the Porter algorithm (the `stemmer` package). The stopword check runs on the word and again on its stem. An exact match of the query to a name or id adds a fixed bonus. Ties break by id ascending.
+The index is a SQLite FTS5 table in `index.db` (the built-in `node:sqlite` module). Ranking is FTS5 BM25 per column, with k1 = 1.2 and b = 0.75 fixed by FTS5. Column weights: name 3, description 2, headings 1, body 0.3. The first 2000 body tokens are indexed. Tokens are lowercased, split on non-alphanumerics, stripped of stopwords, and stemmed with the Porter algorithm (the `stemmer` package). The stopword check runs on the word and again on its stem. margrave builds the tokens itself, so FTS5 only splits on spaces.
+
+An exact match of the query to a name or id (case-insensitive) ranks first. Its shown score has a fixed bonus of 10. Ties break by id in byte order (the UTF-8 bytes of the id). A query uses at most 32 distinct tokens, in the order they appear; later tokens are dropped.
+
+Scores have a different scale from earlier versions (per-column BM25 replaced BM25F), so re-tune any score threshold that you apply to `find --json`.
 
 ## Store
 
@@ -241,10 +264,14 @@ BM25F with k1 = 1.2 and b = 0.75. Field weights: name 3, description 2, headings
   sources/<source-id>/   git clones
   staging/               in-progress clones (deleted on success and on failure)
   sources.json           [{id, kind, spec, url|path, subpath, ref, commit, installedAt}]
-  index.json             one entry per skill, plus BM25 corpus stats
+  index.db               SQLite FTS5 index: one row per skill
 ```
 
-A missing `sources.json` is an empty list. A malformed one is an error, and margrave writes nothing. A malformed `index.json` is an error that tells you to run `margrave reindex`. Both files are written atomically (temp file in the same directory, then rename).
+A missing `sources.json` is an empty list. A malformed one is an error, and margrave writes nothing. A missing, legacy, or invalid `index.db` is an error that tells you to run `margrave reindex`. `sources.json` is written by an atomic rename (temp file in the same directory, then rename). `index.db` is written in SQLite transactions with the `DELETE` journal, so readers need only read access. An `install`, `update`, `remove`, or `reindex` takes the write lock, re-reads `sources.json` under it, and writes both; a second writer waits up to 30 seconds.
+
+## Upgrading
+
+From a version that stored `index.json`: run `margrave reindex` once. It builds `index.db` and removes `index.json`. Until then, `find`, `load`, `list`, `install`, `update`, and `remove` stop with `index.json is from an older margrave; run: margrave reindex`. Then restart running `margrave mcp` sessions and any host app that mounts the hosted handler, and upgrade the CLI and the package together.
 
 ## Exit codes
 

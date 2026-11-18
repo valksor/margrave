@@ -91,9 +91,6 @@ test("--file allows a file in a skill dir that is reached through a symlink", as
     source: "s",
     dir: via,
     hash: "h",
-    frontmatter: {},
-    headings: [],
-    fieldTokens: { name: {}, description: {}, headings: {}, body: {} },
   };
   const loaded = await loadSkill(entry, []);
   assert.deepEqual(loaded.files, ["SKILL.md", "references/x.md"]);
@@ -108,9 +105,6 @@ test("load reports a missing directory and says to run reindex", async () => {
     source: "s",
     dir: path.join(await tmp(), "does-not-exist"),
     hash: "h",
-    frontmatter: {},
-    headings: [],
-    fieldTokens: { name: {}, description: {}, headings: {}, body: {} },
   };
   await assert.rejects(loadSkill(entry, []), /margrave reindex/u);
 });
@@ -151,9 +145,6 @@ test("load of a SKILL.md without frontmatter returns an empty frontmatter and th
     source: "s",
     dir,
     hash: "h",
-    frontmatter: {},
-    headings: [],
-    fieldTokens: { name: {}, description: {}, headings: {}, body: {} },
   };
   const r = await loadSkill(entry, []);
   assert.equal(r.frontmatter, "");

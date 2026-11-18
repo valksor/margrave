@@ -29,10 +29,14 @@ test("frontmatter with a missing field is skipped, with a warning", async () => 
   assert.match(r.warnings.join("\n"), /no frontmatter/u);
 });
 
-test("frontmatter keeps extra keys such as allowed-tools", () => {
-  const p = parseSkillMd("---\nname: x\ndescription: y\nallowed-tools: Bash(git:*), Read\n---\n# Title\n");
+test("a skill carries the four token strings, with headings in their own column, and no frontmatter or headings list", () => {
+  const p = parseSkillMd("---\nname: xy-tool\ndescription: Tunes things\nallowed-tools: Bash(git:*), Read\n---\n# Title here\nbody text\n");
   assert.equal(p.ok, true);
-  if (p.ok) assert.equal(p.skill.frontmatter["allowed-tools"], "Bash(git:*), Read");
+  if (p.ok) {
+    assert.deepEqual(p.skill.tokens, { name: "xy tool", description: "tune thing", headings: "titl here", body: "titl here bodi text" });
+    assert.equal("frontmatter" in p.skill, false);
+    assert.equal("headings" in p.skill, false);
+  }
 });
 
 test("splitSkillMd handles CRLF and a BOM, and returns the body unchanged", () => {

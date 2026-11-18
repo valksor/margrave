@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { atomicWrite } from "../src/store.ts";
 import { resolveScanRoot } from "../src/sources.ts";
-import { CLI, fakeRipwire, git, head, link, makeRepo, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
+import { CLI, fakeRipwire, git, head, indexIds, indexRows, link, makeRepo, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
 import type { Run } from "./helpers.ts";
 
 interface Env {
@@ -23,7 +23,11 @@ const mg = (env: Env, args: string[], extra?: Record<string, string>): Promise<R
 
 async function snapshot(home: string): Promise<{ sources: string | null; index: string | null }> {
   const read = (f: string): Promise<string | null> => readFile(path.join(home, f), "utf8").catch(() => null);
-  return { sources: await read("sources.json"), index: await read("index.json") };
+  const index = await stat(path.join(home, "index.db")).then(
+    () => JSON.stringify(indexRows(home)),
+    () => null,
+  );
+  return { sources: await read("sources.json"), index };
 }
 
 async function names(dir: string): Promise<string[]> {
@@ -310,7 +314,7 @@ function newFindings(text: string): string[] {
   return out;
 }
 
-/** A refused update leaves the old copy live: same sources.json and index.json, same files, no staging. */
+/** A refused update leaves the old copy live: same sources.json and index.db rows, same files, no staging. */
 async function refusedUpdate(m: Marked, extra?: Record<string, string>): Promise<Run> {
   const before = await snapshot(m.env.home);
   const oldFile = await installedFile(m);
@@ -706,26 +710,28 @@ test("usage errors exit 2, unknown commands exit 2, and find/list say when no so
   assert.equal((await mg(env, ["remove", "x"])).code, 1);
 });
 
-test("a malformed index.json is an error that says to run reindex, and reindex repairs it", async () => {
+test("a malformed index.db is an error that says to run reindex, and reindex repairs it", async () => {
   const env = await setup();
   const dir = await tmp("mg-localsrc-");
   await writeSkill(dir, "alpha", "alpha skill");
   assert.equal((await mg(env, ["install", dir])).code, 0);
-  await writeFile(path.join(env.home, "index.json"), "{ broken");
+  await writeFile(path.join(env.home, "index.db"), "{ broken");
   const r = await mg(env, ["find", "alpha"]);
   assert.equal(r.code, 1);
-  assert.match(r.stderr, /margrave reindex/u);
+  assert.match(r.stderr, /index\.db is not a valid margrave index; run: margrave reindex/u);
   assert.equal((await mg(env, ["reindex"])).code, 0);
   assert.equal((await mg(env, ["find", "alpha"])).code, 0);
-  await rm(path.join(env.home, "index.json"));
+  await rm(path.join(env.home, "index.db"));
   const missing = await mg(env, ["find", "alpha"]);
   assert.equal(missing.code, 1);
-  assert.match(missing.stderr, /margrave reindex/u);
+  assert.match(missing.stderr, /index\.db is missing; run: margrave reindex/u);
+  assert.equal((await mg(env, ["reindex"])).code, 0);
+  assert.equal((await mg(env, ["find", "alpha"])).code, 0);
 });
 
 test("atomic writes leave no temp file and a reader never sees a partial file", async () => {
   const dir = await tmp("mg-atomic-");
-  const file = path.join(dir, "index.json");
+  const file = path.join(dir, "data.json");
   const big = (n: number): string => JSON.stringify({ n, pad: "x".repeat(200_000) });
   await atomicWrite(file, big(0));
   let stop = false;
@@ -816,29 +822,26 @@ test("list shows a local source with no ref and no commit; --skills adds the ski
   assert.deepEqual(JSON.parse(fileJson.stdout), { id: `${id}/terraform-modules`, path: "references/x.md", content: "reference text\n" });
 });
 
-test("list still works when index.json is gone: the sources show with no skills", async () => {
+test("list errors when index.db is gone, instead of printing skills=0", async () => {
   const env = await setup();
   const dir = await tmp("mg-localsrc-");
   await writeSkill(dir, "alpha", "alpha skill");
-  const id = await installLocalDir(env, dir);
-  await rm(path.join(env.home, "index.json"));
-  const list = await mg(env, ["list", "--skills"]);
-  assert.equal(list.code, 0, list.stderr);
-  assert.equal(list.stdout, `${id}  local  ref=-  commit=-  skills=0\n`);
-  const asJson = JSON.parse((await mg(env, ["list", "--json", "--skills"])).stdout) as {
-    sources: { skillCount: number }[];
-    skills: unknown[];
-  };
-  assert.deepEqual(asJson.skills, []);
-  assert.equal(asJson.sources[0]?.skillCount, 0);
+  await installLocalDir(env, dir);
+  await rm(path.join(env.home, "index.db"));
+  for (const args of [["list"], ["list", "--skills"], ["list", "--json", "--skills"]]) {
+    const r = await mg(env, args);
+    assert.equal(r.code, 1, args.join(" "));
+    assert.equal(r.stdout, "", args.join(" "));
+    assert.match(r.stderr, /index\.db is missing; run: margrave reindex/u, args.join(" "));
+  }
 });
 
-test("a missing index.json stops install, update, and remove, and says to run reindex", async () => {
+test("a missing index.db stops install, update, and remove, and says to run reindex", async () => {
   const env = await setup();
   const dir = await tmp("mg-localsrc-");
   await writeSkill(dir, "alpha", "alpha skill");
   const id = await installLocalDir(env, dir);
-  await rm(path.join(env.home, "index.json"));
+  await rm(path.join(env.home, "index.db"));
   const before = await snapshot(env.home);
 
   const other = await tmp("mg-localsrc2-");
@@ -850,11 +853,11 @@ test("a missing index.json stops install, update, and remove, and says to run re
   ]) {
     const r = await mg(env, args);
     assert.equal(r.code, 1, args.join(" "));
-    assert.match(r.stderr, /index\.json is missing; run: margrave reindex/u, args.join(" "));
+    assert.match(r.stderr, /index\.db is missing; run: margrave reindex/u, args.join(" "));
   }
   const all = await mg(env, ["update"]);
   assert.equal(all.code, 1);
-  assert.match(all.stderr, new RegExp(`update ${id} failed: index\\.json is missing`, "u"));
+  assert.match(all.stderr, new RegExp(`update ${id} failed: index\\.db is missing`, "u"));
   assert.deepEqual(await snapshot(env.home), before);
 });
 
@@ -970,7 +973,7 @@ test("git source: update works when the stored copy is gone, or no longer holds 
   await rm(path.join(env.home, "sources", id, "skills"), { recursive: true });
   const second = await mg(env, ["update", id]);
   assert.equal(second.code, 0, second.stderr);
-  assert.ok((await readFile(path.join(env.home, "index.json"), "utf8")).includes("react-perf"));
+  assert.ok(indexIds(env.home).some((i) => i.endsWith("/react-perf")));
 });
 
 test("install of a git source without git on PATH, and with a git that fails silently", async () => {

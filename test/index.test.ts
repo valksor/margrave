@@ -1,0 +1,590 @@
+// index.db: ranking, the upgrade and validity guard, locking, and concurrent writes.
+import assert from "node:assert/strict";
+import { chmod, mkdir, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import test, { mock } from "node:test";
+import { MAX_QUERY_TERMS } from "../src/bm25.ts";
+import { findSkills, resolveSkill } from "../src/skills.ts";
+import { localId } from "../src/sources.ts";
+import { deleteSourceSkills, home as storeHome, insertSkills, openIndexRead, openIndexWrite, writeSources } from "../src/store.ts";
+import type { NewEntry, SourceRecord } from "../src/store.ts";
+import {
+  fakeRipwire,
+  holdWriteLock,
+  indexIds,
+  indexRows,
+  newEntry,
+  realClose,
+  realExec,
+  runCli,
+  seedIndex,
+  sleep,
+  tmp,
+  writeSkill,
+} from "./helpers.ts";
+import type { Run } from "./helpers.ts";
+
+/** Point MARGRAVE_HOME at `h` for this test only. */
+function useHome(t: { after: (fn: () => void) => void }, h: string): void {
+  const prev = process.env["MARGRAVE_HOME"];
+  process.env["MARGRAVE_HOME"] = h;
+  t.after(() => {
+    if (prev === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prev;
+  });
+}
+
+/** Rank in a fresh store each call (the caller has pointed MARGRAVE_HOME somewhere that it restores). */
+async function ranked(entries: NewEntry[], task: string, limit?: number): Promise<{ id: string; score: number }[]> {
+  process.env["MARGRAVE_HOME"] = await tmp("mg-home-");
+  await seedIndex(entries);
+  const db = await openIndexRead();
+  try {
+    return findSkills(db, task, limit).map((h) => ({ id: h.id, score: h.score }));
+  } finally {
+    db.close();
+  }
+}
+
+const ids = (hits: { id: string }[]): string[] => hits.map((h) => h.id);
+
+// ---- ranking ----
+
+test("BM25 ranks the document that matches the query best first", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  const entries = [
+    newEntry("s", "react-perf", "Optimize React rendering performance"),
+    newEntry("s", "postgres", "Tune PostgreSQL queries and indexes"),
+    newEntry("s", "docker", "Write Docker Compose files"),
+  ];
+  await seedIndex(entries);
+  const db = await openIndexRead();
+  try {
+    assert.equal(findSkills(db, "react performance", undefined)[0]?.id, "s/react-perf");
+    assert.equal(findSkills(db, "postgresql index", undefined)[0]?.id, "s/postgres");
+    assert.deepEqual(findSkills(db, "kubernetes", undefined), []);
+    assert.deepEqual(findSkills(db, "docker", undefined)[0], {
+      id: "s/docker",
+      name: "docker",
+      description: "Write Docker Compose files",
+      score: findSkills(db, "docker", undefined)[0]?.score,
+    });
+  } finally {
+    db.close();
+  }
+});
+
+test("a name match outweighs the same word in the body", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  const hits = await ranked(
+    [newEntry("s", "alpha", "Something unrelated", "redis redis redis redis"), newEntry("s", "redis", "Something else")],
+    "redis",
+  );
+  assert.equal(hits[0]?.id, "s/redis");
+});
+
+test("an exact name or id match ranks first, even against a skill with strong hits in several columns", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  const entries = [
+    newEntry("s", "deploy-guide", "deploy deploy deploy production deploy checklist", "deploy production deploy production"),
+    newEntry("s", "production", "Short note"),
+  ];
+  assert.equal((await ranked(entries, "production deploy"))[0]?.id, "s/deploy-guide");
+  const exact = await ranked(entries, "production");
+  assert.equal(exact[0]?.id, "s/production");
+  assert.ok((exact[0]?.score ?? 0) >= 10, "the shown score carries the +10 bonus");
+  // The id match is case-insensitive, and an exact match that no token matches still shows up.
+  assert.equal((await ranked(entries, "S/PRODUCTION"))[0]?.id, "s/production");
+  assert.deepEqual(await ranked(entries, "  PRODUCTION  "), exact);
+});
+
+test("a query with no tokens skips the text search; only an exact name or id matches", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  const entries = [newEntry("s", "of", "the and of words"), newEntry("s", "other", "of of of")];
+  // "of" and "the" are stopwords, so there is no token and no MATCH.
+  assert.deepEqual(ids(await ranked(entries, "of")), ["s/of"]);
+  assert.deepEqual(await ranked(entries, "the"), []);
+  assert.deepEqual(await ranked(entries, ""), []);
+  assert.deepEqual(await ranked(entries, "   "), []);
+  assert.deepEqual(await ranked(entries, "!!! ???"), []);
+});
+
+test("equal scores break by id in byte order, in any insert order", async (t) => {
+  const same = (id: string): NewEntry => newEntry("s", id, "identical description text");
+  for (const order of [
+    ["zeta", "alpha", "mid"],
+    ["mid", "zeta", "alpha"],
+  ]) {
+    useHome(t, await tmp("mg-home-"));
+    assert.deepEqual(ids(await ranked(order.map(same), "identical description")), ["s/alpha", "s/mid", "s/zeta"], order.join());
+  }
+});
+
+test("the tie-break is SQLite byte order: a high BMP id sorts before an astral id", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  // Names without a-z0-9 give no name tokens, so both rows tie on the description. UTF-8: U+FF21 is EF BC A1, U+1F600 is F0 9F 98 80.
+  // In UTF-16 order the astral id (D83D ...) would come first.
+  const entries = ["\u{1F600}", "Ａ"].map((n) => newEntry("s", n, "identical description text"));
+  assert.deepEqual(ids(await ranked(entries, "identical description")), ["s/Ａ", "s/\u{1F600}"]);
+});
+
+test("the limit cuts the result list", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  const entries = ["a", "b", "c", "d"].map((x) => newEntry("s", x, "shared words here"));
+  assert.equal((await ranked(entries, "shared words", 2)).length, 2);
+  assert.equal((await ranked(entries, "shared words")).length, 4);
+});
+
+test("tokens named like Object.prototype members rank like any other token", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  const hits = await ranked(
+    [newEntry("s", "a-skill", "explains the constructor pattern and toString"), newEntry("s", "b-skill", "other")],
+    "constructor valueOf",
+  );
+  assert.deepEqual(ids(hits), ["s/a-skill"]);
+  assert.ok(Number.isFinite(hits[0]?.score));
+});
+
+test("a 10,000-term task uses at most 32 terms and returns fast", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  const task = Array.from({ length: 10_000 }, (_, i) => `word${i}`).join(" ");
+  const entries = [
+    newEntry("s", "first", "has word5 in it"),
+    newEntry("s", "late", `has word${MAX_QUERY_TERMS + 5} in it`),
+    newEntry("s", "last", "has word9999 in it"),
+  ];
+  await seedIndex(entries);
+  const db = await openIndexRead();
+  try {
+    const started = performance.now();
+    const hits = findSkills(db, task, undefined);
+    const ms = performance.now() - started;
+    assert.deepEqual(ids(hits), ["s/first"], "terms after the 32nd are dropped");
+    assert.ok(ms < 1000, `took ${ms} ms`);
+  } finally {
+    db.close();
+  }
+});
+
+test("query text never reaches the SQL: quotes, operators, and FTS syntax are plain tokens or dropped", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  const entries = [newEntry("s", "alpha", "alpha near beta"), newEntry("s", "it's", "quote name")];
+  assert.deepEqual(ids(await ranked(entries, `alpha" OR "x' ; DROP TABLE skills; -- NEAR(a b) * ^nomatch:`)), ["s/alpha"]);
+  assert.deepEqual(ids(await ranked(entries, "it's")), ["s/it's"]);
+  const db = await openIndexRead();
+  try {
+    assert.equal((db.prepare("SELECT count(*) AS n FROM skills").get() as { n: number }).n, 2);
+  } finally {
+    db.close();
+  }
+});
+
+test("resolveSkill answers from SQL: id, bare name, ambiguity, unknown", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  await seedIndex([newEntry("a", "x"), newEntry("b", "x"), newEntry("a", "only")]);
+  const db = await openIndexRead();
+  try {
+    assert.equal(resolveSkill(db, "a/x").source, "a");
+    assert.equal(resolveSkill(db, "only").id, "a/only");
+    assert.throws(() => resolveSkill(db, "x"), /"x" is ambiguous; use one of these ids:\n {2}a\/x\n {2}b\/x/u);
+    assert.throws(() => resolveSkill(db, "%"), /no skill "%"/u, "a LIKE wildcard matches nothing");
+  } finally {
+    db.close();
+  }
+});
+
+// ---- the writer connection ----
+
+test("the index uses the DELETE journal, user_version 1, and leaves no side files after a read", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  await seedIndex([newEntry("s", "a")]);
+  const db = await openIndexRead();
+  try {
+    assert.equal((db.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode, "delete");
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 1);
+  } finally {
+    db.close();
+  }
+  assert.deepEqual((await readdir(home)).sort(), ["index.db"]);
+});
+
+test("the writer reads integers as BigInt, and a contentless FTS delete does not break the next write", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  await seedIndex([newEntry("s", "a"), newEntry("s", "b")]);
+  const db = await openIndexWrite("existing");
+  try {
+    assert.equal(typeof (db.prepare("SELECT 1 AS n").get() as { n: unknown }).n, "bigint");
+    db.exec("BEGIN IMMEDIATE");
+    deleteSourceSkills(db, "s");
+    insertSkills(db, [newEntry("s", "c")]);
+    db.exec("COMMIT");
+  } finally {
+    db.close();
+  }
+  assert.deepEqual(indexIds(home), ["s/c"]);
+});
+
+// ---- the guard: missing, legacy, invalid, locked ----
+
+async function localSource(name: string): Promise<{ dir: string; record: (id: string) => SourceRecord }> {
+  const dir = await tmp("mg-localsrc-");
+  await writeSkill(dir, name, `${name} skill`);
+  return {
+    dir,
+    record: (id) => ({ id, kind: "local", spec: dir, path: dir, subpath: "", ref: null, commit: null, installedAt: "now" }),
+  };
+}
+
+async function setup(): Promise<{ home: string; fakeBin: string; dir: string; id: string; mg: (args: string[]) => Promise<Run> }> {
+  const home = await tmp("mg-home-");
+  const fakeBin = await fakeRipwire();
+  const dir = await tmp("mg-localsrc-");
+  await writeSkill(dir, "alpha", "alpha skill for the guard tests");
+  const mg = (args: string[]): Promise<Run> => runCli(args, { home, fakeBin });
+  const inst = await mg(["install", dir]);
+  assert.equal(inst.code, 0, inst.stderr);
+  return { home, fakeBin, dir, id: /^installed (\S+)/mu.exec(inst.stdout)?.[1] ?? "", mg };
+}
+
+const LEGACY = /index\.json is from an older margrave; run: margrave reindex/u;
+const INVALID = /index\.db is not a valid margrave index; run: margrave reindex/u;
+
+test("a store with only a legacy index.json: find, list, install, update, remove all say so and write nothing; reindex fixes it", async () => {
+  const s = await setup();
+  await rm(path.join(s.home, "index.db"));
+  await writeFile(path.join(s.home, "index.json"), '{"version":1,"skills":[],"stats":{}}');
+  const sourcesBefore = await readFile(path.join(s.home, "sources.json"), "utf8");
+  const other = await tmp("mg-localsrc2-");
+  await writeSkill(other, "beta", "beta skill");
+
+  for (const args of [["find", "alpha"], ["list"], ["load", "x"], ["install", other], ["update", s.id], ["update"], ["remove", s.id]]) {
+    const r = await s.mg(args);
+    assert.equal(r.code, 1, args.join(" "));
+    assert.match(r.stderr, LEGACY, args.join(" "));
+  }
+  assert.deepEqual((await readdir(s.home)).filter((n) => n.startsWith("index")).sort(), ["index.json"], "nothing was created");
+  assert.equal(await readFile(path.join(s.home, "sources.json"), "utf8"), sourcesBefore);
+
+  const re = await s.mg(["reindex"]);
+  assert.equal(re.code, 0, re.stderr);
+  assert.deepEqual((await readdir(s.home)).filter((n) => n.startsWith("index")).sort(), ["index.db"], "index.json is gone");
+  assert.equal((await s.mg(["find", "alpha"])).code, 0);
+  assert.deepEqual(indexIds(s.home), [`${s.id}/alpha`]);
+});
+
+test("an index.json newer than index.db means an older margrave wrote it: the legacy error; an older one is ignored", async () => {
+  const s = await setup();
+  const json = path.join(s.home, "index.json");
+  await writeFile(json, "{}");
+  const future = new Date(Date.now() + 60_000);
+  await utimes(json, future, future);
+  const other = await localSource("beta");
+  for (const args of [
+    ["find", "alpha"],
+    ["install", other.dir],
+  ]) {
+    const r = await s.mg(args);
+    assert.equal(r.code, 1, args.join(" "));
+    assert.match(r.stderr, LEGACY, args.join(" "));
+  }
+  const past = new Date(Date.now() - 3_600_000);
+  await utimes(json, past, past);
+  assert.equal((await s.mg(["find", "alpha"])).code, 0);
+  assert.equal((await s.mg(["reindex"])).code, 0);
+  assert.equal((await readdir(s.home)).includes("index.json"), false);
+});
+
+/** An index.db that is not ours, in four shapes. */
+const INVALID_DBS: Record<string, (file: string) => Promise<void> | void> = {
+  "a wrong user_version": (file) => {
+    const db = new DatabaseSync(file);
+    db.exec("CREATE TABLE skills(id TEXT); CREATE VIRTUAL TABLE fts USING fts5(a); PRAGMA user_version = 2");
+    db.close();
+  },
+  "a garbage file": (file) => writeFile(file, "this is not a database, but it is longer than a header would need to be ".repeat(4)),
+  "a 0-byte file": (file) => writeFile(file, ""),
+  "a database with no schema": (file) => {
+    const db = new DatabaseSync(file);
+    db.exec("PRAGMA user_version = 1");
+    db.close();
+  },
+};
+
+test("an invalid index.db is an error on every command; reindex rebuilds it, and drops a stale journal", async () => {
+  for (const [why, make] of Object.entries(INVALID_DBS)) {
+    const s = await setup();
+    const file = path.join(s.home, "index.db");
+    const other = await localSource("beta");
+    await rm(file);
+    await make(file);
+    for (const args of [["find", "alpha"], ["list"], ["load", "alpha"], ["install", other.dir], ["update", s.id], ["remove", s.id]]) {
+      const r = await s.mg(args);
+      assert.equal(r.code, 1, `${why}: ${args.join(" ")}`);
+      assert.match(r.stderr, INVALID, `${why}: ${args.join(" ")}`);
+    }
+    // A stale journal next to an invalid index.db is removed with it.
+    await writeFile(`${file}-journal`, "stale");
+    const re = await s.mg(["reindex"]);
+    assert.equal(re.code, 0, `${why}: ${re.stderr}`);
+    assert.deepEqual(indexIds(s.home), [`${s.id}/alpha`], why);
+    assert.equal((await readdir(s.home)).includes("index.db-journal"), false, why);
+    assert.equal((await s.mg(["find", "alpha"])).code, 0, why);
+  }
+});
+
+test("an install into a store with no sources replaces an invalid index.db", async () => {
+  const home = await tmp("mg-home-");
+  const dir = await tmp("mg-localsrc-");
+  await writeSkill(dir, "alpha", "alpha skill");
+  await writeFile(path.join(home, "index.db"), "garbage");
+  const r = await runCli(["install", dir], { home, fakeBin: await fakeRipwire() });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(indexIds(home).length, 1);
+});
+
+test("a locked database is not called invalid, and reindex does not delete it", { timeout: 60_000 }, async () => {
+  const s = await setup();
+  const before = indexRows(s.home);
+  // EXCLUSIVE blocks readers too. The reader timeout is 5 s.
+  const lock = holdWriteLock(s.home, "EXCLUSIVE");
+  let runs: Run[];
+  try {
+    runs = await Promise.all([s.mg(["find", "alpha"]), s.mg(["reindex"]), s.mg(["list"])]);
+  } finally {
+    lock.release();
+  }
+  for (const r of runs) {
+    assert.equal(r.code, 1, r.stderr);
+    assert.match(r.stderr, /cannot open .*index\.db: /u);
+    assert.doesNotMatch(r.stderr, /not a valid margrave index/u);
+  }
+  assert.deepEqual(indexRows(s.home), before, "the index is intact");
+  assert.equal((await s.mg(["find", "alpha"])).code, 0);
+});
+
+test("a symlinked or non-regular index.db is refused, and reindex does not follow it", async () => {
+  const s = await setup();
+  const file = path.join(s.home, "index.db");
+  const real = path.join(s.home, "real.db");
+  await rename(file, real);
+  await symlink(real, file);
+  const other = await localSource("beta");
+  for (const args of [["find", "alpha"], ["reindex"], ["install", other.dir]]) {
+    const r = await s.mg(args);
+    assert.equal(r.code, 1, args.join(" "));
+    assert.match(r.stderr, /index\.db is not a regular file/u, args.join(" "));
+  }
+  assert.equal((await stat(real)).isFile(), true, "the target is untouched");
+  await rm(file);
+  await mkdir(file);
+  assert.match((await s.mg(["find", "alpha"])).stderr, /index\.db is not a regular file/u);
+});
+
+test("an index.db that cannot be opened for a reason other than NOTADB is an error that names index.db, and nothing is deleted", async (t) => {
+  if (process.getuid?.() === 0) return t.skip("root can read a file with mode 000");
+  const s = await setup();
+  const file = path.join(s.home, "index.db");
+  await chmod(file, 0o000);
+  try {
+    for (const args of [["find", "alpha"], ["reindex"]]) {
+      const r = await s.mg(args);
+      assert.equal(r.code, 1, args.join(" "));
+      assert.match(r.stderr, /cannot open .*index\.db: /u, args.join(" "));
+    }
+  } finally {
+    await chmod(file, 0o644);
+  }
+  assert.deepEqual(indexIds(s.home), [`${s.id}/alpha`]);
+});
+
+test("a store directory that cannot be inspected is an error that names index.db", async (t) => {
+  const file = path.join(await tmp("mg-home-"), "not-a-dir");
+  await writeFile(file, "x");
+  useHome(t, file);
+  assert.equal(storeHome(), file);
+  await assert.rejects(openIndexRead(), /cannot read .*index\.db: /u);
+});
+
+test("a missing index.db with sources says to run reindex", async () => {
+  const s = await setup();
+  await rm(path.join(s.home, "index.db"));
+  const r = await s.mg(["find", "alpha"]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /index\.db is missing; run: margrave reindex/u);
+});
+
+test("a source whose skills are gone lists with skills=0 after a reindex", async () => {
+  const s = await setup();
+  await rm(path.join(s.dir, "alpha"), { recursive: true });
+  assert.equal((await s.mg(["reindex"])).code, 0);
+  const list = await s.mg(["list"]);
+  assert.equal(list.code, 0, list.stderr);
+  assert.match(list.stdout, /skills=0\n$/u);
+});
+
+test("a schema that cannot be created is an error that names index.db, and the handle is closed", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  let closed = 0;
+  mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql.includes("CREATE TABLE skills")) throw new Error("mock: no schema");
+    return realExec.call(this, sql);
+  });
+  mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    closed++;
+    return realClose.call(this);
+  });
+  t.after(() => mock.restoreAll());
+  await assert.rejects(openIndexWrite("create"), /cannot create .*index\.db: mock: no schema/u);
+  assert.equal(closed, 1);
+});
+
+test("an index.db that cannot be created in a read-only store is an error that names index.db", async (t) => {
+  if (process.getuid?.() === 0) return t.skip("root can write into a mode 555 directory");
+  const home = await tmp("mg-home-");
+  t.after(() => chmod(home, 0o755));
+  await chmod(home, 0o555);
+  const r = await runCli(["reindex"], { home });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /cannot create .*index\.db: /u);
+});
+
+// ---- read-only store ----
+
+test("a read-only MARGRAVE_HOME (mode 555) still serves find and load, and creates no side files", async (t) => {
+  const s = await setup();
+  t.after(() => chmod(s.home, 0o755));
+  await chmod(s.home, 0o555);
+  const before = (await readdir(s.home)).sort();
+  const find = await s.mg(["find", "alpha"]);
+  assert.equal(find.code, 0, find.stderr);
+  assert.match(find.stdout, /alpha/u);
+  const load = await s.mg(["load", `${s.id}/alpha`]);
+  assert.equal(load.code, 0, load.stderr);
+  assert.match(load.stdout, /Body of alpha/u);
+  const list = await s.mg(["list", "--json", "--skills"]);
+  assert.equal(list.code, 0, list.stderr);
+  assert.equal((JSON.parse(list.stdout) as { sources: { skillCount: number }[] }).sources[0]?.skillCount, 1);
+  assert.deepEqual((await readdir(s.home)).sort(), before);
+});
+
+// ---- concurrency, forced with a helper connection that holds the write lock ----
+
+/** How long a child process needs to finish its work before the lock, and reach the wait for it. */
+const CHILD_HEAD_START_MS = 2500;
+
+const installedId = (r: Run): string => /^installed (\S+)/mu.exec(r.stdout)?.[1] ?? "";
+
+test("two installs of different sources that wait for the same lock both survive", { timeout: 60_000 }, async () => {
+  const s = await setup();
+  const [one, two] = [await localSource("beta"), await localSource("gamma")];
+  const lock = holdWriteLock(s.home);
+  let runs: Run[];
+  try {
+    const pending = [s.mg(["install", one.dir]), s.mg(["install", two.dir])];
+    await sleep(CHILD_HEAD_START_MS);
+    lock.release();
+    runs = await Promise.all(pending);
+  } finally {
+    lock.release();
+  }
+  for (const r of runs) assert.equal(r.code, 0, r.stderr);
+  const sources = JSON.parse(await readFile(path.join(s.home, "sources.json"), "utf8")) as { id: string }[];
+  assert.equal(sources.length, 3, "all three source records are in sources.json");
+  assert.deepEqual(
+    indexIds(s.home),
+    [`${s.id}/alpha`, `${installedId(runs[0] as Run)}/beta`, `${installedId(runs[1] as Run)}/gamma`].sort(),
+  );
+  const list = await s.mg(["list", "--skills"]);
+  assert.match(list.stdout, /beta skill/u);
+  assert.match(list.stdout, /gamma skill/u);
+});
+
+test("a reindex that waited while another write changed the sources reports it, and loses nothing", { timeout: 60_000 }, async (t) => {
+  const s = await setup();
+  useHome(t, s.home);
+  const extra = await localSource("beta");
+  const lock = holdWriteLock(s.home);
+  let re: Run;
+  try {
+    const pending = s.mg(["reindex"]);
+    await sleep(CHILD_HEAD_START_MS);
+    // The helper acts as an install that won the lock: new source record and new rows.
+    const record = extra.record("local__extra-abc123");
+    const existing = JSON.parse(await readFile(path.join(s.home, "sources.json"), "utf8")) as SourceRecord[];
+    await writeSources([...existing, record]);
+    insertSkills(lock.db, [newEntry(record.id, "beta")]);
+    lock.release();
+    re = await pending;
+  } finally {
+    lock.release();
+  }
+  assert.equal(re.code, 1);
+  assert.match(re.stderr, /sources changed during reindex; run: margrave reindex/u);
+  const sources = JSON.parse(await readFile(path.join(s.home, "sources.json"), "utf8")) as { id: string }[];
+  assert.deepEqual(sources.map((x) => x.id).sort(), [s.id, "local__extra-abc123"].sort());
+  assert.deepEqual(indexIds(s.home), ["local__extra-abc123/beta", `${s.id}/alpha`].sort());
+  // The next reindex sees the new set and works.
+  const again = await s.mg(["reindex"]);
+  assert.equal(again.code, 0, again.stderr);
+});
+
+test(
+  "an update, a remove, and an install that waited while another write changed the sources fail cleanly",
+  { timeout: 60_000 },
+  async (t) => {
+    const s = await setup();
+    useHome(t, s.home);
+    const second = await localSource("beta");
+    const secondInstall = await s.mg(["install", second.dir]);
+    assert.equal(secondInstall.code, 0, secondInstall.stderr);
+    const secondId = installedId(secondInstall);
+    const third = await localSource("gamma");
+    const lock = holdWriteLock(s.home);
+    let runs: Run[];
+    try {
+      const pending = [s.mg(["update", s.id]), s.mg(["remove", secondId]), s.mg(["install", third.dir])];
+      await sleep(CHILD_HEAD_START_MS);
+      // The helper removes both existing sources and adds the third one, as three other commands would have.
+      deleteSourceSkills(lock.db, s.id);
+      deleteSourceSkills(lock.db, secondId);
+      const newId = localId(await realpath(third.dir));
+      insertSkills(lock.db, [newEntry(newId, "gamma")]);
+      await writeSources([third.record(newId)]);
+      lock.release();
+      runs = await Promise.all(pending);
+    } finally {
+      lock.release();
+    }
+    assert.equal(runs[0]?.code, 1);
+    assert.match(runs[0]?.stderr ?? "", new RegExp(`no source "${s.id}"`, "u"), "update: the record is gone");
+    assert.equal(runs[1]?.code, 1);
+    assert.match(runs[1]?.stderr ?? "", new RegExp(`no source "${secondId}"; run: margrave list`, "u"), "remove: the record is gone");
+    assert.equal(runs[2]?.code, 1);
+    assert.match(runs[2]?.stderr ?? "", /is already installed; run: margrave update/u, "install: another install won");
+    const sources = JSON.parse(await readFile(path.join(s.home, "sources.json"), "utf8")) as { id: string }[];
+    assert.equal(sources.length, 1);
+    assert.deepEqual(indexIds(s.home), [`${sources[0]?.id}/gamma`]);
+  },
+);
+
+test("a reader during an open write transaction gets the old results with no error", { timeout: 30_000 }, async () => {
+  const s = await setup();
+  const lock = holdWriteLock(s.home);
+  try {
+    insertSkills(lock.db, [newEntry(s.id, "uncommitted")]);
+    const find = await s.mg(["find", "alpha", "--json"]);
+    assert.equal(find.code, 0, find.stderr);
+    assert.deepEqual(
+      (JSON.parse(find.stdout) as { results: { id: string }[] }).results.map((r) => r.id),
+      [`${s.id}/alpha`],
+    );
+    const list = await s.mg(["list"]);
+    assert.match(list.stdout, /skills=1\n/u);
+  } finally {
+    lock.release();
+  }
+});
