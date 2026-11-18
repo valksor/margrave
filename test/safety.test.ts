@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { PINNED_RIPWIRE, VERSION_TIMEOUT_MS, esc, parseScanXml, runRipwire, scanWithRipwire } from "../src/safety.ts";
 import { MargraveError } from "../src/store.ts";
-import { ROOT, fakeRipwire, tmp } from "./helpers.ts";
+import { ROOT, fakeRipwire, mkfifo, tmp } from "./helpers.ts";
 
 // ---- parser ----
 
@@ -723,6 +723,41 @@ test("a finding row that does not point at a readable line of a file in the scan
       );
     },
   );
+});
+
+// The fake ripwire reports only regular files and symlinks, so this ripwire also reports a FIFO: a row for a/SKILL.md, and one for a/pipe.md when it exists.
+const FIFO_RIPWIRE = String.raw`#!/bin/sh
+if [ "$1" = "--version" ]; then echo "ripwire @VERSION@ (fake)"; exit 0; fi
+dir=
+for a in "$@"; do
+  case "$a" in --scan-skills=*) dir=$(printf '%s' "$a" | cut -c15-) ;; esac
+done
+n=1
+rows="<f p=\"$dir/a/SKILL.md:1\" rule=\"INJECTION:eval\" sev=\"warn\"/>"
+if [ -p "$dir/a/pipe.md" ]; then
+  n=2
+  rows="$rows<f p=\"$dir/a/pipe.md:1\" rule=\"INJECTION:eval\" sev=\"warn\"/>"
+fi
+printf '<skillscan files="1" findings="%s" skipped="0" verdict="warn">%s</skillscan>\n' "$n" "$rows"
+exit 1
+`;
+
+test("baseline: a flagged FIFO is unreadable and counts as new, and does not block the read", { timeout: 10_000 }, async () => {
+  const bin = await tmp("mg-fifo-ripwire-");
+  await writeFile(path.join(bin, "ripwire"), FIFO_RIPWIRE.replace("@VERSION@", PINNED_RIPWIRE));
+  await chmod(path.join(bin, "ripwire"), 0o755);
+  const base = await scanDir({ "a/SKILL.md": "x\n" });
+  const next = await scanDir({ "a/SKILL.md": "x\n" });
+  await mkfifo(path.join(next, "a", "pipe.md"));
+  await assert.rejects(
+    withScripted(bin, () => scanWithRipwire(next, opts([], { baselineDir: base }))),
+    /refused: [\s\S]*a\/pipe\.md:1 {2}INJECTION:eval {2}warn \(unreadable\)/u,
+  );
+  // the same finding without the FIFO is known and proceeds
+  const logs: string[] = [];
+  const ok = await withScripted(bin, () => scanWithRipwire(base, opts(logs, { baselineDir: base })));
+  assert.equal(ok.code, 1);
+  assert.match(logs.join("\n"), /; 0 new vs installed copy/u);
 });
 
 test("a finding row without p or rule attributes parses with empty strings", () => {

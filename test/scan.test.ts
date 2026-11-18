@@ -4,7 +4,7 @@ import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import test, { mock } from "node:test";
 import { extractHeadings, isInside, parseSkillMd, scanSource, splitSkillMd } from "../src/scan.ts";
-import { link, skillMd, tmp, writeSkill } from "./helpers.ts";
+import { link, mkfifo, skillMd, tmp, writeSkill } from "./helpers.ts";
 
 test("frontmatter with a missing field is skipped, with a warning", async () => {
   const root = await tmp();
@@ -157,6 +157,19 @@ test("a SKILL.md that is a directory, or that cannot be read, is skipped with a 
   const r2 = await scanSource(locked, { followSymlinks: false });
   assert.deepEqual(r2.skills, []);
   assert.match(r2.warnings.join("\n"), /locked.SKILL\.md: EACCES/u);
+});
+
+test("a SKILL.md that is a FIFO is skipped without blocking, and a regular one beside it is read", { timeout: 10_000 }, async () => {
+  const root = await tmp();
+  await mkdir(path.join(root, "fifo-skill"));
+  await mkfifo(path.join(root, "fifo-skill", "SKILL.md"));
+  await writeSkill(root, "good", "a good skill");
+  const r = await scanSource(root, { followSymlinks: false });
+  assert.deepEqual(
+    r.skills.map((s) => s.name),
+    ["good"],
+  );
+  assert.match(r.warnings.join("\n"), /fifo-skill.SKILL\.md: not a regular file/u);
 });
 
 test("a directory that cannot be listed is skipped with a warning", async (t) => {

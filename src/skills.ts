@@ -1,8 +1,8 @@
 // find / load / read-file, id resolution, path guard, terminal-safe text.
-import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { clampLimit, rank } from "./bm25.ts";
-import { splitSkillMd } from "./scan.ts";
+import { READ_NO_FOLLOW, splitSkillMd } from "./scan.ts";
 import { MargraveError, RequestError, readIndex, readSources } from "./store.ts";
 import type { IndexEntry, IndexFile, SourceRecord } from "./store.ts";
 
@@ -162,9 +162,13 @@ export async function readSkillFile(dir: string, rel: string): Promise<string> {
     throw new RequestError(`path ${clean(rel)} is outside the skill directory`);
   }
   if (isGitPath(path.relative(realDir, realFile))) throw new RequestError(`path ${clean(rel)} is inside .git, which is not served`);
-  const st = await stat(realFile);
-  if (!st.isFile()) throw new RequestError(`not a file: ${clean(rel)}`);
-  return readFile(realFile, "utf8");
+  const fh = await open(realFile, READ_NO_FOLLOW);
+  try {
+    if (!(await fh.stat()).isFile()) throw new RequestError(`not a file: ${clean(rel)}`);
+    return await fh.readFile("utf8");
+  } finally {
+    await fh.close();
+  }
 }
 
 export interface LoadResult {

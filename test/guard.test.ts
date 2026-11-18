@@ -5,7 +5,7 @@ import test from "node:test";
 import { MargraveError } from "../src/store.ts";
 import { listFiles, loadSkill, readSkillFile } from "../src/skills.ts";
 import type { IndexEntry } from "../src/store.ts";
-import { link, tmp, writeSkill } from "./helpers.ts";
+import { link, mkfifo, tmp, writeSkill } from "./helpers.ts";
 
 test("--file refuses ../, an absolute path, and a symlink out of the dir", async () => {
   const root = await tmp();
@@ -125,6 +125,14 @@ test("readSkillFile reports a missing skill directory, a directory path, and wor
 
   // The filesystem root already ends with a separator, so no second one is added to the prefix.
   await assert.rejects(readSkillFile("/", `margrave-no-such-file-${process.pid}`), /no such file in the skill directory/u);
+});
+
+test("readSkillFile refuses a FIFO without blocking, and reads a regular file beside it", { timeout: 10_000 }, async () => {
+  const dir = await writeSkill(await tmp(), "fifo-dir", "a skill");
+  await mkfifo(path.join(dir, "pipe.md"));
+  await writeFile(path.join(dir, "ref.md"), "regular\n");
+  await assert.rejects(readSkillFile(dir, "pipe.md"), /not a file: pipe\.md/u);
+  assert.equal(await readSkillFile(dir, "ref.md"), "regular\n");
 });
 
 test("listFiles of a directory that cannot be read is an empty list", async () => {

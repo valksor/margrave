@@ -3,12 +3,20 @@ import { chmod, mkdir, mkdtemp, realpath, symlink, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { PINNED_RIPWIRE } from "../src/safety.ts";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const CLI = path.join(ROOT, "src", "cli.ts");
 /** Preload that hides a vendored ripwire from margrave. `runCli` puts it in front of every spawned CLI. */
 export const NO_VENDORED_PRELOAD = path.join(ROOT, "test", "no-vendored-ripwire.ts");
+
+const execFileAsync = promisify(execFile);
+
+/** Make a FIFO (named pipe) at `file`. Node has no mkfifo API. */
+export async function mkfifo(file: string): Promise<void> {
+  await execFileAsync("mkfifo", [file]);
+}
 
 export async function tmp(prefix = "mg-"): Promise<string> {
   return realpath(await mkdtemp(path.join(tmpdir(), prefix)));

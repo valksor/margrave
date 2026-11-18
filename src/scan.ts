@@ -1,12 +1,16 @@
 // SKILL.md discovery, frontmatter parsing, headings.
 import { createHash } from "node:crypto";
-import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import YAML from "yaml";
 import { buildFieldTokens } from "./bm25.ts";
 import type { FieldTokens } from "./bm25.ts";
 
 const SKIP_DIRS = new Set([".git", "node_modules"]);
+
+/** Open flags for reading a file we must not follow: no symlink as the last component, and a FIFO does not block the open. */
+export const READ_NO_FOLLOW = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
 export interface ScannedSkill {
   name: string;
@@ -177,12 +181,16 @@ export async function scanSource(root: string, opts: ScanOptions): Promise<ScanR
     }
     let text: string;
     try {
-      const st = await lstat(file);
-      if (!st.isFile()) {
-        warnings.push(`skipped ${file}: not a regular file`);
-        return;
+      const fh = await open(file, READ_NO_FOLLOW);
+      try {
+        if (!(await fh.stat()).isFile()) {
+          warnings.push(`skipped ${file}: not a regular file`);
+          return;
+        }
+        text = await fh.readFile("utf8");
+      } finally {
+        await fh.close();
       }
-      text = await readFile(file, "utf8");
     } catch (err) {
       warnings.push(`skipped ${file}: ${(err as Error).message}`);
       return;

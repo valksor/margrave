@@ -11,10 +11,10 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { open, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isInside } from "./scan.ts";
+import { READ_NO_FOLLOW, isInside } from "./scan.ts";
 import { MargraveError, atomicWrite, reportsRoot } from "./store.ts";
 
 export interface ScanOutcome {
@@ -260,12 +260,16 @@ async function readFlagged(realRoot: string, rel: string, cache: Map<string, Fil
   let info: FileInfo | null = null;
   try {
     const abs = path.join(realRoot, rel);
-    const st = await lstat(abs);
-    if (st.isFile() && (await realpath(abs)) === abs && isInside(abs, realRoot)) {
-      const buf = await readFile(abs);
-      const lines = utf8.decode(buf).split("\n");
-      if (lines.at(-1) === "") lines.pop();
-      info = { hash: sha256(buf), lines };
+    const fh = await open(abs, READ_NO_FOLLOW);
+    try {
+      if ((await fh.stat()).isFile() && (await realpath(abs)) === abs && isInside(abs, realRoot)) {
+        const buf = await fh.readFile();
+        const lines = utf8.decode(buf).split("\n");
+        if (lines.at(-1) === "") lines.pop();
+        info = { hash: sha256(buf), lines };
+      }
+    } finally {
+      await fh.close();
     }
   } catch {
     info = null;
