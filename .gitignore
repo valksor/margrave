@@ -2,3 +2,31 @@ node_modules/
 dist/
 coverage/
 vendor/
+
+# Logs
+*.log
+.pnpm-debug.log*
+
+# OS
+.DS_Store
+
+# Env files
+.env
+.env.*
+
+# Build and tool caches
+*.tgz
+*.tsbuildinfo
+.eslintcache
+
+# Only pnpm-lock.yaml is supported
+package-lock.json
+yarn.lock
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/backups/
+.claude/logs/
+.claude/scheduled_tasks.lock
+.claude/worktrees/
+.claude/memory/
