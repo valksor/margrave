@@ -219,8 +219,10 @@ jobs:
           grep -q "ripwire was not found" "$RUNNER_TEMP/refusal.txt"
 
       # The macOS leg uploads `unsigned-macos-arm64`; only `sign-macos` uploads
-      # `bundle-macos-arm64`. So the `bundle-*` globs in `attest` and
-      # `create-release` can match only the signed macOS file.
+      # `bundle-macos-arm64`, so the `bundle-*` globs in `attest` and
+      # `create-release` pick up the signed macOS file, not this one. This
+      # separates the jobs; it is not a trust boundary against code that runs
+      # in this job.
       - name: Upload bundle
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -318,6 +320,18 @@ jobs:
           UP="$RUNNER_TEMP/upstream"
           NAME="ripwire-$RIPWIRE_VERSION-macos-arm64"
           BIN="$RUNNER_TEMP/sign/margrave/vendor/ripwire/ripwire"
+          # A symlink anywhere on this path would survive the repack and ship a
+          # dangling link, so require real directories and a regular file.
+          for p in "$RUNNER_TEMP/sign/margrave" "$RUNNER_TEMP/sign/margrave/vendor" "$RUNNER_TEMP/sign/margrave/vendor/ripwire" "$BIN"; do
+            if [[ -L "$p" ]]; then
+              echo "::error::$p is a symlink in the unsigned bundle. Nothing was signed."
+              exit 1
+            fi
+          done
+          if [[ ! -f "$BIN" ]]; then
+            echo "::error::$BIN is not a regular file in the unsigned bundle. Nothing was signed."
+            exit 1
+          fi
           rm -rf "$UP"
           mkdir -p "$UP"
           curl -fsSL --proto '=https' -o "$UP/$NAME.tar.gz" "https://github.com/redhat-et/ripwire/releases/download/v$RIPWIRE_VERSION/$NAME.tar.gz"
@@ -400,7 +414,7 @@ jobs:
           security find-identity -v -p codesigning "$KC" > "$RUNNER_TEMP/identities.txt"
           COUNT=$(grep -c '"Developer ID Application:' "$RUNNER_TEMP/identities.txt" || true)
           if [[ "$COUNT" -ne 1 ]]; then
-            echo "::error::Expected exactly one valid \"Developer ID Application\" identity in the certificate, found $COUNT"
+            echo "::error::Expected exactly one valid \"Developer ID Application\" identity in the certificate, found $COUNT. A count of 0 means the p12 holds no such identity, its certificate is expired or revoked, or its chain is not trusted (only Apple's Developer ID G2 intermediate is imported)."
             exit 1
           fi
           IDENTITY=$(grep '"Developer ID Application:' "$RUNNER_TEMP/identities.txt" | awk '{print $2}')

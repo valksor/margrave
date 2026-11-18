@@ -78,7 +78,7 @@ Only the first line counts. A token in the body of the message, such as in a squ
 
 Releases sign and notarize the macOS ripwire in the `sign-macos` job. A release fails until the signing setup below exists. A failed or unavailable notarization blocks the whole release, Linux included.
 
-1. Create the GitHub Environment `release-signing` (Settings → Environments). Add a deployment-branch rule that allows `master` only, with no tags. A required reviewer is optional.
+1. Create the GitHub Environment `release-signing` (Settings → Environments). Add a deployment-branch rule that allows `master` only, with no tags, before you add any secret. A required reviewer is optional. GitHub also creates this environment by itself, without a branch rule, the first time a workflow run names it, so check that the rule is there before step 2.
 2. Add these five secrets to that environment:
    - `MACOS_CERT_P12`: export the Developer ID Application certificate with its private key as a `.p12` file from Keychain Access, then run `base64 -i cert.p12 | pbcopy`.
    - `MACOS_CERT_PASSWORD`: the password you set for that export.
