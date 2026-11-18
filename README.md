@@ -15,7 +15,7 @@ Skills are not loaded into the agent by default, so 1000+ installed skills cost 
 
 ## 1. Install margrave itself
 
-Node 27 or newer. The repo pins `27.0.0-alpha.0.1.0` in `.nvmrc`. nvm hides alpha builds by default, so install it with `nvm install --only=alpha 27.0.0-alpha.0.1.0` before `nvm use`.
+The release bundles and the Homebrew formula need no Node. The npm package and a build from source need Node 24 or newer. The repo pins `26.13.0` in `.nvmrc`: `nvm use` selects it, and the release binary embeds that version.
 
 ```sh
 nvm use && pnpm install --frozen-lockfile && pnpm run build && pnpm add -g "$PWD"
@@ -25,11 +25,11 @@ nvm use && pnpm install --frozen-lockfile && pnpm run build && pnpm add -g "$PWD
 
 ### From a release
 
-Every push to `master` publishes a release at https://github.com/valksor/margrave/releases with these assets. All of them need Node 27 or newer (see above).
+Every push to `master` publishes a release at https://github.com/valksor/margrave/releases with these assets. The bundles need no Node. The npm package needs Node 24 or newer.
 
 | Asset                                                                                | Contents                                                                                                                                                                                                                         |
 | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `margrave-v<version>-linux-x64.tar.gz`, `-linux-arm64.tar.gz`, `-macos-arm64.tar.gz` | A `margrave/` directory with the built CLI, its production `node_modules`, and ripwire in `vendor/ripwire/`. Nothing else to install.                                                                                            |
+| `margrave-v<version>-linux-x64.tar.gz`, `-linux-arm64.tar.gz`, `-macos-arm64.tar.gz` | A `margrave/` directory with the standalone binary `bin/margrave` (it embeds Node 26), ripwire in `vendor/ripwire/`, `package.json`, and the license files. Nothing else to install.                                             |
 | `margrave-v<version>.tgz`                                                            | The npm package. It does not carry ripwire: run `node <package dir>/scripts/ensure-ripwire.mjs` once to fetch the pinned one. Without it, margrave falls back to `ripwire` on `PATH`, which must be at least the pinned version. |
 
 Homebrew (macOS arm64, Linux):
@@ -37,8 +37,6 @@ Homebrew (macOS arm64, Linux):
 ```sh
 brew install valksor/tap/margrave
 ```
-
-The formula does not install Node. margrave needs Node 27 or newer on `PATH`, and Homebrew's own `node` is 26, which does not work. Install Node 27 with the nvm command from [section 1](#1-install-margrave-itself): `nvm install --only=alpha 27.0.0-alpha.0.1.0`. nvm puts `node` on `PATH` only in interactive shells.
 
 The tap checks for new releases every 6 hours, so `brew upgrade` can trail a release by up to 6 hours. If you installed a bundle before, remove its `~/.local/bin/margrave` symlink: the first `margrave` on `PATH` wins.
 
@@ -49,10 +47,21 @@ gh release download --repo valksor/margrave --pattern 'margrave-v*-linux-x64.tar
 gh attestation verify margrave-v*-linux-x64.tar.gz --repo valksor/margrave
 tar -xzf margrave-v*-linux-x64.tar.gz
 mkdir -p ~/.local/bin
-ln -s "$PWD/margrave/dist/cli.js" ~/.local/bin/margrave
+ln -s "$PWD/margrave/bin/margrave" ~/.local/bin/margrave
 ```
 
+Symlink `margrave/bin/margrave`. Do not copy it: margrave finds `vendor/ripwire` next to the real binary.
+
+The Linux bundles embed the official glibc build of Node. A musl host (Alpine) or a host with an old glibc must use the npm package.
+
 `~/.local/bin` must be on `PATH`. If it is not, add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file and open a new shell.
+
+#### Upgrading from 0.1.x
+
+The bundle no longer has `dist/cli.js`. Do both of these:
+
+1. Point the old `~/.local/bin/margrave` symlink at `margrave/bin/margrave`.
+2. Run `margrave wrap <agent>` again and apply its output. Old agent configs run `node .../dist/cli.js mcp`, which no longer exists.
 
 Package:
 
@@ -60,7 +69,7 @@ Package:
 pnpm add -g ./margrave-v<version>.tgz
 ```
 
-On macOS, the bundle's ripwire is signed with a Developer ID and notarized. Gatekeeper checks the notarization online at the first run, so a browser download that you use offline can still be blocked. In that case, run `gh attestation verify` on the file first, extract that same file, then clear the quarantine flag on the bundled ripwire only: `xattr -d com.apple.quarantine margrave/vendor/ripwire/ripwire`.
+On macOS, the bundle's `margrave` and ripwire are signed with a Developer ID and notarized. Gatekeeper checks the notarization online at the first run, so a browser download that you use offline can still be blocked. In that case, run `gh attestation verify` on the file first, extract that same file, then clear the quarantine flag on the bundled `margrave` and ripwire only: `xattr -d com.apple.quarantine margrave/bin/margrave margrave/vendor/ripwire/ripwire`.
 
 ## 2. Install a skill source
 
@@ -74,13 +83,25 @@ margrave install https://example.com/team/skills.git --ref v2
 
 ## 3. Connect an agent
 
-`margrave wrap <agent>` prints setup text and writes nothing. It uses absolute paths (`process.execPath` and the absolute `dist/cli.js`), so the agent's own PATH and nvm state do not matter. It passes `MARGRAVE_HOME` when that is set.
+`margrave wrap <agent>` prints setup text and writes nothing. It uses absolute paths, so the agent's own PATH and nvm state do not matter. From a release binary it prints the absolute path of that binary (the path you ran it by, so a Homebrew upgrade keeps working). From the npm package or a source build it prints `process.execPath` and the absolute `dist/cli.js`. It passes `MARGRAVE_HOME` when that is set.
 
 ```sh
 margrave wrap claude    # a `claude mcp add` command, then the instruction snippet
 margrave wrap codex     # a [mcp_servers.margrave] block for ~/.codex/config.toml, then the snippet
 margrave wrap bb        # the claude command line, with a note that bb runs the provider's MCP config
 margrave wrap generic   # the plain command line, then the snippet
+```
+
+Example for a release binary (`margrave wrap claude`):
+
+```sh
+claude mcp add margrave -- /home/you/.local/bin/margrave mcp
+```
+
+The same command from the npm package or a source build:
+
+```sh
+claude mcp add margrave -- /usr/local/bin/node /path/to/margrave/dist/cli.js mcp
 ```
 
 Run the printed command yourself, and add the snippet to the agent's instructions.
@@ -316,6 +337,7 @@ margrave never deletes `index.db`. If `index.db` is not a margrave index (for ex
 ```sh
 nvm use && pnpm install --frozen-lockfile
 pnpm run build  # tsrs, chmod +x dist/cli.js, then scripts/ensure-ripwire.mjs
+pnpm run build:sea  # build, then bundle it into the standalone binary build/margrave
 pnpm test       # node --test test/ under c8 (runs the .ts sources directly; no network, temp MARGRAVE_HOME); fails when line, branch, function, or statement coverage of src/ is below 100%
 ```
 
