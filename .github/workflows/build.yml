@@ -274,8 +274,26 @@ jobs:
           fi
 
           # execArgvExtension is none, so the binary ignores NODE_OPTIONS and
-          # cannot be used as a general JS launcher. A node would fail here.
-          NODE_OPTIONS=--require=/nonexistent "$BUNDLE/bin/margrave" --help > /dev/null
+          # cannot be used as a general JS launcher. A node would refuse this
+          # unknown flag. (No file path here: knip would read a --require path
+          # as an unresolved import and fail the test workflow.)
+          NODE_OPTIONS=--no-such-flag-margrave "$BUNDLE/bin/margrave" --help > /dev/null
+
+          # Started by a path that contains a slash, wrap prints that path as
+          # given (Homebrew's wrapper relies on this): through a symlink it keeps
+          # the symlink path, not the real path. Started by a bare name from
+          # PATH, it prints the real path instead; that case is not checked here.
+          "$BUNDLE/bin/margrave" wrap generic > "$RUNNER_TEMP/wrap.txt"
+          if ! grep -qxF "$BUNDLE/bin/margrave mcp" "$RUNNER_TEMP/wrap.txt"; then
+            echo "::error::wrap generic does not print $BUNDLE/bin/margrave mcp: $(cat "$RUNNER_TEMP/wrap.txt")"
+            exit 1
+          fi
+          ln -sf "$BUNDLE/bin/margrave" "$RUNNER_TEMP/margrave-link"
+          "$RUNNER_TEMP/margrave-link" wrap generic > "$RUNNER_TEMP/wrap-link.txt"
+          if ! grep -qxF "$RUNNER_TEMP/margrave-link mcp" "$RUNNER_TEMP/wrap-link.txt"; then
+            echo "::error::wrap generic through a symlink does not print $RUNNER_TEMP/margrave-link mcp: $(cat "$RUNNER_TEMP/wrap-link.txt")"
+            exit 1
+          fi
 
           # One license directory per production dependency, plus Node's own.
           GOT_LICENSES=0
@@ -318,14 +336,16 @@ jobs:
   # and bin/margrave, then publishes the bundle as `bundle-macos-arm64`. The
   # trust differs. ripwire is signed only as a byte-identical copy of the
   # pinned upstream release. bin/margrave is built by the bundle job from this
-  # commit (repo source, production dependencies, and the Node from .nvmrc) and
-  # has no upstream copy to compare with, so the Team ID vouches for this
-  # repo's build; `attest` attests its build provenance. It is built with
-  # execArgvExtension none and carries only the two entitlements in
-  # .github/entitlements.plist. There is no unsigned fallback: when the
-  # signing setup is missing or notarization fails, this job fails and so does
-  # the whole release. Secrets are set only on the steps that use them. No step
-  # runs code from the bundle while key material (keychain, p12, p8) exists.
+  # commit (repo source, its production dependencies, the Node from .nvmrc,
+  # and the build tooling in devDependencies such as tsrs and esbuild, which
+  # all run in that job) and has no upstream copy to compare with, so the
+  # Team ID vouches for this repo's build; `attest` attests its build
+  # provenance. It is built with execArgvExtension none and carries only the
+  # two entitlements in .github/entitlements.plist. There is no unsigned
+  # fallback: when the signing setup is missing or notarization fails, this job
+  # fails and so does the whole release. Secrets are set only on the steps that
+  # use them. No step runs code from the bundle while key material (keychain,
+  # p12, p8) exists.
   sign-macos:
     runs-on: macos-latest
     timeout-minutes: 30
@@ -551,15 +571,13 @@ jobs:
             echo "::error::The signed margrave has no TeamIdentifier"
             exit 1
           fi
-          # Only the two entitlements of the plist may be present: no dylib
-          # injection.
-          ENTITLEMENTS=$(codesign -d --entitlements :- "$MARGRAVE_BIN" 2>/dev/null)
-          if ! grep -q 'com.apple.security.cs.allow-jit' <<< "$ENTITLEMENTS"; then
-            echo "::error::The signed margrave lacks the allow-jit entitlement"
-            exit 1
-          fi
-          if grep -Eq 'disable-library-validation|allow-dyld-environment-variables' <<< "$ENTITLEMENTS"; then
-            echo "::error::The signed margrave carries an entitlement that allows dylib injection"
+          # The signed entitlements must equal the plist exactly: no other
+          # entitlement (for example dylib injection or get-task-allow) slips in.
+          codesign -d --entitlements - --xml "$MARGRAVE_BIN" > "$RUNNER_TEMP/signed-entitlements.plist" 2>/dev/null
+          SIGNED=$(plutil -convert json -o - "$RUNNER_TEMP/signed-entitlements.plist" | jq -S -c .)
+          WANTED=$(plutil -convert json -o - .github/entitlements.plist | jq -S -c .)
+          if [[ "$SIGNED" != "$WANTED" ]]; then
+            echo "::error::The signed margrave entitlements $SIGNED differ from .github/entitlements.plist $WANTED"
             exit 1
           fi
           codesign --verify --strict --verbose=2 "$BIN"
@@ -840,7 +858,7 @@ jobs:
             - **Package** (`margrave-v${{ steps.get_version.outputs.VERSION }}.tgz`): the npm package without ripwire. Run `node <package dir>/scripts/ensure-ripwire.mjs` to vendor the pinned ripwire, or put a `ripwire` of the same version or newer on `PATH`. Needs Node 24 or newer.
             - **Homebrew** (macOS arm64, Linux): `brew install valksor/tap/margrave`; needs no Node.
 
-            Upgrading from 0.1.x: point your `margrave` symlink at `margrave/bin/margrave`, and run `margrave wrap <agent>` again; old agent configs start `node .../dist/cli.js`, which no longer exists.
+            Upgrading a bundle or Homebrew install from 0.1.2 or earlier: first, if you symlinked a bundle, point that symlink at `margrave/bin/margrave` (`ln -sf`). Then run `margrave wrap <agent>` again and apply its output, because old agent configs start `node .../dist/cli.js`, which no longer exists. The README section "Upgrading from 0.1.2 or earlier" has the exact commands.
 
             The macOS bundle's `margrave` and ripwire are signed with a Developer ID and notarized, so a browser download works when the Mac is online at its first run. Offline, see the README.
 

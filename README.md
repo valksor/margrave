@@ -56,13 +56,6 @@ The Linux bundles embed the official glibc build of Node. A musl host (Alpine) o
 
 `~/.local/bin` must be on `PATH`. If it is not, add `export PATH="$HOME/.local/bin:$PATH"` to your shell's rc file and open a new shell.
 
-#### Upgrading from 0.1.x
-
-The bundle no longer has `dist/cli.js`. Do both of these:
-
-1. Point the old `~/.local/bin/margrave` symlink at `margrave/bin/margrave`.
-2. Run `margrave wrap <agent>` again and apply its output. Old agent configs run `node .../dist/cli.js mcp`, which no longer exists.
-
 Package:
 
 ```sh
@@ -70,6 +63,13 @@ pnpm add -g ./margrave-v<version>.tgz
 ```
 
 On macOS, the bundle's `margrave` and ripwire are signed with a Developer ID and notarized. Gatekeeper checks the notarization online at the first run, so a browser download that you use offline can still be blocked. In that case, run `gh attestation verify` on the file first, extract that same file, then clear the quarantine flag on the bundled `margrave` and ripwire only: `xattr -d com.apple.quarantine margrave/bin/margrave margrave/vendor/ripwire/ripwire`.
+
+#### Upgrading from 0.1.2 or earlier
+
+The bundle, and so the Homebrew install, no longer has `dist/cli.js`. In this order:
+
+1. Bundle only: point the old symlink at the new binary, from the directory you extracted the new bundle in: `ln -sf "$PWD/margrave/bin/margrave" ~/.local/bin/margrave`. Homebrew updates its own `margrave` command.
+2. Run `margrave wrap <agent>` again and apply its output. Old agent configs run `node .../dist/cli.js mcp`, which no longer exists. Bundle users: run it as `~/.local/bin/margrave wrap <agent>`, so the config keeps the symlink path and survives the next bundle upgrade; run by name, it prints the bundle's real location.
 
 ## 2. Install a skill source
 
