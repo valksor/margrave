@@ -6,7 +6,7 @@ Thank you for your interest in contributing to margrave. Contributions are welco
 
 ### Prerequisites
 
-- Node 24 or newer. The repo pins `26.13.0` in `.nvmrc`: run `nvm use`. The release binary embeds that Node version.
+- Node 24 or newer. The repo pins `26.13.1` in `.nvmrc`: run `nvm use`. The release binary embeds that Node version.
 - pnpm 12. The repo pins the exact version in the `packageManager` field of `package.json`; enable [corepack](https://nodejs.org/api/corepack.html) to use it:
   ```bash
   corepack enable
