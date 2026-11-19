@@ -11,3 +11,5 @@ allowBuilds:
   lefthook: false
   # esbuild's platform binary comes from optionalDependencies, so the postinstall is not needed.
   esbuild: false
+minimumReleaseAgeExclude:
+  - knip@6.46.1

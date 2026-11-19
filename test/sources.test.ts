@@ -780,6 +780,8 @@ test("check scans valid skills alongside a skipped invalid skill", async (t) => 
     const checked = await checkSources(id);
     assert.equal(checked[0]?.error, null);
     assert.deepEqual(checked[0]?.added, []);
+    assert.deepEqual(checked[0]?.changed, []);
+    assert.deepEqual(checked[0]?.removed, []);
     assert.equal(await read(home, "sources.json"), before);
     assert.deepEqual(indexRows(home), rows);
   });
