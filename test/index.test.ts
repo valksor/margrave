@@ -7,7 +7,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { MAX_QUERY_TERMS } from "../src/bm25.ts";
-import { findSkills, resolveSkill } from "../src/skills.ts";
+import { findSkills, formatFind, resolveSkill } from "../src/skills.ts";
 import { installSource, localId, reindexAll, removeSource, updateSources } from "../src/sources.ts";
 import { deleteSourceSkills, home as storeHome, insertSkills, openIndexRead, openIndexWrite } from "../src/store.ts";
 import type { NewEntry, SourceRecord } from "../src/store.ts";
@@ -51,12 +51,12 @@ function useHome(t: { after: (fn: () => void) => void }, h: string): void {
 }
 
 /** Rank in a fresh store each call (the caller has pointed MARGRAVE_HOME somewhere that it restores). */
-async function ranked(entries: NewEntry[], task: string, limit?: number): Promise<{ id: string; score: number }[]> {
+async function ranked(entries: NewEntry[], task: string, limit?: number, explain = false): Promise<{ id: string; score: number }[]> {
   process.env["MARGRAVE_HOME"] = await tmp("mg-home-");
   await seedIndex(entries);
   const db = await openIndexRead();
   try {
-    return findSkills(db, task, limit).map((h) => ({ id: h.id, score: h.score }));
+    return findSkills(db, task, limit, explain).map((h) => ({ id: h.id, score: h.score }));
   } finally {
     db.close();
   }
@@ -119,6 +119,21 @@ test("a query with no tokens skips the text search; only an exact name or id mat
   const entries = [newEntry("s", "of", "the and of words"), newEntry("s", "other", "of of of")];
   // "of" and "the" are stopwords, so there is no token and no MATCH.
   assert.deepEqual(ids(await ranked(entries, "of")), ["s/of"]);
+  const db = await openIndexRead();
+  try {
+    const hit = findSkills(db, "of", undefined, true)[0];
+    assert.equal(hit?.exact, true);
+    assert.equal(hit?.recommended, true);
+    assert.deepEqual(hit?.matchedTerms, { name: [], description: [], headings: [], body: [] });
+    const exactId = findSkills(db, "S/OF", undefined, true);
+    assert.equal(exactId[0]?.id, "s/of");
+    const text = formatFind(exactId);
+    assert.match(text, /exact name or id/u);
+    assert.doesNotMatch(text, /matches in/u);
+    assert.match(text, /load: margrave load s\/of/u);
+  } finally {
+    db.close();
+  }
   assert.deepEqual(await ranked(entries, "the"), []);
   assert.deepEqual(await ranked(entries, ""), []);
   assert.deepEqual(await ranked(entries, "   "), []);
@@ -151,11 +166,35 @@ test("the limit cuts the result list", async (t) => {
   assert.equal((await ranked(entries, "shared words")).length, 4);
 });
 
+test("a recommendation below a higher-scoring weak match survives the limit", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  const entries = [
+    newEntry("s", "rare", "unrelated"),
+    newEntry("s", "target", "unrelated", "rare common extra"),
+    ...Array.from({ length: 8 }, (_, i) => newEntry("s", `filler${i}`, "unrelated", "common extra")),
+  ];
+  await seedIndex(entries);
+  const db = await openIndexRead();
+  try {
+    const hits = findSkills(db, "rare common extra", 25, true);
+    const weak = hits.find((hit) => hit.id === "s/rare");
+    const recommended = hits.find((hit) => hit.id === "s/target");
+    assert.equal(weak?.recommended, false);
+    assert.equal(recommended?.recommended, true);
+    assert.ok((weak?.score ?? 0) > (recommended?.score ?? 0));
+    assert.equal(findSkills(db, "rare common extra", 1)[0]?.id, "s/target");
+  } finally {
+    db.close();
+  }
+});
+
 test("tokens named like Object.prototype members rank like any other token", async (t) => {
   useHome(t, await tmp("mg-home-"));
   const hits = await ranked(
     [newEntry("s", "a-skill", "explains the constructor pattern and toString"), newEntry("s", "b-skill", "other")],
     "constructor valueOf",
+    undefined,
+    true,
   );
   assert.deepEqual(ids(hits), ["s/a-skill"]);
   assert.ok(Number.isFinite(hits[0]?.score));
@@ -173,7 +212,7 @@ test("a 10,000-term task uses at most 32 terms and returns fast", async (t) => {
   const db = await openIndexRead();
   try {
     const started = performance.now();
-    const hits = findSkills(db, task, undefined);
+    const hits = findSkills(db, task, undefined, true);
     const ms = performance.now() - started;
     assert.deepEqual(ids(hits), ["s/first"], "terms after the 32nd are dropped");
     assert.ok(ms < 1000, `took ${ms} ms`);
@@ -186,13 +225,13 @@ test("the term cap is exact: the 32nd distinct token matches and the 33rd does n
   useHome(t, await tmp("mg-home-"));
   const task = Array.from({ length: 40 }, (_, i) => `word${i}`).join(" ");
   const entries = [newEntry("s", "inside", "has word31 in it"), newEntry("s", "outside", "has word32 in it")];
-  assert.deepEqual(ids(await ranked(entries, task)), ["s/inside"]);
+  assert.deepEqual(ids(await ranked(entries, task, undefined, true)), ["s/inside"]);
 });
 
 test("query text never reaches the SQL: quotes, operators, and FTS syntax are plain tokens or dropped", async (t) => {
   useHome(t, await tmp("mg-home-"));
   const entries = [newEntry("s", "alpha", "alpha near beta"), newEntry("s", "it's", "quote name")];
-  assert.deepEqual(ids(await ranked(entries, `alpha" OR "x' ; DROP TABLE skills; -- NEAR(a b) * ^nomatch:`)), ["s/alpha"]);
+  assert.deepEqual(ids(await ranked(entries, `alpha" OR "x' ; DROP TABLE skills; -- NEAR(a b) * ^nomatch:`, undefined, true)), ["s/alpha"]);
   assert.deepEqual(ids(await ranked(entries, "it's")), ["s/it's"]);
   const db = await openIndexRead();
   try {

@@ -127,6 +127,18 @@ test("hosted: find, load, read, and request errors, with no server path in any t
     isError: false,
     text: "no match\ntry other words",
   });
+  const weakQuery = "repair a toaster with Terraform";
+  assert.deepEqual(await call(client, "find_skills", { task: weakQuery }), { isError: false, text: "no match\ntry other words" });
+  const weak = await call(client, "find_skills", { task: weakQuery, explain: true });
+  assert.equal(weak.isError, false);
+  assert.match(weak.text, /weak match/u);
+  assert.match(weak.text, /matches in name \(terraform\)/u);
+  assert.doesNotMatch(weak.text, /load:/u);
+  noPaths(weak.text);
+  const explained = await call(client, "find_skills", { task: "terraform modules", explain: true });
+  assert.match(explained.text, /matches in name \(modul, terraform\)/u);
+  assert.match(explained.text, /load: call load_skill/u);
+  noPaths(explained.text);
 
   const loaded = await call(client, "load_skill", { id });
   assert.equal(loaded.isError, false);

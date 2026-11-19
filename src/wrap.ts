@@ -10,7 +10,7 @@ export const AGENTS = ["claude", "codex", "bb", "generic"] as const;
 export type Agent = (typeof AGENTS)[number];
 
 export const SNIPPET =
-  'Installed skills are available on demand through margrave. Before a task in an unfamiliar domain, tool, or framework, run `margrave find "<task in plain words>"` (or the find_skills MCP tool). Then run `margrave load <id>` (or load_skill) for the best match and follow it.';
+  'Installed skills are available on demand through margrave. Before a task in an unfamiliar domain, tool, or framework, run `margrave find "<task in plain words>"` (or the find_skills MCP tool). Run `margrave load <id>` (or load_skill) only for a recommended result.';
 
 export interface WrapInput {
   /** Executable to run: the margrave binary, or node. */

@@ -25,7 +25,7 @@ const USAGE = `usage: margrave <command>
   update [source] [--allow-unsafe]            refresh one source, or all
   remove <source>                             remove a source (never deletes a local directory)
   list [--skills] [--json]                    list sources, and with --skills every skill
-  find "<task>" [--limit N] [--json]          rank installed skills for a task
+  find "<task>" [--limit N] [--json] [--explain]  rank installed skills for a task
   load <id> [--json]                          print one skill
   load <id> --file <path>                     print one file inside a skill directory
   reindex                                     rescan all sources
@@ -136,7 +136,7 @@ async function run(argv: string[]): Promise<void> {
       return;
     }
     case "find": {
-      const p = parse(rest, { limit: { type: "string" }, json: { type: "boolean" } });
+      const p = parse(rest, { limit: { type: "string" }, json: { type: "boolean" }, explain: { type: "boolean" } });
       const words = positionals(p, 1, Number.POSITIVE_INFINITY, 'find "<task>"');
       const task = words.join(" ");
       const c = await loadContext();
@@ -146,7 +146,7 @@ async function run(argv: string[]): Promise<void> {
         return;
       }
       try {
-        const hits = findSkills(c.db, task, p.values["limit"]);
+        const hits = findSkills(c.db, task, p.values["limit"], p.values["explain"] === true);
         if (p.values["json"] === true) json({ task, results: hits });
         else out(formatFind(hits));
       } finally {

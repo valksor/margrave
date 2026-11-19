@@ -107,6 +107,15 @@ export function tokenize(input: string): string[] {
 
 /** The four space-joined token strings of one skill, one per FTS column. */
 export type TokenStrings = Record<Field, string>;
+export type MatchedTerms = Record<Field, string[]>;
+
+/** Test indexed evidence for a non-exact search candidate. Such a candidate has at least one query term. */
+export function hasRecommendationEvidence(terms: readonly string[], matched: MatchedTerms): boolean {
+  if (terms.length === 1) return matched.name.length > 0;
+  const all = new Set(FIELDS.flatMap((field) => matched[field]));
+  const prominent = new Set([...matched.name, ...matched.description, ...matched.headings]);
+  return all.size === terms.length || (prominent.size >= 2 && prominent.size * 3 >= terms.length);
+}
 
 /** Build the token strings for one skill. Body is cut to its first 2000 tokens; duplicates stay, so term frequency is kept. */
 export function buildFieldTokens(parts: { name: string; description: string; headings: readonly string[]; body: string }): TokenStrings {

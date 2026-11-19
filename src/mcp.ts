@@ -9,10 +9,10 @@ import { RequestError } from "./store.ts";
 import type { IndexEntry } from "./store.ts";
 
 export const SERVER_INSTRUCTIONS =
-  "This server gives access to installed skills that the agent does not load by default. Before a task in an unfamiliar domain, tool, or framework, call find_skills with the task in plain words. Call load_skill with the best id. Call read_skill_file for a file that the skill names.";
+  "This server gives access to installed skills that the agent does not load by default. Before a task in an unfamiliar domain, tool, or framework, call find_skills with the task in plain words. Call load_skill only for a recommended result. Call read_skill_file for a file that the skill names.";
 
 export const FIND_DESCRIPTION =
-  "Find installed skills for a task. Give the task in plain words. Returns ranked skill ids with descriptions. Use load_skill to read one.";
+  "Find recommended installed skills for a task in plain words. Use explain to see matching terms and weak matches. Use load_skill only for a recommended result.";
 export const LOAD_DESCRIPTION =
   "Load the instructions of one skill. Use an id from find_skills. Returns the skill text, its source, and its base directory.";
 export const READ_DESCRIPTION =
@@ -91,14 +91,14 @@ export function createServer(variant: Variant = LOCAL): McpServer {
     "find_skills",
     {
       description: FIND_DESCRIPTION,
-      inputSchema: { task: z.string(), limit: z.number().int().optional() },
+      inputSchema: { task: z.string(), limit: z.number().int().optional(), explain: z.boolean().optional() },
     },
-    async ({ task, limit }) => {
+    async ({ task, limit, explain }) => {
       try {
         const ctx = await loadContext();
         if (ctx === null) return ok(variant.noSources);
         try {
-          return ok(formatFind(findSkills(ctx.db, task, limit), variant.findText));
+          return ok(formatFind(findSkills(ctx.db, task, limit, explain), variant.findText));
         } finally {
           ctx.db.close();
         }

@@ -38,14 +38,14 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   assert.equal(client.getInstructions(), SERVER_INSTRUCTIONS);
   assert.equal(
     SERVER_INSTRUCTIONS,
-    "This server gives access to installed skills that the agent does not load by default. Before a task in an unfamiliar domain, tool, or framework, call find_skills with the task in plain words. Call load_skill with the best id. Call read_skill_file for a file that the skill names.",
+    "This server gives access to installed skills that the agent does not load by default. Before a task in an unfamiliar domain, tool, or framework, call find_skills with the task in plain words. Call load_skill only for a recommended result. Call read_skill_file for a file that the skill names.",
   );
   const tools = (await client.listTools()).tools;
   assert.deepEqual(tools.map((x) => x.name).sort(), ["find_skills", "load_skill", "read_skill_file"]);
   const desc = Object.fromEntries(tools.map((x) => [x.name, x.description]));
   assert.equal(
     desc["find_skills"],
-    "Find installed skills for a task. Give the task in plain words. Returns ranked skill ids with descriptions. Use load_skill to read one.",
+    "Find recommended installed skills for a task in plain words. Use explain to see matching terms and weak matches. Use load_skill only for a recommended result.",
   );
   assert.equal(
     desc["load_skill"],
