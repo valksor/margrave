@@ -17,11 +17,20 @@ Skills are not loaded into the agent by default, so 1000+ installed skills cost 
 
 The release bundles and the Homebrew formula need no Node. The npm package and a build from source need Node 24 or newer. The repo pins `26.13.1` in `.nvmrc`: `nvm use` selects it, and the release binary embeds that version.
 
+### From source
+
+If you already have a `margrave-dev` wrapper in `~/.local/bin`, move it aside before creating the symlink.
+
 ```sh
-nvm use && pnpm install --frozen-lockfile && pnpm run build && pnpm add -g "$PWD"
+nvm use && pnpm install --frozen-lockfile && pnpm run build:sea
+mkdir -p ~/.local/bin
+ln -s "$PWD/build/dev/bin/margrave-dev" ~/.local/bin/margrave-dev
+margrave-dev version
 ```
 
-`pnpm run build` also makes sure ripwire is available (see [Where ripwire comes from](#where-ripwire-comes-from)). `pnpm add -g` needs pnpm's global bin directory on `PATH`. If it is not there yet, run `pnpm setup` once and open a new shell.
+Add `~/.local/bin` to `PATH` if needed. Create the symlink once. Later builds update its target. Each development binary reports the package version with a `-dirty` suffix. The executable reads its version and finds the vendored ripwire through the bundle layout. See [Where ripwire comes from](#where-ripwire-comes-from).
+
+If an older install from this checkout with `pnpm add -g "$PWD"` still shadows Homebrew, remove it with `pnpm remove -g margrave`.
 
 ### From a release
 
@@ -338,7 +347,7 @@ margrave never deletes `index.db`. If `index.db` is not a margrave index (for ex
 ```sh
 nvm use && pnpm install --frozen-lockfile
 pnpm run build  # tsrs, chmod +x dist/cli.js, then scripts/ensure-ripwire.mjs
-pnpm run build:sea  # build, then bundle it into the standalone binary build/margrave
+pnpm run build:sea  # build the standalone development binary at build/dev/bin/margrave-dev
 pnpm test       # node --test test/ under c8 (runs the .ts sources directly; no network, temp MARGRAVE_HOME); fails when line, branch, function, or statement coverage of src/ is below 100%
 ```
 

@@ -40,7 +40,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "tsrs --noEmit",
-    "build:sea": "pnpm run build && node scripts/build-sea.mjs",
+    "build:sea": "pnpm run build && node scripts/build-sea.mjs --dev",
     "knip": "knip"
   },
   "dependencies": {
