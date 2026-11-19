@@ -188,6 +188,7 @@ export function runMcp(): Promise<void> {
   const value = process.env["MARGRAVE_ALLOWED_SOURCES"];
   const ids = value === undefined ? undefined : value.trim() === "" ? [] : value.split(",").map((id) => id.trim());
   const allowedSources = validateAllowedSources(ids, "MARGRAVE_ALLOWED_SOURCES must contain comma-separated source IDs");
-  serveStdio(() => buildServer(LOCAL, allowedSources, process.env["MARGRAVE_SKILLS_SH"] === "1"), { legacy: "reject" });
+  // Local agent hosts (Claude Code, Codex, bb) still open with an older protocol revision: serve them.
+  serveStdio(() => buildServer(LOCAL, allowedSources, process.env["MARGRAVE_SKILLS_SH"] === "1"), { legacy: "serve" });
   return Promise.resolve();
 }

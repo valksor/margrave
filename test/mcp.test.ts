@@ -317,16 +317,24 @@ test("stdio source allowlists scope search and both reads", async (t) => {
   }
 });
 
-test("stdio rejects an older protocol negotiation", () => {
-  const request = {
-    jsonrpc: "2.0",
-    id: 1,
-    method: "initialize",
-    params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1" } },
-  };
-  const result = spawnSync(process.execPath, [CLI, "mcp"], { input: `${JSON.stringify(request)}\n`, encoding: "utf8" });
-  assert.equal(result.status, 0, result.stderr);
-  const response = JSON.parse(result.stdout) as { id: number; error: { code: number } };
-  assert.equal(response.id, 1);
-  assert.equal(response.error.code, -32022);
+test("stdio serves a client that opens with an older protocol revision", () => {
+  for (const protocolVersion of ["2025-11-25", "2025-06-18"]) {
+    const request = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion, capabilities: {}, clientInfo: { name: "test", version: "1" } },
+    };
+    const result = spawnSync(process.execPath, [CLI, "mcp"], { input: `${JSON.stringify(request)}\n`, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout.split("\n")[0] ?? "") as {
+      id: number;
+      result?: { protocolVersion: string; serverInfo: { name: string } };
+      error?: unknown;
+    };
+    assert.equal(response.id, 1);
+    assert.equal(response.error, undefined);
+    assert.equal(response.result?.protocolVersion, protocolVersion);
+    assert.equal(response.result?.serverInfo.name, "margrave");
+  }
 });
