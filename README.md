@@ -25,7 +25,7 @@ If you already have a `margrave-dev` wrapper in `~/.local/bin`, move it aside be
 nvm use && pnpm install --frozen-lockfile && pnpm run build:sea
 mkdir -p ~/.local/bin
 ln -s "$PWD/build/dev/bin/margrave-dev" ~/.local/bin/margrave-dev
-margrave-dev version
+~/.local/bin/margrave-dev version
 ```
 
 Add `~/.local/bin` to `PATH` if needed. Create the symlink once. Later builds update its target. Each development binary reports the package version with a `-dirty` suffix. The executable reads its version and finds the vendored ripwire through the bundle layout. See [Where ripwire comes from](#where-ripwire-comes-from).
