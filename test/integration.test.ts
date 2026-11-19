@@ -710,6 +710,15 @@ test("usage errors exit 2, unknown commands exit 2, and find/list say when no so
   assert.equal((await mg(env, ["remove", "x"])).code, 1);
 });
 
+test("version, --version, and -v print the version", async () => {
+  const env = await setup();
+  for (const args of [["version"], ["--version"], ["-v"]]) {
+    const r = await mg(env, args);
+    assert.equal(r.code, 0);
+    assert.match(r.stdout, /^margrave \d+\.\d+\.\d+/u);
+  }
+});
+
 test("a malformed index.db is an error that says to move it aside, and reindex then rebuilds it", async () => {
   const env = await setup();
   const dir = await tmp("mg-localsrc-");

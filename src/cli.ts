@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // margrave CLI. Exit codes: 0 ok, 1 error, 2 usage.
 import { parseArgs } from "node:util";
-import { runMcp } from "./mcp.ts";
+import { runMcp, version } from "./mcp.ts";
 import {
   NO_SOURCES_MESSAGE,
   clean,
@@ -31,6 +31,7 @@ const USAGE = `usage: margrave <command>
   reindex                                     rescan all sources
   mcp                                         run the stdio MCP server
   wrap <claude|codex|bb|generic>              print setup text for an agent
+  version                                     print the version
 `;
 
 type Parsed = ReturnType<typeof parseArgs>;
@@ -65,6 +66,10 @@ async function run(argv: string[]): Promise<void> {
   if (command === undefined) throw new UsageError("missing command");
   if (command === "--help" || command === "-h" || command === "help") {
     out(USAGE);
+    return;
+  }
+  if (command === "--version" || command === "-v" || command === "version") {
+    out(`margrave ${version()}`);
     return;
   }
   const ctx = (allowUnsafe: boolean): Ctx => ({ log: err, allowUnsafe });
