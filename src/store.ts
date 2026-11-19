@@ -59,7 +59,6 @@ export const stagingRoot = (): string => path.join(home(), "staging");
 export const reportsRoot = (): string => path.join(home(), "reports");
 export const sourcesFile = (): string => path.join(home(), "sources.json");
 export const indexDbFile = (): string => path.join(home(), "index.db");
-const legacyIndexFile = (): string => path.join(home(), "index.json");
 
 export async function ensureDirs(): Promise<void> {
   await mkdir(sourcesRoot(), { recursive: true });
@@ -99,7 +98,7 @@ export function isRecord(v: unknown): v is Record<string, unknown> {
 }
 
 function validSnapshot(v: Record<string, unknown>): boolean {
-  if (v["snapshot"] === undefined) return true;
+  if (v["kind"] === "local") return v["snapshot"] === undefined;
   return (
     v["kind"] === "git" &&
     typeof v["snapshot"] === "string" &&
@@ -118,7 +117,8 @@ function validSource(v: unknown): v is SourceRecord {
   if (v["commit"] !== null && typeof v["commit"] !== "string") return false;
   if (typeof v["installedAt"] !== "string") return false;
   if (!validSnapshot(v)) return false;
-  if (v["kind"] === "git") return typeof v["url"] === "string";
+  if (v["kind"] === "git")
+    return typeof v["url"] === "string" && typeof v["ref"] === "string" && /^refs\/(?:heads|tags)\/.+/u.test(v["ref"]);
   return typeof v["path"] === "string";
 }
 
@@ -175,10 +175,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(name, description, headings, b
 PRAGMA user_version = ${SCHEMA_VERSION};
 `;
 
-const legacyMessage = (): string => "index.json is from an older margrave; run: margrave reindex";
 // A schema-less file (user_version 0, no tables): reindex can fill it.
 const invalidMessage = (file: string): string => `${file} is not a valid margrave index; run: margrave reindex`;
-// Not ours, or damaged (including user_version 0 with tables, and user_version 1 with a table missing): margrave never deletes it, so the user moves it aside.
+// Foreign or damaged indexes are never deleted; the user moves them aside.
 const foreignMessage = (file: string): string => `${file} is not a margrave index; move it aside, then run: margrave reindex`;
 const unfinishedWriteMessage = (file: string): string =>
   `${file} has an unfinished write from a stopped margrave process; run: margrave reindex`;
@@ -198,14 +197,9 @@ async function statIndexDb(file: string): Promise<Stats | null> {
   return st;
 }
 
-/** The guard for a store that has sources: the index must exist and must not be older than a legacy index.json. */
-async function requireCurrentIndex(file: string, st: Stats | null): Promise<void> {
-  const legacy = await lstatIfExists(legacyIndexFile());
-  if (st === null) {
-    throw new MargraveError(legacy === null ? "index.db is missing; run: margrave reindex" : legacyMessage());
-  }
-  // An older margrave wrote index.json after the upgrade: its skills are not in index.db.
-  if (legacy !== null && legacy.mtimeMs >= st.mtimeMs) throw new MargraveError(legacyMessage());
+/** The guard for a store that has sources: the index must exist. */
+function requireCurrentIndex(st: Stats | null): void {
+  if (st === null) throw new MargraveError("index.db is missing; run: margrave reindex");
 }
 
 interface OpenOptions {
@@ -219,7 +213,7 @@ interface Probe {
 }
 
 /**
- * Reads the version and schema of an open database. Only versions 0, 1, and 2 are recognized.
+ * Reads the version and schema of an open database. Only versions 0 and 2 are recognized.
  * So is user_version 0 with any schema object: margrave creates its schema in one transaction, so another program wrote it.
  */
 function readProbe(db: DatabaseSync, file: string): Probe {
@@ -238,7 +232,7 @@ function readProbe(db: DatabaseSync, file: string): Probe {
     fts: number | bigint;
   };
   const version = Number(counts.user_version);
-  if (version !== 0 && version !== 1 && version !== SCHEMA_VERSION) throw new MargraveError(foreignMessage(file));
+  if (version !== 0 && version !== SCHEMA_VERSION) throw new MargraveError(foreignMessage(file));
   if (version === 0 && Number(counts.total) > 0) throw new MargraveError(foreignMessage(file));
   if (
     version !== 0 &&
@@ -247,8 +241,7 @@ function readProbe(db: DatabaseSync, file: string): Probe {
       Number(counts.base_columns) !== 9 ||
       Number(counts.fts) !== 1 ||
       Number(counts.fts_columns) !== 4 ||
-      (version === 1 && Number(counts.extra_columns) !== 0) ||
-      (version === 2 && Number(counts.extra_columns) !== 2))
+      Number(counts.extra_columns) !== 2)
   )
     throw new MargraveError(foreignMessage(file));
   return { version };
@@ -284,18 +277,17 @@ function openCurrent(file: string, options: OpenOptions): DatabaseSync {
   const { db, probe } = openProbed(file, options);
   if (probe.version === SCHEMA_VERSION) return db;
   db.close();
-  if (probe.version === 1) throw new MargraveError("the skill index uses an older schema; run: margrave reindex");
   // Version 0 has no schema: reindex can fill it.
   throw new MargraveError(invalidMessage(file));
 }
 
 /**
  * Open index.db for reading: read-only, one connection per call. The caller closes it.
- * Throws a MargraveError for a missing, legacy, or invalid index.
+ * Throws a MargraveError for a missing or invalid index.
  */
 export async function openIndexRead(): Promise<DatabaseSync> {
   const file = indexDbFile();
-  await requireCurrentIndex(file, await statIndexDb(file));
+  requireCurrentIndex(await statIndexDb(file));
   return openCurrent(file, { readOnly: true, timeout: READ_TIMEOUT_MS });
 }
 
@@ -304,12 +296,11 @@ export async function openIndexRead(): Promise<DatabaseSync> {
  * "existing": the index must exist and be complete (a store that has sources).
  * "create": a write into a store with no sources. A missing file, or a file with user_version 0 and no
  * tables (including 0 bytes), is initialized in place under the write lock. A file that is not ours is refused.
- * "reindex": also opens a complete version 1 index for migration by the caller.
  */
-export async function openIndexWrite(mode: "existing" | "create" | "reindex"): Promise<DatabaseSync> {
+export async function openIndexWrite(mode: "existing" | "create"): Promise<DatabaseSync> {
   const file = indexDbFile();
   const st = await statIndexDb(file);
-  if (mode === "existing") await requireCurrentIndex(file, st);
+  if (mode === "existing") requireCurrentIndex(st);
   // The first open waits as long as a reader would. Then the busy timeout goes up for the write lock.
   const options = { readBigInts: true, timeout: READ_TIMEOUT_MS };
   // requireCurrentIndex() threw for a missing file, so the file is there.
@@ -319,15 +310,10 @@ export async function openIndexWrite(mode: "existing" | "create" | "reindex"): P
     await mkdir(home(), { recursive: true });
     const opened = st === null ? null : openProbed(file, options);
     db = setWriterPragmas(opened === null ? new DatabaseSync(file, options) : opened.db);
-    if (opened?.probe.version === 1) {
-      if (mode !== "reindex") throw new MargraveError("the skill index uses an older schema; run: margrave reindex");
-      return db;
-    }
     // The schema is checked again under the lock: a second creator that waited finds it complete and changes nothing.
     db.exec("BEGIN IMMEDIATE");
     const now = readProbe(db, file);
     if (now.version === 0) db.exec(SCHEMA);
-    else if (now.version === 1) throw new MargraveError("the skill index uses an older schema; run: margrave reindex");
     db.exec("COMMIT");
     return db;
   } catch (err) {
@@ -343,19 +329,8 @@ function setWriterPragmas(db: DatabaseSync): DatabaseSync {
   return db;
 }
 
-/** Remove a legacy index.json. Called after a reindex COMMIT. */
-export async function removeLegacyIndex(): Promise<void> {
-  await rm(legacyIndexFile(), { force: true });
-}
-
 export function deleteAllSkills(db: DatabaseSync): void {
   db.exec("DELETE FROM fts; DELETE FROM skills");
-}
-
-export function migrateSkillIndex(db: DatabaseSync): void {
-  db.exec(
-    "ALTER TABLE skills ADD COLUMN manifest TEXT NOT NULL DEFAULT '[]'; ALTER TABLE skills ADD COLUMN frontmatter TEXT NOT NULL DEFAULT ''; PRAGMA user_version = 2",
-  );
 }
 
 export function deleteSourceSkills(db: DatabaseSync, source: string): void {

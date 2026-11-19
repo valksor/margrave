@@ -1,7 +1,7 @@
 // index.db: ranking, the upgrade and validity guard, locking, and concurrent writes.
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
-import fsp, { chmod, mkdir, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import fsp, { chmod, mkdir, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -311,57 +311,15 @@ async function setup(): Promise<{ home: string; fakeBin: string; dir: string; id
   return { home, fakeBin, dir, id: /^installed (\S+)/mu.exec(inst.stdout)?.[1] ?? "", mg };
 }
 
-const LEGACY = /index\.json is from an older margrave; run: margrave reindex/u;
 const INVALID = /index\.db is not a valid margrave index; run: margrave reindex/u;
 
-test("a store with only a legacy index.json: find, list, install, update, remove all say so and write nothing; reindex fixes it", async () => {
-  const s = await setup();
-  await rm(path.join(s.home, "index.db"));
-  await writeFile(path.join(s.home, "index.json"), '{"version":1,"skills":[],"stats":{}}');
-  const sourcesBefore = await readFile(path.join(s.home, "sources.json"), "utf8");
-  const other = await tmp("mg-localsrc2-");
-  await writeSkill(other, "beta", "beta skill");
-
-  for (const args of [["find", "alpha"], ["list"], ["load", "x"], ["install", other], ["update", s.id], ["update"], ["remove", s.id]]) {
-    const r = await s.mg(args);
-    assert.equal(r.code, 1, args.join(" "));
-    assert.match(r.stderr, LEGACY, args.join(" "));
-  }
-  assert.deepEqual((await readdir(s.home)).filter((n) => n.startsWith("index")).sort(), ["index.json"], "nothing was created");
-  assert.equal(await readFile(path.join(s.home, "sources.json"), "utf8"), sourcesBefore);
-
-  const re = await s.mg(["reindex"]);
-  assert.equal(re.code, 0, re.stderr);
-  assert.deepEqual((await readdir(s.home)).filter((n) => n.startsWith("index")).sort(), ["index.db"], "index.json is gone");
-  assert.equal((await s.mg(["find", "alpha"])).code, 0);
-  assert.deepEqual(indexIds(s.home), [`${s.id}/alpha`]);
-});
-
-test("an index.json newer than index.db means an older margrave wrote it: the legacy error; an older one is ignored", async () => {
+test("a loose index.json is ignored and remains untouched", async () => {
   const s = await setup();
   const json = path.join(s.home, "index.json");
-  await writeFile(json, "{}");
-  const future = new Date(Date.now() + 60_000);
-  await utimes(json, future, future);
-  const other = await localSource("beta");
-  for (const args of [
-    ["find", "alpha"],
-    ["install", other.dir],
-  ]) {
-    const r = await s.mg(args);
-    assert.equal(r.code, 1, args.join(" "));
-    assert.match(r.stderr, LEGACY, args.join(" "));
-  }
-  // The same mtime counts as newer: an older margrave that wrote index.json in the same instant must not go unnoticed.
-  const same = new Date(Date.now() - 120_000);
-  await utimes(json, same, same);
-  await utimes(path.join(s.home, "index.db"), same, same);
-  assert.match((await s.mg(["find", "alpha"])).stderr, LEGACY);
-  const past = new Date(Date.now() - 3_600_000);
-  await utimes(json, past, past);
+  await writeFile(json, "legacy bytes");
   assert.equal((await s.mg(["find", "alpha"])).code, 0);
   assert.equal((await s.mg(["reindex"])).code, 0);
-  assert.equal((await readdir(s.home)).includes("index.json"), false);
+  assert.equal(await readFile(json, "utf8"), "legacy bytes");
 });
 
 const FOREIGN = /index\.db is not a margrave index; move it aside, then run: margrave reindex/u;
@@ -518,7 +476,7 @@ test("a version 2 index with incomplete FTS columns is rejected", async (t) => {
   db.exec("DROP TABLE fts; CREATE VIRTUAL TABLE fts USING fts5(name)");
   db.close();
   await assert.rejects(openIndexRead(), /not a margrave index/u);
-  await assert.rejects(openIndexWrite("reindex"), /not a margrave index/u);
+  await assert.rejects(openIndexWrite("create"), /not a margrave index/u);
   const missingIndex = new DatabaseSync(path.join(s.home, "index.db"));
   missingIndex.exec("DROP TABLE fts; CREATE VIRTUAL TABLE fts USING fts5(name, description, headings, body); DROP INDEX skills_source");
   missingIndex.close();
@@ -544,7 +502,7 @@ test("a version 1 schema committed before the create lock is rejected", async (t
     return realExec.call(this, sql);
   });
   t.after(() => mock.restoreAll());
-  await assert.rejects(openIndexWrite("create"), /older schema; run: margrave reindex/u);
+  await assert.rejects(openIndexWrite("create"), /not a margrave index/u);
   assert.equal(fired, true);
 });
 
@@ -707,7 +665,7 @@ test("update with no argument prints a guard error once, not once per source", a
   await writeFile(path.join(s.home, "index.json"), "{}");
   const r = await s.mg(["update"]);
   assert.equal(r.code, 1);
-  assert.equal(r.stderr.match(/index\.json is from an older margrave/gu)?.length, 1, r.stderr);
+  assert.equal(r.stderr.match(/index\.db is missing; run: margrave reindex/gu)?.length, 1, r.stderr);
 });
 
 test("two first-time installs of different sources into an empty store both survive", { timeout: 60_000 }, async () => {
@@ -785,27 +743,6 @@ test("a store directory that cannot be inspected is an error that names index.db
   useHome(t, file);
   assert.equal(storeHome(), file);
   await assert.rejects(openIndexRead(), /cannot read .*index\.db: /u);
-});
-
-test("an index.json that cannot be inspected is an error, not taken as absent: the legacy check never passes on EACCES", async (t) => {
-  const home = await tmp("mg-home-");
-  useHome(t, home);
-  await seedIndex([newEntry("s", "a")]);
-  const real = fsp.lstat;
-  mock.method(fsp, "lstat", (p: string, ...rest: never[]) =>
-    p.endsWith("index.json") ? Promise.reject(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })) : real(p, ...rest),
-  );
-  syncBuiltinESMExports();
-  t.after(() => {
-    mock.restoreAll();
-    syncBuiltinESMExports();
-  });
-  await assert.rejects(openIndexRead(), /cannot read .*index\.json: EACCES/u);
-  await assert.rejects(openIndexWrite("existing"), /cannot read .*index\.json: EACCES/u);
-  // Only ENOENT means "no legacy file".
-  mock.restoreAll();
-  syncBuiltinESMExports();
-  (await openIndexRead()).close();
 });
 
 test("a missing index.db with sources says to run reindex", async () => {
@@ -1018,42 +955,18 @@ test("a reader during an open write transaction gets the old results with no err
   }
 });
 
-test("v1 migration rolls back scan and schema failures and can be retried", async (t) => {
+test("schema 1 is rejected without changing the database", async (t) => {
   const s = await setup();
   useHome(t, s.home);
   const file = path.join(s.home, "index.db");
   const db = new DatabaseSync(file);
   db.exec("ALTER TABLE skills DROP COLUMN manifest; ALTER TABLE skills DROP COLUMN frontmatter; PRAGMA user_version = 1");
   db.close();
-  const before = indexRows(s.home);
-  const checkOld = () => {
-    const old = new DatabaseSync(file);
-    assert.equal((old.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 1);
-    assert.deepEqual(old.prepare("SELECT id, name, source, hash FROM skills ORDER BY id").all(), before);
-    old.close();
-  };
-  await assert.rejects(openIndexRead(), /older schema; run: margrave reindex/u);
-  await assert.rejects(openIndexWrite("create"), /older schema; run: margrave reindex/u);
-  await rename(s.dir, `${s.dir}-hidden`);
-  await assert.rejects(reindexAll(quiet), /source is unreadable/u);
-  checkOld();
-  await rename(`${s.dir}-hidden`, s.dir);
-  mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
-    if (sql.startsWith("ALTER TABLE skills ADD COLUMN")) {
-      realExec.call(this, sql);
-      throw new Error("forced migration failure");
-    }
-    return realExec.call(this, sql);
-  });
-  t.after(() => mock.restoreAll());
-  await assert.rejects(reindexAll(quiet), /forced migration failure/u);
-  mock.restoreAll();
-  checkOld();
-  await reindexAll(quiet);
-  const upgraded = new DatabaseSync(file);
-  assert.equal((upgraded.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 2);
-  assert.equal((upgraded.prepare("SELECT count(*) AS n FROM skills WHERE manifest <> ''").get() as { n: number }).n, 1);
-  upgraded.close();
+  const before = await readFile(file);
+  await assert.rejects(openIndexRead(), /not a margrave index/u);
+  await assert.rejects(openIndexWrite("existing"), /not a margrave index/u);
+  await assert.rejects(reindexAll(quiet), /not a margrave index/u);
+  assert.deepEqual(await readFile(file), before);
 });
 
 test("a selected revision reports an operational read error and an index change", async (t) => {

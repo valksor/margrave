@@ -11,13 +11,11 @@ import {
   installMode,
   logWarnings,
   parseSpec,
-  qualifiedRef,
   resolveScanRoot,
   scanInstalledSource,
   sourceDir,
   switchAlias,
   toEntries,
-  trackingRef,
 } from "./sources.ts";
 import type { Ctx } from "./sources.ts";
 import {
@@ -222,13 +220,12 @@ export async function exportLock(selected: string[]): Promise<LockFile> {
   try {
     const locked: LockedSource[] = [];
     for (const rec of targets) {
-      const ref = rec.ref !== null && qualifiedRef(rec.ref) ? rec.ref : (await trackingRef(rec, true)).ref;
       locked.push({
         spec: rec.spec,
         id: rec.id,
         url: rec.url as string,
         subpath: rec.subpath,
-        ref,
+        ref: rec.ref as string,
         commit: rec.commit as string,
         skills: lockInventory(indexedEntries(db, rec.id)),
       });
@@ -294,10 +291,6 @@ async function ensureRestoreAlias(rec: SourceRecord, destination: string): Promi
     if (err.code === "ENOENT") return null;
     throw err;
   });
-  if (rec.snapshot === undefined) {
-    if (existing?.isDirectory()) return;
-    throw new MargraveError(`installed source differs from the lock: ${rec.id}`);
-  }
   if (existing === null) {
     await switchAlias(rec.id, null, destination);
     return;

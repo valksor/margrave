@@ -11,7 +11,7 @@ import type { ManifestEntry } from "./scan.ts";
 import { clean, cleanBlock, shellQuote } from "./text.ts";
 export { listFiles, readSkillFile } from "./skill-files.ts";
 export { clean, cleanBlock, shellQuote } from "./text.ts";
-import { MargraveError, RequestError, home, openIndexRead, readSources, sourcesRoot } from "./store.ts";
+import { MargraveError, RequestError, home, openIndexRead, readSources } from "./store.ts";
 import type { IndexEntry, SourceRecord } from "./store.ts";
 
 export const NO_SOURCES_MESSAGE = "no skill sources installed; run: margrave install <owner/repo|path>";
@@ -186,19 +186,12 @@ export interface LoadResult {
 }
 
 async function gitSelectionChanged(entry: IndexEntry, mismatch: boolean): Promise<boolean> {
-  const legacy = path.join(sourcesRoot(), entry.source);
   const snapshots = path.join(home(), "snapshots", entry.source);
-  const inLegacy = entry.dir === legacy || entry.dir.startsWith(`${legacy}${path.sep}`);
-  if (!inLegacy && (!mismatch || !entry.dir.startsWith(`${snapshots}${path.sep}`))) return false;
+  if (!mismatch || !entry.dir.startsWith(`${snapshots}${path.sep}`)) return false;
   const source = (await readSources()).find((s) => s.id === entry.source);
   if (source?.kind !== "git") return false;
-  if (inLegacy && source.snapshot !== undefined) return true;
-  if (!mismatch) return false;
-  const selected = source.snapshot === undefined ? legacy : path.join(snapshots, source.snapshot);
-  return (
-    (entry.dir !== selected && !entry.dir.startsWith(`${selected}${path.sep}`)) ||
-    (selected === legacy && (await lstat(legacy).catch(() => null))?.isSymbolicLink() === true)
-  );
+  const selected = path.join(snapshots, source.snapshot as string);
+  return entry.dir !== selected && !entry.dir.startsWith(`${selected}${path.sep}`);
 }
 
 export async function readSelectedFile(entry: IndexEntry, rel: string, revision?: string): Promise<string> {

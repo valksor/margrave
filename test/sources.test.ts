@@ -268,8 +268,19 @@ test("a sources.json that cannot be read for a reason other than ENOENT is an er
 test("every field of a source record is checked", async (t) => {
   const h = await tmp("mg-home-");
   useHome(t, h);
-  const good = { id: "o__r", kind: "git", spec: "o/r", url: "u", subpath: "", ref: null, commit: null, installedAt: "now" };
-  await writeFile(path.join(h, "sources.json"), JSON.stringify([good, { ...good, id: "l", kind: "local", path: "/p" }]));
+  const good = {
+    id: "o__r",
+    kind: "git",
+    spec: "o/r",
+    url: "u",
+    subpath: "",
+    ref: "refs/heads/main",
+    commit: "a".repeat(40),
+    snapshot: `${"a".repeat(40)}-${"b".repeat(16)}`,
+    installedAt: "now",
+  };
+  const local = { id: "l", kind: "local", spec: "/p", path: "/p", subpath: "", ref: null, commit: null, installedAt: "now" };
+  await writeFile(path.join(h, "sources.json"), JSON.stringify([good, local]));
   assert.equal((await readSources()).length, 2);
 
   const { url: _url, ...noUrl } = good;
@@ -285,8 +296,10 @@ test("every field of a source record is checked", async (t) => {
     "commit is neither null nor a string": { ...good, commit: 1 },
     "installedAt is not a string": { ...good, installedAt: 1 },
     "a git record without url": noUrl,
-    "a local record without path": { ...good, kind: "local" },
-    "snapshot on a local source": { ...good, kind: "local", path: "/p", snapshot: `${"a".repeat(40)}-${"b".repeat(16)}` },
+    "a local record without path": { ...local, path: undefined },
+    "snapshot on a local source": { ...local, snapshot: `${"a".repeat(40)}-${"b".repeat(16)}` },
+    "git record without snapshot": { ...good, snapshot: undefined },
+    "git record with short ref": { ...good, ref: "main" },
     "snapshot traversal": { ...good, commit: "a".repeat(40), snapshot: `../${"a".repeat(40)}-${"b".repeat(16)}` },
     "snapshot commit mismatch": { ...good, commit: "c".repeat(40), snapshot: `${"a".repeat(40)}-${"b".repeat(16)}` },
     "snapshot nonce malformed": { ...good, commit: "a".repeat(40), snapshot: `${"a".repeat(40)}-${"B".repeat(16)}` },
@@ -501,7 +514,7 @@ test("reindex: when sources.json cannot be written, the rows roll back, and a le
     passRename();
     assert.deepEqual(await reindexAll(quiet), { skills: 2, sources: 1 });
     assert.equal(indexIds(home).length, 2);
-    assert.equal(await read(home, "index.json"), null, "the legacy file goes after a COMMIT");
+    assert.equal(await read(home, "index.json"), "legacy");
   });
 });
 
@@ -614,7 +627,7 @@ test("reindex: control characters in a failure message are logged as text", asyn
   });
 });
 
-test("reindex preserves unreadable source rows and migration rejects an unreadable supporting directory", async (t) => {
+test("reindex preserves unreadable source rows", async (t) => {
   const prev = process.env["MARGRAVE_HOME"];
   const home = await tmp("mg-home-");
   process.env["MARGRAVE_HOME"] = home;
@@ -656,14 +669,6 @@ test("reindex preserves unreadable source rows and migration rejects an unreadab
   );
   assert.notEqual(after.find((row) => row.name === "beta")?.hash, rows.find((row) => row.name === "beta")?.hash);
   assert.match(logs.join("\n"), /denied/u);
-  const db = new DatabaseSync(path.join(home, "index.db"));
-  db.exec("ALTER TABLE skills DROP COLUMN manifest; ALTER TABLE skills DROP COLUMN frontmatter; PRAGMA user_version = 1");
-  db.close();
-  await assert.rejects(reindexAll({ log: () => {}, allowUnsafe: false }), /source is unreadable/u);
-  const old = new DatabaseSync(path.join(home, "index.db"));
-  assert.equal((old.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 1);
-  assert.equal((old.prepare("SELECT count(*) AS n FROM skills").get() as { n: number }).n, 2);
-  old.close();
   mock.restoreAll();
   syncBuiltinESMExports();
   await reindexAll({ log: () => {}, allowUnsafe: false });
@@ -723,70 +728,19 @@ test("a reader keeps the selected snapshot during publication", async (t) => {
   });
 });
 
-test("legacy Git directories reindex, update and remove", async (t) => {
+test("Git records without a snapshot are rejected", async (t) => {
   await inStore(t, async (home) => {
     const repo = await makeRepo();
     const { id } = await installSource(repo.url, null, quiet);
-    const alias = path.join(home, "sources", id);
-    const target = await fsp.realpath(alias);
-    await fsp.unlink(alias);
-    await fsp.rename(target, alias);
     const records = await readSources();
     delete records[0]!.snapshot;
     await writeFile(path.join(home, "sources.json"), JSON.stringify(records));
-    assert.equal((await reindexAll(quiet)).skills, 3);
-    const skill = `${id}/react-perf`;
-    const oldRevision = indexRows(home).find((row) => row.id === skill)!.hash;
-    const oldText = await readFile(path.join(alias, "skills", "react-perf", "SKILL.md"), "utf8");
-    await writeSkill(path.join(repo.dir, "skills"), "react-perf", "new description", "new content\n");
-    await git(repo.dir, "add", "-A");
-    await git(repo.dir, "commit", "-qm", "legacy update");
-    let release!: () => void;
-    let reached!: () => void;
-    const paused = new Promise<void>((resolve) => {
-      reached = resolve;
-    });
-    const resume = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const real = fsp.rename;
-    mock.method(fsp, "rename", async (from: string, to: string) => {
-      if (to === path.join(home, "sources.json")) {
-        reached();
-        await resume;
-      }
-      return real(from, to);
-    });
-    syncBuiltinESMExports();
-    const updating = updateSources(id, quiet);
-    try {
-      await Promise.race([
-        paused,
-        updating.then(() => {
-          throw new Error("writer completed before pause");
-        }),
-      ]);
-      const reader = await runCli(["load", skill, "--file", "SKILL.md", "--revision", oldRevision], { home });
-      assert.ok(reader.code === 0 || reader.stderr.includes("skill revision changed; search again"), reader.stderr);
-      if (reader.code === 0) assert.equal(reader.stdout, oldText);
-    } finally {
-      release();
-      await updating;
-      passRename();
-    }
-    assert.equal((await fsp.lstat(alias)).isSymbolicLink(), true);
-    assert.equal((await reindexAll(quiet)).skills, 3);
-    await removeSource(id);
-    assert.equal((await readdir(path.join(home, "snapshots", id))).length, 0);
-    await installSource(repo.url, null, quiet);
-    const installed = await fsp.realpath(alias);
-    await fsp.unlink(alias);
-    await fsp.rename(installed, alias);
-    const legacy = await readSources();
-    delete legacy[0]!.snapshot;
-    await writeFile(path.join(home, "sources.json"), JSON.stringify(legacy));
-    await removeSource(id);
-    await assert.rejects(fsp.lstat(alias), /ENOENT/u);
+    const before = await readFile(path.join(home, "index.db"));
+    await assert.rejects(readSources(), /malformed/u);
+    await assert.rejects(reindexAll(quiet), /malformed/u);
+    await assert.rejects(updateSources(id, quiet), /malformed/u);
+    await assert.rejects(removeSource(id), /malformed/u);
+    assert.deepEqual(await readFile(path.join(home, "index.db")), before);
   });
 });
 

@@ -16,11 +16,9 @@ import {
   ensureDirs,
   insertSkills,
   home,
-  migrateSkillIndex,
   openIndexRead,
   openIndexWrite,
   readSources,
-  removeLegacyIndex,
   skillHashes,
   sourcesRoot,
   stagingRoot,
@@ -152,9 +150,8 @@ export function sourceDir(id: string): string {
 
 /** Resolve a record only within its own snapshot directory. */
 function gitDir(rec: SourceRecord): string {
-  const legacy = sourceDir(rec.id);
-  if (rec.snapshot === undefined) return legacy;
-  return path.join(home(), "snapshots", rec.id, rec.snapshot);
+  sourceDir(rec.id);
+  return path.join(home(), "snapshots", rec.id, rec.snapshot as string);
 }
 
 async function switchAlias(
@@ -174,9 +171,7 @@ async function switchAlias(
     if (existing !== null) throw duplicate(id);
   } else if (
     existing !== null &&
-    (previous.snapshot === undefined
-      ? !existing.isDirectory()
-      : !existing.isSymbolicLink() || (await readlink(alias)) !== path.relative(path.dirname(alias), gitDir(previous)))
+    (!existing.isSymbolicLink() || (await readlink(alias)) !== path.relative(path.dirname(alias), gitDir(previous)))
   ) {
     throw duplicate(id);
   }
@@ -197,7 +192,6 @@ async function switchAlias(
   return {
     rollback: async () => {
       if (moved) {
-        if (existing?.isDirectory() === true && next !== null) await rm(alias, { force: true });
         await rename(aside, alias);
       } else if (next !== null) await rm(alias, { force: true });
     },
@@ -289,7 +283,7 @@ async function validateGitRef(ref: string, message?: string): Promise<void> {
 }
 
 async function remoteRefs(url: string, ref: string): Promise<Map<string, string>> {
-  const names = qualifiedRef(ref) ? [ref] : [`refs/heads/${ref}`, `refs/tags/${ref}`];
+  const names = [ref];
   let output: string;
   try {
     output = await git(["ls-remote", "--", url, ...names, ...names.map((name) => `${name}^{}`)]);
@@ -308,22 +302,13 @@ async function remoteRefs(url: string, ref: string): Promise<Map<string, string>
   return found;
 }
 
-async function trackingRef(rec: SourceRecord, check: boolean): Promise<{ ref: string; sha: string }> {
-  const ref = rec.ref;
-  if (ref === null) throw new MargraveError("source tracking ref is unresolved; run margrave update <source> --ref <fully-qualified-ref>");
-  if (qualifiedRef(ref)) await validateGitRef(ref);
+async function trackingRef(rec: SourceRecord): Promise<string> {
+  const ref = rec.ref as string;
+  await validateGitRef(ref);
   const refs = await remoteRefs(rec.url as string, ref);
-  if (qualifiedRef(ref)) {
-    const sha = refs.get(ref);
-    if (sha === undefined) throw new MargraveError("remote tracking ref was not found");
-    return { ref, sha };
-  }
-  const matches = [...refs];
-  if (matches.length !== 1 || (check && matches[0]?.[1] !== rec.commit)) {
-    throw new MargraveError("source tracking ref is unresolved; run margrave update <source> --ref <fully-qualified-ref>");
-  }
-  const [name, sha] = matches[0] as [string, string];
-  return { ref: name, sha };
+  const sha = refs.get(ref);
+  if (sha === undefined) throw new MargraveError("remote tracking ref was not found");
+  return sha;
 }
 
 async function withStaging<T>(fn: (stage: string) => Promise<T>): Promise<T> {
@@ -401,7 +386,7 @@ async function checkIndex(sources: readonly SourceRecord[]): Promise<void> {
  * `mode` is "create" for a store with no sources or a reindex: a missing index, or one with user_version 0, is initialized.
  */
 async function commit(
-  mode: "existing" | "create" | "reindex",
+  mode: "existing" | "create",
   change: (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[] | undefined | Promise<SourceRecord[] | undefined>,
   rollback?: () => Promise<void>,
 ): Promise<void> {
@@ -598,7 +583,7 @@ export async function updateSources(
 ): Promise<{ results: UpdateResult[]; errors: { id: string; message: string }[] }> {
   if (ref !== null && arg === null) throw new UsageError("update --ref requires one Git source");
   const sources = await readSources();
-  // A missing, legacy, or invalid index fails once here, not once per source.
+  // A missing or invalid index fails once here, not once per source.
   if (arg === null) await checkIndex(sources);
   const targets = arg === null ? sources : [findSource(sources, arg)];
   await validateUpdateRef(ref, targets[0]);
@@ -653,7 +638,8 @@ async function updateOne(id: string, ctx: Ctx, ref: string | null): Promise<Upda
   // readSources() only returns a git record with a url.
   const url = rec.url as string;
 
-  const selected = ref ?? (await trackingRef(rec, false)).ref;
+  const selected = (ref ?? rec.ref) as string;
+  await validateGitRef(selected);
   return withStaging(async (stage) => {
     const clone = path.join(stage, "repo");
     const sha = await gitClone(url, selected, clone);
@@ -694,7 +680,7 @@ async function updateOne(id: string, ctx: Ctx, ref: string | null): Promise<Upda
       throw err;
     }
     if (alias?.retired !== null && alias?.retired !== undefined) await rm(alias.retired, { recursive: true, force: true });
-    if (rec.snapshot !== undefined) await rm(gitDir(rec), { recursive: true, force: true });
+    await rm(gitDir(rec), { recursive: true, force: true });
     return { id, kind: "git" as const, oldCommit: rec.commit, newCommit: sha, ...(diff.value as ReturnType<typeof diffEntries>) };
   });
 }
@@ -754,9 +740,9 @@ export async function checkSources(arg: string | null): Promise<CheckResult[]> {
         const entries = await scanInstalledSource(rec, { log: () => {}, allowUnsafe: false });
         Object.assign(result, diffEntries(before, entries));
         if (rec.kind === "git") {
-          const remote = await trackingRef(rec, true);
-          result.newCommit = remote.sha;
-          result.updateAvailable = remote.sha !== rec.commit;
+          const remote = await trackingRef(rec);
+          result.newCommit = remote;
+          result.updateAvailable = remote !== rec.commit;
         }
       } catch (err) {
         result.error = err instanceof Error ? err.message : String(err);
@@ -798,7 +784,7 @@ export async function removeSource(arg: string): Promise<SourceRecord> {
     },
   );
   if (alias?.retired !== null && alias?.retired !== undefined) await rm(alias.retired, { recursive: true, force: true });
-  if (removed?.kind === "git" && removed.snapshot !== undefined) await rm(gitDir(removed), { recursive: true, force: true });
+  if (removed?.kind === "git") await rm(gitDir(removed), { recursive: true, force: true });
 
   return removed as SourceRecord;
 }
@@ -837,11 +823,6 @@ function applyReindex(sources: readonly SourceRecord[], scan: ReindexScan, fresh
   if (JSON.stringify(fresh) !== JSON.stringify(sources)) {
     throw new MargraveError("sources changed during reindex; run: margrave reindex");
   }
-  const version = Number((db.prepare("PRAGMA user_version").get() as { user_version: number | bigint }).user_version);
-  if (version === 1) {
-    if (scan.failed.size > 0) throw new MargraveError("cannot upgrade the skill index while a source is unreadable");
-    migrateSkillIndex(db);
-  }
   if (scan.failed.size === 0) deleteAllSkills(db);
   else for (const rec of sources) if (!scan.failed.has(rec.id)) deleteSourceSkills(db, rec.id);
   insertSkills(db, scan.entries);
@@ -851,9 +832,7 @@ function applyReindex(sources: readonly SourceRecord[], scan: ReindexScan, fresh
 export async function reindexAll(ctx: Ctx): Promise<{ skills: number; sources: number }> {
   const sources = await readSources();
   const scan = await scanInstalledSources(sources, ctx);
-  await commit("reindex", (fresh, db) => applyReindex(sources, scan, fresh, db));
-  // After the commit only: if the reindex fails, the old index stays.
-  await removeLegacyIndex();
+  await commit("create", (fresh, db) => applyReindex(sources, scan, fresh, db));
   return { skills: scan.entries.length, sources: sources.length };
 }
 
@@ -886,4 +865,4 @@ export async function listSources(
   }
 }
 
-export { commit, git, gitDir, installMode, logWarnings, qualifiedRef, scanInstalledSource, switchAlias, toEntries, trackingRef };
+export { commit, git, gitDir, installMode, logWarnings, scanInstalledSource, switchAlias, toEntries };

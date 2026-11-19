@@ -307,7 +307,7 @@ test("check reports local additions, removals, and supporting file changes", asy
   assert.equal((await mg(env, ["update", id, "--ref", "refs/heads/main"])).code, 2);
 });
 
-test("legacy short refs resolve only when safe", async () => {
+test("stored short refs are rejected while short install refs remain supported", async () => {
   const env = await setup();
   const repo = await makeRepo();
   await git(repo.dir, "branch", "legacy");
@@ -316,24 +316,16 @@ test("legacy short refs resolve only when safe", async () => {
   const id = sourceId(inst);
   const file = path.join(env.home, "sources.json");
   const records = JSON.parse(await readFile(file, "utf8")) as { ref: string }[];
-  assert.ok(records[0]);
+  assert.equal(records[0]?.ref, "refs/heads/legacy");
   records[0].ref = "legacy";
   await writeFile(file, JSON.stringify(records));
-  assert.equal((await mg(env, ["check", id])).code, 0);
-  await git(repo.dir, "tag", "-a", "legacy", "-m", "tag");
-  const ambiguous = await mg(env, ["check", id]);
-  assert.equal(ambiguous.code, 1);
-  assert.match(ambiguous.stderr, /source tracking ref is unresolved/u);
-  assert.equal((await mg(env, ["update", id])).code, 1);
-  await git(repo.dir, "tag", "-d", "legacy");
-  await writeSkill(path.join(repo.dir, "skills"), "added", "A new skill");
-  await git(repo.dir, "add", "-A");
-  await git(repo.dir, "commit", "-qm", "new commit");
-  await git(repo.dir, "branch", "-f", "legacy", "HEAD");
-  assert.equal((await mg(env, ["check", id])).code, 1);
-  const updated = await mg(env, ["update", id]);
-  assert.equal(updated.code, 0, updated.stderr);
-  assert.equal((JSON.parse(await readFile(file, "utf8")) as { ref: string }[])[0]?.ref, "refs/heads/legacy");
+  const before = await readFile(path.join(env.home, "index.db"));
+  for (const args of [["check", id], ["update", id], ["reindex"], ["lock", "export"]]) {
+    const result = await mg(env, args);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /malformed/u);
+  }
+  assert.deepEqual(await readFile(path.join(env.home, "index.db")), before);
 });
 
 test("a failed install leaves no staging, no store dir, and no sources.json change", async () => {
@@ -1449,38 +1441,22 @@ for (const aliasState of ["missing", "incorrect"] as const) {
   });
 }
 
-test("lock restore validates a legacy source directory", async () => {
+test("lock export rejects a Git record without a snapshot", async () => {
   const env = await setup();
   const repo = await makeRepo();
   const installed = await mg(env, ["install", repo.url]);
   assert.equal(installed.code, 0, installed.stderr);
-  const id = sourceId(installed);
-  const alias = path.join(env.home, "sources", id);
   const recordsFile = path.join(env.home, "sources.json");
   const records = JSON.parse(await readFile(recordsFile, "utf8")) as { snapshot?: string }[];
-  const destination = await realpath(alias);
-  await rm(alias);
-  await rename(destination, alias);
   delete records[0]!.snapshot;
   await writeFile(recordsFile, JSON.stringify(records));
-  const reindexed = await mg(env, ["reindex"]);
-  assert.equal(reindexed.code, 0, reindexed.stderr);
-  const exported = await mg(env, ["lock", "export"]);
-  assert.equal(exported.code, 0, exported.stderr);
-  const file = path.join(await tmp(), "lock.json");
-  await writeFile(file, exported.stdout);
-  const restored = await mg(env, ["lock", "restore", file]);
-  assert.equal(restored.code, 0, restored.stderr);
-  assert.equal(restored.stdout, `already restored ${id}\n`);
-  const moved = path.join(env.home, "legacy-source");
-  await rename(alias, moved);
-  await link(moved, alias);
-  const conflict = await mg(env, ["lock", "restore", file]);
-  assert.equal(conflict.code, 1);
-  assert.match(conflict.stderr, /installed source differs from the lock/u);
-  assert.equal(conflict.stdout, "");
-  assert.equal(await readlink(alias), moved);
-  assert.ok((await stat(moved)).isDirectory());
+  const before = await readFile(path.join(env.home, "index.db"));
+  for (const args of [["reindex"], ["lock", "export"]]) {
+    const result = await mg(env, args);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /malformed/u);
+  }
+  assert.deepEqual(await readFile(path.join(env.home, "index.db")), before);
 });
 
 test("lock validation and staging failures do not publish", async () => {
