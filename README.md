@@ -248,7 +248,7 @@ Limit: the baseline compares the flagged line, not the lines around it. A known 
 
 ## MCP server
 
-`margrave/hosted` requires a client that supports MCP protocol revision `2026-07-28`. `margrave mcp` (stdio) also serves clients that open with an older revision the MCP SDK supports (for example `2025-06-18`), so current local agent hosts can start it.
+`margrave mcp` (stdio) and `margrave/hosted` speak MCP protocol revision `2026-07-28` and also serve clients that open with an older revision the MCP SDK supports (for example `2025-06-18`); hosted serves those statelessly, one request at a time.
 
 `margrave mcp` is read-only. `install`, `update`, and `remove` are not exposed. It opens `index.db` on every call, so a new install shows up without a restart. After upgrading Margrave, restart running `margrave mcp` sessions.
 

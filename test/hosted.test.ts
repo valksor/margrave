@@ -392,20 +392,32 @@ test("hosted source options isolate requests on the same store", async (t) => {
   }
 });
 
-test("hosted rejects an older protocol negotiation", async () => {
-  const response = await handleHostedMcp(
-    new Request("http://test/mcp", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "initialize",
-        params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1" } },
+test("hosted serves a client that opens with an older protocol revision", async () => {
+  for (const protocolVersion of ["2025-11-25", "2025-06-18"]) {
+    const response = await handleHostedMcp(
+      new Request("http://test/mcp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion, capabilities: {}, clientInfo: { name: "test", version: "1" } },
+        }),
       }),
-    }),
-  );
-  const body = (await response.json()) as { id: number; error: { code: number } };
-  assert.equal(body.id, 1);
-  assert.equal(body.error.code, -32022);
+    );
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    // A stateless 2025 answer may come as one server-sent event: take its data line.
+    const json = text.trimStart().startsWith("{") ? text : (text.split("\n").find((line) => line.startsWith("data: ")) ?? "").slice(6);
+    const body = JSON.parse(json) as {
+      id: number;
+      result?: { protocolVersion: string; serverInfo: { name: string } };
+      error?: unknown;
+    };
+    assert.equal(body.id, 1);
+    assert.equal(body.error, undefined);
+    assert.equal(body.result?.protocolVersion, protocolVersion);
+    assert.equal(body.result?.serverInfo.name, "margrave");
+  }
 });
