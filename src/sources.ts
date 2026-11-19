@@ -1,7 +1,7 @@
 // Source specs, git (execFile, no shell), staging, swap, local registration, reindex.
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
-import { lstat, mkdtemp, realpath, rename, rm, stat } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { lstat, mkdir, mkdtemp, readlink, realpath, rename, rm, stat, symlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -15,6 +15,7 @@ import {
   deleteSourceSkills,
   ensureDirs,
   insertSkills,
+  home,
   migrateSkillIndex,
   openIndexRead,
   openIndexWrite,
@@ -149,6 +150,61 @@ export function sourceDir(id: string): string {
   return dir;
 }
 
+/** Resolve a record only within its own snapshot directory. */
+function gitDir(rec: SourceRecord): string {
+  const legacy = sourceDir(rec.id);
+  if (rec.snapshot === undefined) return legacy;
+  return path.join(home(), "snapshots", rec.id, rec.snapshot);
+}
+
+async function switchAlias(
+  id: string,
+  previous: SourceRecord | null,
+  next: string | null,
+): Promise<{ rollback: () => Promise<void>; retired: string | null }> {
+  const alias = sourceDir(id);
+  const suffix = randomBytes(8).toString("hex");
+  const aside = `${alias}.${suffix}.old`;
+  const temp = `${alias}.${suffix}.new`;
+  const existing = await lstat(alias).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  });
+  if (previous === null) {
+    if (existing !== null) throw duplicate(id);
+  } else if (
+    existing !== null &&
+    (previous.snapshot === undefined
+      ? !existing.isDirectory()
+      : !existing.isSymbolicLink() || (await readlink(alias)) !== path.relative(path.dirname(alias), gitDir(previous)))
+  ) {
+    throw duplicate(id);
+  }
+  if (next !== null) await symlink(path.relative(path.dirname(alias), next), temp);
+  let moved = false;
+  try {
+    if (existing !== null) {
+      if (existing.isSymbolicLink() && next !== null) await symlink(await readlink(alias), aside);
+      else await rename(alias, aside);
+      moved = true;
+    }
+    if (next !== null) await rename(temp, alias);
+  } catch (err) {
+    if (moved) await rename(aside, alias);
+    await rm(temp, { force: true });
+    throw err;
+  }
+  return {
+    rollback: async () => {
+      if (moved) {
+        if (existing?.isDirectory() === true && next !== null) await rm(alias, { force: true });
+        await rename(aside, alias);
+      } else if (next !== null) await rm(alias, { force: true });
+    },
+    retired: moved ? aside : null,
+  };
+}
+
 /** Find a source by id, or by its original spec. */
 export function findSource(sources: readonly SourceRecord[], arg: string): SourceRecord {
   const byId = sources.find((s) => s.id === arg);
@@ -245,6 +301,25 @@ function toEntries(sourceId: string, skills: readonly ScannedSkill[], mapDir: (d
   }));
 }
 
+async function prepareSnapshot(
+  id: string,
+  sha: string,
+  clone: string,
+  realClone: string,
+  skills: readonly ScannedSkill[],
+): Promise<{
+  snapshot: string;
+  destination: string;
+  entries: NewEntry[];
+}> {
+  const snapshot = `${sha}-${randomBytes(8).toString("hex")}`;
+  const destination = path.join(home(), "snapshots", id, snapshot);
+  const entries = toEntries(id, skills, (d) => path.join(destination, path.relative(realClone, d)));
+  await mkdir(path.dirname(destination), { recursive: true });
+  await rename(clone, destination);
+  return { snapshot, destination, entries };
+}
+
 /** The index must be usable before the slow work (clone, scan) starts. A store with no sources has no index to check. */
 async function checkIndex(sources: readonly SourceRecord[]): Promise<void> {
   if (sources.length > 0) (await openIndexWrite("existing")).close();
@@ -257,13 +332,14 @@ async function checkIndex(sources: readonly SourceRecord[]): Promise<void> {
  */
 async function commit(
   mode: "existing" | "create" | "reindex",
-  change: (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[],
+  change: (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[] | Promise<SourceRecord[]>,
+  rollback?: () => Promise<void>,
 ): Promise<void> {
   const db = await openIndexWrite(mode);
   try {
     db.exec("BEGIN IMMEDIATE");
     const fresh = await readSources();
-    const next = change(fresh, db);
+    const next = await change(fresh, db);
     await writeSources(next);
     try {
       db.exec("COMMIT");
@@ -272,6 +348,7 @@ async function commit(
       throw err;
     }
   } catch (err) {
+    if (rollback !== undefined) await rollback();
     if (db.isTransaction) {
       try {
         db.exec("ROLLBACK");
@@ -387,7 +464,7 @@ async function installGit(
       throw new MargraveError(`no valid skills (SKILL.md with name and description) found in ${spec}`);
     }
     await scanWithRipwire(scanRoot, { ...ctx, sourceId: id, skills: scan.skills });
-    const entries = toEntries(id, scan.skills, (d) => path.join(final, path.relative(realClone, d)));
+    const { snapshot, destination, entries } = await prepareSnapshot(id, sha, clone, realClone, scan.skills);
     const record: SourceRecord = {
       id,
       kind: "git",
@@ -396,14 +473,25 @@ async function installGit(
       subpath: parsed.subpath,
       ref: pinned,
       commit: sha,
+      snapshot,
       installedAt: new Date().toISOString(),
     };
 
-    await rename(clone, final);
+    let alias: Awaited<ReturnType<typeof switchAlias>> | undefined;
     try {
-      await commit(await installMode(), addSource(record, entries));
+      await commit(
+        await installMode(),
+        async (fresh, db) => {
+          if (fresh.some((s) => s.id === id)) throw duplicate(id);
+          alias = await switchAlias(id, null, destination);
+          return addSource(record, entries)(fresh, db);
+        },
+        async () => {
+          await alias?.rollback();
+        },
+      );
     } catch (err) {
-      await rm(final, { recursive: true, force: true });
+      await rm(destination, { recursive: true, force: true });
       throw err;
     }
     return { id, skills: entries.map((e) => e.id) };
@@ -490,7 +578,6 @@ async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
   }
   // readSources() only returns a git record with a url.
   const url = rec.url as string;
-  const final = sourceDir(id);
 
   return withStaging(async (stage) => {
     const clone = path.join(stage, "repo");
@@ -503,27 +590,41 @@ async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
     logWarnings(ctx, scan.warnings);
     if (scan.skills.length === 0) throw new MargraveError(`no valid skills found in the new revision of ${id}; kept the old copy`);
     // The baseline: the installed copy, scanned before the swap. It is what the user accepted.
-    const baselineDir = await installedScanRoot(final, rec.subpath);
+    const baselineDir = await installedScanRoot(gitDir(rec), rec.subpath);
     await scanWithRipwire(scanRoot, { ...ctx, sourceId: id, skills: scan.skills, baselineDir });
-    const entries = toEntries(id, scan.skills, (d) => path.join(final, path.relative(realClone, d)));
-
-    // Swap: old dir aside, new dir in, then write. Roll back on failure.
-    const aside = path.join(stage, "old");
-    const hadOld = (await lstat(final).catch(() => null)) !== null;
-    if (hadOld) await rename(final, aside);
+    const { snapshot, destination, entries } = await prepareSnapshot(id, sha, clone, realClone, scan.skills);
+    let alias: Awaited<ReturnType<typeof switchAlias>> | undefined;
     try {
-      await rename(clone, final);
+      await commit(
+        "existing",
+        async (fresh, db) => {
+          const current = fresh.find((s) => s.id === id);
+          if (current === undefined) throw new MargraveError(`no source "${id}"`);
+          if (
+            current.kind !== "git" ||
+            current.snapshot !== rec.snapshot ||
+            current.commit !== rec.commit ||
+            current.installedAt !== rec.installedAt
+          ) {
+            throw new MargraveError("source changed during update; run margrave update again");
+          }
+          alias = await switchAlias(id, current, destination);
+          const before = skillHashes(db, id);
+          deleteSourceSkills(db, id);
+          insertSkills(db, entries);
+          diff.value = diffEntries(before, entries);
+          return fresh.map((s) => (s.id === id ? { ...s, commit: sha, snapshot } : s));
+        },
+        async () => {
+          await alias?.rollback();
+        },
+      );
     } catch (err) {
-      if (hadOld) await rename(aside, final);
+      await rm(destination, { recursive: true, force: true });
       throw err;
     }
-    try {
-      await commit("existing", replaceSource(id, entries, sha, diff));
-    } catch (err) {
-      await rm(final, { recursive: true, force: true });
-      if (hadOld) await rename(aside, final);
-      throw err;
-    }
+    if (alias?.retired !== null && alias?.retired !== undefined) await rm(alias.retired, { recursive: true, force: true });
+    if (rec.snapshot !== undefined) await rm(gitDir(rec), { recursive: true, force: true });
     return { id, kind: "git" as const, oldCommit: rec.commit, newCommit: sha, ...(diff.value as ReturnType<typeof diffEntries>) };
   });
 }
@@ -556,18 +657,25 @@ export async function removeSource(arg: string): Promise<SourceRecord> {
   const rec = findSource(sources, arg);
   await checkIndex(sources);
 
-  await commit("existing", (fresh, db) => {
-    // Another `remove` that ran while this one waited for the lock makes this fire.
-    if (!fresh.some((s) => s.id === rec.id)) throw new MargraveError(`no source "${rec.id}"; run: margrave list`);
-    deleteSourceSkills(db, rec.id);
-    return fresh.filter((s) => s.id !== rec.id);
-  });
-  // Local sources are only unregistered. The user's directory is never deleted.
-  if (rec.kind === "git") {
-    // Deletes only sources/<id>, after sourceDir() checked it is a direct child of sources/.
-    await rm(sourceDir(rec.id), { recursive: true, force: true });
-  }
-  return rec;
+  let removed: SourceRecord | undefined;
+  let alias: Awaited<ReturnType<typeof switchAlias>> | undefined;
+  await commit(
+    "existing",
+    async (fresh, db) => {
+      removed = fresh.find((s) => s.id === rec.id);
+      if (removed === undefined) throw new MargraveError(`no source "${rec.id}"; run: margrave list`);
+      if (removed.kind === "git") alias = await switchAlias(rec.id, removed, null);
+      deleteSourceSkills(db, rec.id);
+      return fresh.filter((s) => s.id !== rec.id);
+    },
+    async () => {
+      await alias?.rollback();
+    },
+  );
+  if (alias?.retired !== null && alias?.retired !== undefined) await rm(alias.retired, { recursive: true, force: true });
+  if (removed?.kind === "git" && removed.snapshot !== undefined) await rm(gitDir(removed), { recursive: true, force: true });
+
+  return removed as SourceRecord;
 }
 
 // ---- reindex ----
@@ -579,7 +687,7 @@ interface ReindexScan {
 
 async function scanInstalledSource(rec: SourceRecord, ctx: Ctx): Promise<NewEntry[]> {
   if (rec.kind === "local") return scanLocal(rec, ctx);
-  const dir = sourceDir(rec.id);
+  const dir = gitDir(rec);
   const root = await resolveScanRoot(dir, rec.subpath);
   const scan = await scanSource(root, { followSymlinks: false, boundary: dir, strict: true });
   logWarnings(ctx, scan.warnings);

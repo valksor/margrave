@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { chmod, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { atomicWrite } from "../src/store.ts";
@@ -90,7 +90,10 @@ test("git source via file://: install, duplicate, find, load, update, remove", a
   assert.equal(load.code, 0, load.stderr);
   assert.match(load.stdout, new RegExp(`^skill: ${id}/react-perf\\n`, "u"));
   assert.match(load.stdout, new RegExp(`commit: ${first}\\n`, "u"));
-  assert.match(load.stdout, new RegExp(`base: ${path.join(env.home, "sources", id, "skills", "react-perf")}\\n`, "u"));
+  assert.match(
+    load.stdout,
+    new RegExp(`base: ${path.join(env.home, "snapshots", id, String(rec[0]?.["snapshot"]), "skills", "react-perf")}\\n`, "u"),
+  );
   assert.match(
     load.stdout,
     /frontmatter:\n---\nname: react-perf\ndescription: .*\n---\nfiles:\n- SKILL\.md\nbody:\n# react-perf\n\nBody of react-perf\.\n$/u,
@@ -456,7 +459,7 @@ test("update with staging exit 3 refuses and shows ripwire's stderr", async () =
 
 test("update falls back to today's rules when the baseline scan fails", async () => {
   const m = await marked();
-  const failBaseline = { FAKE_RIPWIRE_FAIL_ON: "/sources/" };
+  const failBaseline = { FAKE_RIPWIRE_FAIL_ON: "/snapshots/" };
   // the known critical line counts as new without a baseline, so exit 2 refuses
   await setBody(m, [KNOWN_CRIT, KNOWN_WARN, "x"]);
   const r = await refusedUpdate(m, failBaseline);
@@ -473,14 +476,14 @@ test("update falls back to today's rules when the baseline scan fails", async ()
 
 test("update with no installed copy uses today's rules and prints the no-baseline line", async () => {
   const m = await marked();
-  await rm(path.join(m.env.home, "sources", m.id), { recursive: true });
+  await rm(await realpath(path.join(m.env.home, "sources", m.id)), { recursive: true });
   const before = await snapshot(m.env.home);
   const r = await mg(m.env, ["update", m.id]);
   assert.equal(r.code, 1, r.stderr);
   assert.match(r.stderr, /^scan: no baseline \(the installed copy is missing\); every finding counts as new$/mu);
   assert.match(r.stderr, /refused: ripwire found CRITICAL findings \(exit 2\)/u);
   assert.deepEqual(await snapshot(m.env.home), before);
-  assert.deepEqual(await names(path.join(m.env.home, "sources")), []);
+  assert.deepEqual(await names(path.join(m.env.home, "sources")), [m.id]);
   assert.deepEqual(await names(path.join(m.env.home, "staging")), []);
 });
 
@@ -952,7 +955,7 @@ test("git source: reindex rescans the stored copy, and skips it when the copy is
   assert.equal(re.code, 0, re.stderr);
   assert.equal(re.stdout.trim(), "reindexed 3 skills from 1 sources");
 
-  await rm(path.join(env.home, "sources", id), { recursive: true });
+  await rm(await realpath(path.join(env.home, "sources", id)), { recursive: true });
   const gone = await mg(env, ["reindex"]);
   assert.equal(gone.code, 0, gone.stderr);
   assert.equal(gone.stdout.trim(), "reindexed 0 skills from 1 sources");
@@ -1178,4 +1181,36 @@ test("reference-only updates change revision and pinned reads detect drift", asy
   assert.equal((await mg(env, ["reindex"])).code, 0);
   const refreshed = (await find()).results[0]!.revision;
   assert.equal((await mg(env, ["load", id, "--file", "references/tips.md", "--revision", refreshed])).stdout, "drift\n");
+});
+
+test("concurrent Git updates retain only the active snapshot", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const id = sourceId(await mg(env, ["install", repo.url]));
+  await writeSkill(path.join(repo.dir, "skills"), "react-perf", "concurrent update");
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-qm", "concurrent");
+  const results = await Promise.all([mg(env, ["update", id]), mg(env, ["update", id])]);
+  assert.ok(results.some((result) => result.code === 0));
+  for (const result of results) {
+    if (result.code !== 0) assert.match(result.stderr, /source changed during update; run margrave update again/u);
+  }
+  const records = JSON.parse(await readFile(path.join(env.home, "sources.json"), "utf8")) as { snapshot: string }[];
+  assert.deepEqual(await names(path.join(env.home, "snapshots", id)), [records[0]!.snapshot]);
+  assert.match(await readFile(path.join(env.home, "sources", id, "skills", "react-perf", "SKILL.md"), "utf8"), /concurrent update/u);
+});
+
+test("a Git skill at the snapshot root reports drift", async () => {
+  const env = await setup();
+  const dir = await tmp("mg-root-repo-");
+  await git(dir, "init", "-q", "-b", "main");
+  await writeFile(path.join(dir, "SKILL.md"), skillMd("root-skill", "Root skill"));
+  await git(dir, "add", "-A");
+  await git(dir, "commit", "-qm", "root");
+  const id = sourceId(await mg(env, ["install", `file://${dir}`]));
+  const skill = `${id}/root-skill`;
+  const revision = indexRows(env.home).find((row) => row.id === skill)!.hash;
+  await writeFile(path.join(env.home, "sources", id, "SKILL.md"), skillMd("root-skill", "changed"));
+  const result = await mg(env, ["load", skill, "--revision", revision]);
+  assert.match(result.stderr, /skill files changed since indexing/u);
 });

@@ -29,6 +29,8 @@ export interface SourceRecord {
   ref: string | null;
   commit: string | null;
   installedAt: string;
+  /** Managed Git snapshot key. */
+  snapshot?: string;
 }
 
 export interface IndexEntry {
@@ -96,6 +98,17 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+function validSnapshot(v: Record<string, unknown>): boolean {
+  if (v["snapshot"] === undefined) return true;
+  return (
+    v["kind"] === "git" &&
+    typeof v["snapshot"] === "string" &&
+    typeof v["commit"] === "string" &&
+    /^(?:[0-9a-f]{40}|[0-9a-f]{64})-[0-9a-f]{16}$/u.test(v["snapshot"]) &&
+    v["snapshot"].startsWith(`${v["commit"]}-`)
+  );
+}
+
 function validSource(v: unknown): v is SourceRecord {
   if (!isRecord(v)) return false;
   if (typeof v["id"] !== "string" || typeof v["spec"] !== "string") return false;
@@ -104,6 +117,7 @@ function validSource(v: unknown): v is SourceRecord {
   if (v["ref"] !== null && typeof v["ref"] !== "string") return false;
   if (v["commit"] !== null && typeof v["commit"] !== "string") return false;
   if (typeof v["installedAt"] !== "string") return false;
+  if (!validSnapshot(v)) return false;
   if (v["kind"] === "git") return typeof v["url"] === "string";
   return typeof v["path"] === "string";
 }

@@ -1,6 +1,7 @@
 // find / load / read-file, id resolution, path guard, terminal-safe text.
 import { lstat } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { FIELDS, FIELD_WEIGHTS, NAME_BONUS, clampLimit, hasRecommendationEvidence, queryTerms } from "./bm25.ts";
 import type { Field, MatchedTerms } from "./bm25.ts";
@@ -10,7 +11,7 @@ import type { ManifestEntry } from "./scan.ts";
 import { clean, cleanBlock, shellQuote } from "./text.ts";
 export { listFiles, readSkillFile } from "./skill-files.ts";
 export { clean, cleanBlock, shellQuote } from "./text.ts";
-import { MargraveError, RequestError, openIndexRead, readSources } from "./store.ts";
+import { MargraveError, RequestError, home, openIndexRead, readSources, sourcesRoot } from "./store.ts";
 import type { IndexEntry, SourceRecord } from "./store.ts";
 
 export const NO_SOURCES_MESSAGE = "no skill sources installed; run: margrave install <owner/repo|path>";
@@ -180,6 +181,22 @@ export interface LoadResult {
   body: string;
 }
 
+async function gitSelectionChanged(entry: IndexEntry, mismatch: boolean): Promise<boolean> {
+  const legacy = path.join(sourcesRoot(), entry.source);
+  const snapshots = path.join(home(), "snapshots", entry.source);
+  const inLegacy = entry.dir === legacy || entry.dir.startsWith(`${legacy}${path.sep}`);
+  if (!inLegacy && (!mismatch || !entry.dir.startsWith(`${snapshots}${path.sep}`))) return false;
+  const source = (await readSources()).find((s) => s.id === entry.source);
+  if (source?.kind !== "git") return false;
+  if (inLegacy && source.snapshot !== undefined) return true;
+  if (!mismatch) return false;
+  const selected = source.snapshot === undefined ? legacy : path.join(snapshots, source.snapshot);
+  return (
+    (entry.dir !== selected && !entry.dir.startsWith(`${selected}${path.sep}`)) ||
+    (selected === legacy && (await lstat(legacy).catch(() => null))?.isSymbolicLink() === true)
+  );
+}
+
 export async function readSelectedFile(entry: IndexEntry, rel: string, revision?: string): Promise<string> {
   if (revision === undefined) return readSkillFile(entry.dir, rel);
   validateRevision(revision);
@@ -200,7 +217,10 @@ export async function readSelectedFile(entry: IndexEntry, rel: string, revision?
   } finally {
     db.close();
   }
-  if (bytes === undefined || bytes.length !== item.size || `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== item.digest) {
+  const mismatch =
+    bytes === undefined || bytes.length !== item.size || `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== item.digest;
+  if (await gitSelectionChanged(entry, mismatch)) throw new RequestError("skill revision changed; search again");
+  if (mismatch || bytes === undefined) {
     throw new RequestError("skill files changed since indexing; ask the store operator to run margrave reindex, then search again");
   }
   return bytes.toString("utf8");
@@ -212,11 +232,14 @@ export async function loadSkill(entry: IndexEntry, sources: readonly SourceRecor
   const text = await readSelectedFile(entry, "SKILL.md", revision);
   const { rawFrontmatter, body } = splitSkillMd(text);
   const src = sources.find((s) => s.id === entry.source);
+  const snapshotRoot = path.join(home(), "snapshots", entry.source);
+  const key = path.relative(snapshotRoot, entry.dir).split(path.sep)[0] ?? "";
+  const selectedCommit = /^([0-9a-f]{40}|[0-9a-f]{64})-[0-9a-f]{16}$/u.exec(key)?.[1];
   return {
     id: entry.id,
     source: entry.source,
     spec: src?.spec ?? "",
-    commit: src?.commit ?? null,
+    commit: (src?.kind === "git" ? selectedCommit : undefined) ?? src?.commit ?? null,
     base: entry.dir,
     frontmatter: rawFrontmatter ?? "",
     files: revision === undefined ? await listFiles(entry.dir) : (JSON.parse(entry.manifest) as ManifestEntry[]).map((f) => f.path),

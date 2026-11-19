@@ -12,6 +12,7 @@ import {
   localId,
   parseSpec,
   reindexAll,
+  removeSource,
   resolveScanRoot,
   sanitizeId,
   sourceDir,
@@ -283,6 +284,10 @@ test("every field of a source record is checked", async (t) => {
     "installedAt is not a string": { ...good, installedAt: 1 },
     "a git record without url": noUrl,
     "a local record without path": { ...good, kind: "local" },
+    "snapshot on a local source": { ...good, kind: "local", path: "/p", snapshot: `${"a".repeat(40)}-${"b".repeat(16)}` },
+    "snapshot traversal": { ...good, commit: "a".repeat(40), snapshot: `../${"a".repeat(40)}-${"b".repeat(16)}` },
+    "snapshot commit mismatch": { ...good, commit: "c".repeat(40), snapshot: `${"a".repeat(40)}-${"b".repeat(16)}` },
+    "snapshot nonce malformed": { ...good, commit: "a".repeat(40), snapshot: `${"a".repeat(40)}-${"B".repeat(16)}` },
   };
   for (const [why, record] of Object.entries(bad)) {
     await writeFile(path.join(h, "sources.json"), JSON.stringify([record]));
@@ -452,11 +457,12 @@ test("update of a git source rolls the stored copy back when the swap or the wri
     await git(repo.dir, "commit", "-q", "-m", "change");
 
     // The new clone cannot be moved into place.
-    failRename((from, to) => to === final && from.endsWith(`${path.sep}repo`));
+    failRename((from, to) => to.includes(`${path.sep}snapshots${path.sep}`) && from.endsWith(`${path.sep}repo`));
     await assert.rejects(updateSources(id, quiet), /mock: cannot rename to /u);
     assert.equal(await stored(), before.skill);
     assert.equal(await read(home, "sources.json"), before.sources);
     assert.deepEqual(indexIds(home), before.index);
+    assert.equal((await readdir(path.join(home, "snapshots", id))).length, 1);
 
     // The new clone is in place, but sources.json cannot be written.
     failRename((_from, to) => to.endsWith("sources.json"));
@@ -464,6 +470,7 @@ test("update of a git source rolls the stored copy back when the swap or the wri
     assert.equal(await stored(), before.skill);
     assert.equal(await read(home, "sources.json"), before.sources);
     assert.deepEqual(indexIds(home), before.index);
+    assert.equal((await readdir(path.join(home, "snapshots", id))).length, 1);
 
     // With the mock gone, the same update works.
     passRename();
@@ -533,7 +540,7 @@ test("reindex: a rejection that is not an Error is logged as text and the source
   await inStore(t, async (home) => {
     const repo = await makeRepo();
     const { id } = await installSource(repo.url, null, quiet);
-    const dir = path.join(home, "sources", id);
+    const dir = await fsp.realpath(path.join(home, "sources", id));
 
     mock.restoreAll();
     const real = fsp.realpath;
@@ -552,7 +559,7 @@ test("reindex: control characters in a failure message are logged as text", asyn
   await inStore(t, async (home) => {
     const repo = await makeRepo();
     const { id } = await installSource(repo.url, null, quiet);
-    const dir = path.join(home, "sources", id);
+    const dir = await fsp.realpath(path.join(home, "sources", id));
 
     mock.restoreAll();
     const real = fsp.realpath;
@@ -616,4 +623,145 @@ test("reindex preserves unreadable source rows and migration rejects an unreadab
   mock.restoreAll();
   syncBuiltinESMExports();
   await reindexAll({ log: () => {}, allowUnsafe: false });
+});
+
+test("a reader keeps the selected snapshot during publication", async (t) => {
+  await inStore(t, async (home) => {
+    const repo = await makeRepo();
+    const { id } = await installSource(repo.url, null, quiet);
+    const skill = `${id}/react-perf`;
+    const old = indexRows(home).find((row) => row.id === skill)!.hash;
+    const alias = path.join(home, "sources", id, "skills", "react-perf", "SKILL.md");
+    const oldText = await readFile(alias, "utf8");
+    await writeSkill(path.join(repo.dir, "skills"), "react-perf", "new description", "new content\n");
+    await git(repo.dir, "add", "-A");
+    await git(repo.dir, "commit", "-qm", "next");
+    let release!: () => void;
+    let reached!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const resume = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const real = fsp.rename;
+    mock.method(fsp, "rename", async (from: string, to: string) => {
+      await real(from, to);
+      if (to === path.join(home, "sources.json")) {
+        reached();
+        await resume;
+      }
+    });
+    syncBuiltinESMExports();
+    const updating = updateSources(id, quiet);
+    try {
+      await Promise.race([
+        paused,
+        updating.then(() => {
+          throw new Error("writer completed before pause");
+        }),
+      ]);
+      assert.match(await readFile(alias, "utf8"), /new content/u);
+      const reader = await runCli(["load", skill, "--file", "SKILL.md", "--revision", old], { home });
+      assert.equal(reader.code, 0, reader.stderr);
+      assert.equal(reader.stdout, oldText);
+    } finally {
+      release();
+      await updating;
+      passRename();
+    }
+    const stale = await runCli(["load", skill, "--revision", old], { home });
+    assert.match(stale.stderr, /skill revision changed; search again/u);
+    const current = indexRows(home).find((row) => row.id === skill)!.hash;
+    const fresh = await runCli(["load", skill, "--file", "SKILL.md", "--revision", current], { home });
+    assert.match(fresh.stdout, /new content/u);
+    assert.equal((await readdir(path.join(home, "snapshots", id))).length, 1);
+  });
+});
+
+test("legacy Git directories reindex, update and remove", async (t) => {
+  await inStore(t, async (home) => {
+    const repo = await makeRepo();
+    const { id } = await installSource(repo.url, null, quiet);
+    const alias = path.join(home, "sources", id);
+    const target = await fsp.realpath(alias);
+    await fsp.unlink(alias);
+    await fsp.rename(target, alias);
+    const records = await readSources();
+    delete records[0]!.snapshot;
+    await writeFile(path.join(home, "sources.json"), JSON.stringify(records));
+    assert.equal((await reindexAll(quiet)).skills, 3);
+    const skill = `${id}/react-perf`;
+    const oldRevision = indexRows(home).find((row) => row.id === skill)!.hash;
+    const oldText = await readFile(path.join(alias, "skills", "react-perf", "SKILL.md"), "utf8");
+    await writeSkill(path.join(repo.dir, "skills"), "react-perf", "new description", "new content\n");
+    await git(repo.dir, "add", "-A");
+    await git(repo.dir, "commit", "-qm", "legacy update");
+    let release!: () => void;
+    let reached!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const resume = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const real = fsp.rename;
+    mock.method(fsp, "rename", async (from: string, to: string) => {
+      if (to === path.join(home, "sources.json")) {
+        reached();
+        await resume;
+      }
+      return real(from, to);
+    });
+    syncBuiltinESMExports();
+    const updating = updateSources(id, quiet);
+    try {
+      await Promise.race([
+        paused,
+        updating.then(() => {
+          throw new Error("writer completed before pause");
+        }),
+      ]);
+      const reader = await runCli(["load", skill, "--file", "SKILL.md", "--revision", oldRevision], { home });
+      assert.ok(reader.code === 0 || reader.stderr.includes("skill revision changed; search again"), reader.stderr);
+      if (reader.code === 0) assert.equal(reader.stdout, oldText);
+    } finally {
+      release();
+      await updating;
+      passRename();
+    }
+    assert.equal((await fsp.lstat(alias)).isSymbolicLink(), true);
+    assert.equal((await reindexAll(quiet)).skills, 3);
+    await removeSource(id);
+    assert.equal((await readdir(path.join(home, "snapshots", id))).length, 0);
+    await installSource(repo.url, null, quiet);
+    const installed = await fsp.realpath(alias);
+    await fsp.unlink(alias);
+    await fsp.rename(installed, alias);
+    const legacy = await readSources();
+    delete legacy[0]!.snapshot;
+    await writeFile(path.join(home, "sources.json"), JSON.stringify(legacy));
+    await removeSource(id);
+    await assert.rejects(fsp.lstat(alias), /ENOENT/u);
+  });
+});
+
+test("missing and foreign aliases do not delete another directory", async (t) => {
+  await inStore(t, async (home) => {
+    const repo = await makeRepo();
+    const { id } = await installSource(repo.url, null, quiet);
+    const alias = path.join(home, "sources", id);
+    const installed = await fsp.realpath(alias);
+    await fsp.unlink(alias);
+    const other = await tmp("mg-other-");
+    await fsp.symlink(other, alias);
+    await assert.rejects(updateSources(id, quiet), /already installed/u);
+    await assert.rejects(removeSource(id), /already installed/u);
+    assert.equal(await fsp.realpath(alias), other);
+    assert.equal((await fsp.stat(installed)).isDirectory(), true);
+    await fsp.unlink(alias);
+    await removeSource(id);
+    await assert.rejects(fsp.stat(installed), /ENOENT/u);
+    assert.equal((await fsp.stat(other)).isDirectory(), true);
+  });
 });
