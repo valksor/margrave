@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { parseLock } from "../src/lock.ts";
 import fsp, { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
@@ -23,7 +24,20 @@ import {
 import { MargraveError, UsageError, home as storeHome, openIndexRead, readSources } from "../src/store.ts";
 import type { SourceRecord } from "../src/store.ts";
 import { resolveSkill } from "../src/skills.ts";
-import { fakeRipwire, git, indexIds, indexRows, makeRepo, newEntry, realExec, runCli, seedIndex, tmp, writeSkill } from "./helpers.ts";
+import {
+  changeAtLock,
+  fakeRipwire,
+  git,
+  indexIds,
+  indexRows,
+  makeRepo,
+  newEntry,
+  realExec,
+  runCli,
+  seedIndex,
+  tmp,
+  writeSkill,
+} from "./helpers.ts";
 
 test("spec parsing is checked in order: local, git URL, GitHub", () => {
   assert.deepEqual(parseSpec("./skills"), { kind: "local", path: path.resolve("./skills") });
@@ -406,6 +420,136 @@ function failCommit(): void {
   });
 }
 
+test("remove rolls back a moved Git alias when commit fails", async (t) => {
+  await inStore(t, async (home) => {
+    const repo = await makeRepo();
+    const { id } = await installSource(repo.url, null, quiet);
+    const alias = path.join(home, "sources", id);
+    const target = await fsp.readlink(alias);
+    const before = await read(home, "sources.json");
+    const rows = indexRows(home);
+    failCommit();
+    await assert.rejects(removeSource(id), /mock: COMMIT failed/u);
+    passRename();
+    assert.equal(await fsp.readlink(alias), target);
+    assert.equal(await read(home, "sources.json"), before);
+    assert.deepEqual(indexRows(home), rows);
+  });
+});
+
+test("Git update preserves the old alias when publication rename fails", async (t) => {
+  await inStore(t, async (home) => {
+    const repo = await makeRepo();
+    const { id } = await installSource(repo.url, null, quiet);
+    const alias = path.join(home, "sources", id);
+    const target = await fsp.readlink(alias);
+    const before = await read(home, "sources.json");
+    const rows = indexRows(home);
+    await writeSkill(path.join(repo.dir, "skills"), "new-skill", "new skill");
+    await git(repo.dir, "add", "-A");
+    await git(repo.dir, "commit", "-qm", "add skill");
+    failRename((from, to) => from.endsWith(".new") && to === alias);
+    await assert.rejects(updateSources(id, quiet), /mock: cannot rename/u);
+    passRename();
+    assert.equal(await fsp.readlink(alias), target);
+    assert.equal(await read(home, "sources.json"), before);
+    assert.deepEqual(indexRows(home), rows);
+  });
+});
+
+test("Git update preserves the old alias when creating its replacement fails", async (t) => {
+  await inStore(t, async (home) => {
+    const repo = await makeRepo();
+    const { id } = await installSource(repo.url, null, quiet);
+    const alias = path.join(home, "sources", id);
+    const target = await fsp.readlink(alias);
+    const before = await read(home, "sources.json");
+    const rows = indexRows(home);
+    const realLstat = fsp.lstat;
+    mock.method(fsp, "lstat", ((file: string, ...args: unknown[]) =>
+      file === alias
+        ? Promise.reject(Object.assign(new Error("alias stat denied"), { code: "EACCES" }))
+        : (realLstat as (...a: unknown[]) => Promise<unknown>)(file, ...args)) as typeof fsp.lstat);
+    syncBuiltinESMExports();
+    await assert.rejects(updateSources(id, quiet), /alias stat denied/u);
+    passRename();
+    assert.equal(await fsp.readlink(alias), target);
+    assert.equal(await read(home, "sources.json"), before);
+    assert.deepEqual(indexRows(home), rows);
+    const actual = fsp.symlink;
+    mock.method(fsp, "symlink", ((targetPath: string, linkPath: string, ...args: unknown[]) =>
+      linkPath.startsWith(`${alias}.`) && linkPath.endsWith(".new")
+        ? Promise.reject(new Error("mock: symlink failed"))
+        : (actual as (...a: unknown[]) => Promise<void>)(targetPath, linkPath, ...args)) as typeof fsp.symlink);
+    syncBuiltinESMExports();
+    await assert.rejects(updateSources(id, quiet), /mock: symlink failed/u);
+    passRename();
+    assert.equal(await fsp.readlink(alias), target);
+    assert.equal(await read(home, "sources.json"), before);
+    assert.deepEqual(indexRows(home), rows);
+  });
+});
+
+test("Git update preserves a source record changed by another writer", async (t) => {
+  await inStore(t, async (home) => {
+    const repo = await makeRepo();
+    const { id } = await installSource(repo.url, null, quiet);
+    const file = path.join(home, "sources.json");
+    const records = JSON.parse(readFileSync(file, "utf8")) as SourceRecord[];
+    assert.ok(records[0]);
+    records[0].installedAt = "competing writer";
+    const competing = JSON.stringify(records);
+    const alias = await fsp.readlink(path.join(home, "sources", id));
+    const rows = indexRows(home);
+    const hook = changeAtLock(t, 1, () => writeFileSync(file, competing));
+    await assert.rejects(updateSources(id, quiet), /source changed during update/u);
+    assert.equal(hook.fired(), true);
+    assert.equal(readFileSync(file, "utf8"), competing);
+    assert.equal(await fsp.readlink(path.join(home, "sources", id)), alias);
+    assert.deepEqual(indexRows(home), rows);
+  });
+});
+
+test("Git update preserves another writer's removal", async (t) => {
+  await inStore(t, async (home) => {
+    const repo = await makeRepo();
+    const { id } = await installSource(repo.url, null, quiet);
+    const file = path.join(home, "sources.json");
+    const hook = changeAtLock(t, 1, () => writeFileSync(file, "[]\n"));
+    await assert.rejects(updateSources(id, quiet), /no source/u);
+    assert.equal(hook.fired(), true);
+    assert.equal(readFileSync(file, "utf8"), "[]\n");
+  });
+});
+
+test("Git install preserves a competing record or alias", async (t) => {
+  await inStore(t, async (home) => {
+    const repo = await makeRepo();
+    const { id } = await installSource(repo.url, null, quiet);
+    const record = JSON.parse(readFileSync(path.join(home, "sources.json"), "utf8")) as SourceRecord[];
+    const other = await tmp("mg-home-");
+    process.env["MARGRAVE_HOME"] = other;
+    const file = path.join(other, "sources.json");
+    const competing = JSON.stringify(record);
+    const first = changeAtLock(t, 2, () => writeFileSync(file, competing));
+    await assert.rejects(installSource(repo.url, null, quiet), /already installed/u);
+    assert.equal(first.fired(), true);
+    assert.equal(readFileSync(file, "utf8"), competing);
+    mock.restoreAll();
+
+    const third = await tmp("mg-home-");
+    process.env["MARGRAVE_HOME"] = third;
+    const alias = path.join(third, "sources", id);
+    const second = changeAtLock(t, 2, () => {
+      mkdirSync(path.dirname(alias), { recursive: true });
+      writeFileSync(alias, "other writer");
+    });
+    await assert.rejects(installSource(repo.url, null, quiet), /already installed/u);
+    assert.equal(second.fired(), true);
+    assert.equal(readFileSync(alias, "utf8"), "other writer");
+  });
+});
+
 test("a COMMIT that fails restores the old sources.json, rolls back the rows, and reports the COMMIT error", async (t) => {
   await inStore(t, async (home) => {
     const first = await tmp("mg-localsrc-");
@@ -537,6 +681,7 @@ function mockSourcesRead(answer: (nth: number) => Promise<string> | undefined): 
 
 test("update of all sources: a rejection that is not an Error, or a source that vanished, is reported for that source", async (t) => {
   await inStore(t, async () => {
+    await assert.rejects(updateSources(null, quiet, "refs/heads/main"), /update --ref requires one Git source/u);
     const dir = await tmp("mg-localsrc-");
     await writeSkill(dir, "alpha", "alpha skill");
     const { id } = await installSource(dir, null, quiet);
@@ -592,6 +737,65 @@ test("check reports a source record changed during its scan", async (t) => {
     const results = await checkSources(id);
     assert.equal(changed, true);
     assert.equal(results[0]?.error, "source changed during check; run margrave check again");
+  });
+});
+
+test("check reports a metadata read failure without changing the store", async (t) => {
+  await inStore(t, async (home) => {
+    const root = await tmp("mg-source-");
+    await writeSkill(root, "alpha", "alpha skill");
+    const { id } = await installSource(root, null, quiet);
+    const before = await read(home, "sources.json");
+    const rows = indexRows(home);
+    mockSourcesRead((nth) => (nth === 2 ? Promise.reject(new Error("metadata denied")) : undefined));
+    const checked = await checkSources(id);
+    assert.equal(checked[0]?.error, "metadata denied");
+    mockSourcesRead((nth) => (nth === 2 ? Promise.reject("metadata unavailable") : undefined));
+    assert.equal((await checkSources(id))[0]?.error, "metadata unavailable");
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    const actual = fsp.readdir;
+    mock.method(fsp, "readdir", ((file: string, ...args: unknown[]) =>
+      file === root
+        ? Promise.reject("scan unavailable")
+        : (actual as (...a: unknown[]) => Promise<unknown>)(file, ...args)) as typeof fsp.readdir);
+    syncBuiltinESMExports();
+    assert.equal((await checkSources(id))[0]?.error, "scan unavailable");
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    assert.equal(await read(home, "sources.json"), before);
+    assert.deepEqual(indexRows(home), rows);
+  });
+});
+
+test("check scans valid skills alongside a skipped invalid skill", async (t) => {
+  await inStore(t, async (home) => {
+    const root = await tmp("mg-source-");
+    await writeSkill(root, "alpha", "alpha skill");
+    const { id } = await installSource(root, null, quiet);
+    const before = await read(home, "sources.json");
+    const rows = indexRows(home);
+    await mkdir(path.join(root, "invalid"));
+    await writeFile(path.join(root, "invalid", "SKILL.md"), "no frontmatter\n");
+    const checked = await checkSources(id);
+    assert.equal(checked[0]?.error, null);
+    assert.deepEqual(checked[0]?.added, []);
+    assert.equal(await read(home, "sources.json"), before);
+    assert.deepEqual(indexRows(home), rows);
+  });
+});
+
+test("check reports an unavailable local Git remote without changing the store", async (t) => {
+  await inStore(t, async (home) => {
+    const repo = await makeRepo();
+    const { id } = await installSource(repo.url, null, quiet);
+    const before = await read(home, "sources.json");
+    const rows = indexRows(home);
+    await fsp.rm(repo.dir, { recursive: true, force: true });
+    const checked = await checkSources(id);
+    assert.match(checked[0]?.error ?? "", /cannot read remote tracking ref/u);
+    assert.equal(await read(home, "sources.json"), before);
+    assert.deepEqual(indexRows(home), rows);
   });
 });
 

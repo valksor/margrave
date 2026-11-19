@@ -18,6 +18,7 @@ import {
   indexIds,
   indexRows,
   leaveHotJournal,
+  makeRepo,
   newEntry,
   realClose,
   realExec,
@@ -992,4 +993,25 @@ test("a selected revision reports an operational read error and an index change"
   writer.prepare("UPDATE skills SET hash = ? WHERE id = ?").run(`sha256:${"b".repeat(64)}`, entry.id);
   writer.close();
   await assert.rejects(readSelectedFile(entry, "SKILL.md", entry.revision), /skill revision changed; search again/u);
+});
+
+test("a pinned Git read reports file drift when its source record disappears", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  const repo = await makeRepo();
+  const fakeBin = await fakeRipwire();
+  const installed = await runCli(["install", repo.url], { home, fakeBin });
+  assert.equal(installed.code, 0, installed.stderr);
+  const db = await openIndexRead();
+  const entry = resolveSkill(db, "react-perf");
+  db.close();
+  await writeFile(path.join(entry.dir, "SKILL.md"), "changed bytes\n");
+  const sourceFile = path.join(home, "sources.json");
+  const records = JSON.parse(await readFile(sourceFile, "utf8")) as { snapshot: string }[];
+  assert.ok(records[0]);
+  records[0].snapshot = `${records[0].snapshot.slice(0, -16)}0000000000000000`;
+  await writeFile(sourceFile, JSON.stringify(records));
+  await assert.rejects(readSelectedFile(entry, "SKILL.md", entry.revision), /skill revision changed; search again/u);
+  await writeFile(path.join(home, "sources.json"), "[]\n");
+  await assert.rejects(readSelectedFile(entry, "SKILL.md", entry.revision), /skill files changed since indexing/u);
 });

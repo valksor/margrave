@@ -601,13 +601,12 @@ export async function updateSources(
 }
 
 /**
- * The change for an update: replace the rows of one source and, for a git source, set its commit.
+ * The change for a local update: replace the rows of one source.
  * The old hashes are read inside the transaction, so the diff matches what the update replaced.
  */
 function replaceSource(
   id: string,
   entries: readonly NewEntry[],
-  sha: string | null,
   diff: { value?: ReturnType<typeof diffEntries> },
 ): (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[] {
   return (fresh, db) => {
@@ -617,7 +616,7 @@ function replaceSource(
     deleteSourceSkills(db, id);
     insertSkills(db, entries);
     diff.value = diffEntries(before, entries);
-    return sha === null ? fresh : fresh.map((s) => (s.id === id ? { ...s, commit: sha } : s));
+    return fresh;
   };
 }
 
@@ -632,7 +631,7 @@ async function updateOne(id: string, ctx: Ctx, ref: string | null): Promise<Upda
 
   if (rec.kind === "local") {
     const entries = await scanLocal(rec, ctx);
-    await commit("existing", replaceSource(id, entries, null, diff));
+    await commit("existing", replaceSource(id, entries, diff));
     return { id, kind: "local", oldCommit: null, newCommit: null, ...(diff.value as ReturnType<typeof diffEntries>) };
   }
   // readSources() only returns a git record with a url.

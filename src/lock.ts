@@ -70,7 +70,7 @@ const refValid = (s: string): boolean =>
 
 export function checkLockUrl(value: string): void {
   if (/^https:\/\//iu.test(value)) {
-    const authority = value.slice(8).split(/[/?#]/u, 1)[0] ?? "";
+    const authority = value.slice(8).split(/[/?#]/u, 1)[0]!;
     let credentials = false;
     try {
       const url = new URL(value);
@@ -137,10 +137,10 @@ export function parseLock(value: unknown): LockFile {
       skillIds.add(skill["id"]);
       entries.push({ id: skill["id"], revision: skill["revision"] });
     }
-    entries.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    entries.sort((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)));
     sources.push({ spec, id, url, subpath, ref, commit: lockedCommit, skills: entries });
   }
-  sources.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  sources.sort((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)));
   return { version: 1, sources };
 }
 
@@ -158,7 +158,7 @@ export async function readLock(file: string): Promise<LockFile> {
 // ---- lock export and restore ----
 
 function lockInventory(entries: readonly { id: string; revision: string }[]): { id: string; revision: string }[] {
-  return entries.map(({ id, revision }) => ({ id, revision })).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return entries.map(({ id, revision }) => ({ id, revision })).sort((a, b) => Number(a.id > b.id) - Number(a.id < b.id));
 }
 
 function sameInventory(entries: readonly { id: string; revision: string }[], locked: LockedSource): boolean {

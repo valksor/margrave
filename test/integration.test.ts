@@ -259,6 +259,9 @@ test("check and explicit Git tracking refs", async () => {
   await git(repo.dir, "tag", "-d", "shared");
   const missingBefore = await storeFiles(env.home);
   assert.equal((await mg(env, ["check", id])).code, 1);
+  const missingJson = await mg(env, ["check", id, "--json"]);
+  assert.equal(missingJson.code, 1);
+  assert.ok((JSON.parse(missingJson.stdout) as { error: string | null }[])[0]?.error);
   assert.deepEqual(await storeFiles(env.home), missingBefore);
   const failed = await mg(env, ["update", id, "--ref", "refs/heads/missing"]);
   assert.equal(failed.code, 1);
@@ -287,6 +290,12 @@ test("check and explicit Git tracking refs", async () => {
 
 test("check reports local additions, removals, and supporting file changes", async () => {
   const env = await setup();
+  const empty = await mg(env, ["check"]);
+  assert.equal(empty.code, 0, empty.stderr);
+  assert.match(empty.stdout, /no skill sources installed/u);
+  const invalidLock = await mg(env, ["lock", "invalid"]);
+  assert.equal(invalidLock.code, 2);
+  assert.match(invalidLock.stderr, /expected lock export or lock restore/u);
   const root = await tmp("mg-local-");
   await writeSkill(root, "old", "Old skill");
   await writeSkill(root, "kept", "Kept skill");
@@ -303,6 +312,11 @@ test("check reports local additions, removals, and supporting file changes", asy
   assert.deepEqual(rows[0]?.added, [`${id}/new`]);
   assert.deepEqual(rows[0]?.changed, [`${id}/kept`]);
   assert.deepEqual(rows[0]?.removed, [`${id}/old`]);
+  const text = await mg(env, ["check", id]);
+  assert.equal(text.code, 1, text.stderr);
+  assert.match(text.stdout, new RegExp(`added: ${id}/new`, "u"));
+  assert.match(text.stdout, new RegExp(`changed: ${id}/kept`, "u"));
+  assert.match(text.stdout, new RegExp(`removed: ${id}/old`, "u"));
   assert.deepEqual([await readFile(path.join(env.home, "sources.json")), await readFile(path.join(env.home, "index.db"))], before);
   assert.equal((await mg(env, ["update", id, "--ref", "refs/heads/main"])).code, 2);
 });

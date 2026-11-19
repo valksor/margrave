@@ -230,7 +230,7 @@ export async function loadSkill(entry: IndexEntry, sources: readonly SourceRecor
   const { rawFrontmatter, body } = splitSkillMd(text);
   const src = sources.find((s) => s.id === entry.source);
   const snapshotRoot = path.join(home(), "snapshots", entry.source);
-  const key = path.relative(snapshotRoot, entry.dir).split(path.sep)[0] ?? "";
+  const key = path.relative(snapshotRoot, entry.dir).split(path.sep)[0]!;
   const selectedCommit = /^([0-9a-f]{40}|[0-9a-f]{64})-[0-9a-f]{16}$/u.exec(key)?.[1];
   return {
     id: entry.id,
