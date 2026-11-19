@@ -7,7 +7,6 @@ import {
   NO_SOURCES_MESSAGE,
   clean,
   cleanBlock,
-  findSkills,
   formatFind,
   formatLoad,
   loadContext,
@@ -20,6 +19,7 @@ import { checkSources, installSource, listSources, reindexAll, removeSource, upd
 import type { Ctx } from "./sources.ts";
 import { MargraveError, RequestError, UsageError } from "./store.ts";
 import { wrap } from "./wrap.ts";
+import { formatSuggestions, searchSkills } from "./search.ts";
 
 const USAGE = `usage: margrave <command>
 
@@ -205,19 +205,20 @@ async function run(argv: string[]): Promise<void> {
       const p = parse(rest, { limit: { type: "string" }, json: { type: "boolean" }, explain: { type: "boolean" } });
       const words = positionals(p, 1, Number.POSITIVE_INFINITY, 'find "<task>"');
       const task = words.join(" ");
-      const c = await loadContext();
-      if (c === null) {
-        if (p.values["json"] === true) json({ task, results: [], message: NO_SOURCES_MESSAGE });
-        else out(NO_SOURCES_MESSAGE);
-        return;
-      }
-      try {
-        const hits = findSkills(c.db, task, p.values["limit"], p.values["explain"] === true);
-        if (p.values["json"] === true) json({ task, results: hits });
-        else out(formatFind(hits));
-      } finally {
-        c.db.close();
-      }
+      const { hits, noSources, suggestions } = await searchSkills(
+        task,
+        p.values["limit"],
+        p.values["explain"] === true,
+        process.env["MARGRAVE_SKILLS_SH"] === "1",
+      );
+      if (p.values["json"] === true)
+        json({
+          task,
+          results: hits,
+          ...(noSources ? { message: NO_SOURCES_MESSAGE } : {}),
+          ...(suggestions.length > 0 ? { suggestions } : {}),
+        });
+      else out((noSources ? NO_SOURCES_MESSAGE : formatFind(hits)) + formatSuggestions(suggestions));
       return;
     }
     case "load": {

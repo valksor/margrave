@@ -122,6 +122,8 @@ margrave find "react performance"
 margrave load <id from the result>
 ```
 
+Set `MARGRAVE_SKILLS_SH=1` to enable skills.sh suggestions for the CLI and stdio MCP. When the installed search has no recommendation, Margrave sends the task text to skills.sh. Enable this only where you can share search terms with skills.sh. Each suggestion links to its catalog page and shows a manual `margrave install owner/repo` command. The command installs the source repository.
+
 ## Commands
 
 | Command                                                   | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -267,6 +269,8 @@ Scoped servers apply this list to search, skill loads, and supporting-file reads
 `import { handleHostedMcp } from "margrave/hosted"` gives a `(Request, options?) => Promise<Response>` handler for MCP Streamable HTTP. margrave starts no server. The host app mounts the handler on one route.
 
 Pass `{ allowedSources: ["owner__repo"] }` as the second argument to `handleHostedMcp` to scope a hosted request. An empty array serves no sources. The hosted application chooses this option in trusted server code.
+
+To enable skills.sh suggestions for hosted MCP, pass `{ skillsSh: true }` to `handleHostedMcp` as part of the server configuration. When the visible installed sources have no recommendation, the server sends the task text to skills.sh. Users can ask the store operator to install a suggested source.
 
 It has the same three tools and the same inputs as `margrave mcp`. It reads the store in `MARGRAVE_HOME` of the host process on every call. It needs read access to `MARGRAVE_HOME`; it does not need write access, so a read-only mount or a separate user works. The handler serves MCP requests over stateless Streamable HTTP. It is POST-only. Other methods get 405.
 

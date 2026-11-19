@@ -5,7 +5,6 @@ import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import {
   NO_SOURCES_MESSAGE,
-  findSkills,
   formatFind,
   formatLoad,
   loadContext,
@@ -18,6 +17,7 @@ import type { Context, FindText } from "./skills.ts";
 import { RequestError } from "./store.ts";
 import type { IndexEntry } from "./store.ts";
 import { checkId } from "./sources.ts";
+import { formatSuggestions, searchSkills } from "./search.ts";
 
 export const SERVER_INSTRUCTIONS =
   "This server gives access to installed skills that the agent does not load by default. Before a task in an unfamiliar domain, tool, or framework, call find_skills with the task in plain words. Call load_skill only for a recommended result. Call read_skill_file for a file that the skill names.";
@@ -97,6 +97,7 @@ function resolveEntry(ctx: Context, id: string, revision: string | undefined, al
 
 export interface ServerOptions {
   allowedSources?: readonly string[];
+  skillsSh?: boolean;
 }
 
 function validateAllowedSources(value: unknown, invalidMessage: string): ReadonlySet<string> | undefined {
@@ -114,27 +115,32 @@ function validateAllowedSources(value: unknown, invalidMessage: string): Readonl
 }
 
 export function createServer(variant: Variant = LOCAL, options: ServerOptions = {}): McpServer {
-  return buildServer(variant, validateAllowedSources(options.allowedSources, "allowedSources must contain valid source IDs"));
+  return buildServer(
+    variant,
+    validateAllowedSources(options.allowedSources, "allowedSources must contain valid source IDs"),
+    options.skillsSh === true,
+  );
 }
 
-function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | undefined): McpServer {
+function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | undefined, skillsSh: boolean): McpServer {
   const server = new McpServer({ name: "margrave", version: version() }, { instructions: SERVER_INSTRUCTIONS });
 
   server.registerTool(
     "find_skills",
     {
-      description: FIND_DESCRIPTION,
+      description:
+        FIND_DESCRIPTION +
+        (skillsSh
+          ? " On a local miss, this tool sends the task to skills.sh. Offer catalog suggestions to the user. Wait for an explicit request before installation."
+          : ""),
       inputSchema: z.object({ task: z.string(), limit: z.number().int().optional(), explain: z.boolean().optional() }),
     },
     async ({ task, limit, explain }) => {
       try {
-        const ctx = await loadContext();
-        if (ctx === null) return ok(variant.noSources);
-        try {
-          return ok(formatFind(findSkills(ctx.db, task, limit, explain, allowedSources), variant.findText));
-        } finally {
-          ctx.db.close();
-        }
+        const { hits, noSources, suggestions } = await searchSkills(task, limit, explain === true, skillsSh, allowedSources);
+        return ok(
+          (noSources ? variant.noSources : formatFind(hits, variant.findText)) + formatSuggestions(suggestions, !variant.showHostPaths),
+        );
       } catch (err) {
         return variant.fail(err);
       }
@@ -182,6 +188,6 @@ export function runMcp(): Promise<void> {
   const value = process.env["MARGRAVE_ALLOWED_SOURCES"];
   const ids = value === undefined ? undefined : value.trim() === "" ? [] : value.split(",").map((id) => id.trim());
   const allowedSources = validateAllowedSources(ids, "MARGRAVE_ALLOWED_SOURCES must contain comma-separated source IDs");
-  serveStdio(() => buildServer(LOCAL, allowedSources), { legacy: "reject" });
+  serveStdio(() => buildServer(LOCAL, allowedSources, process.env["MARGRAVE_SKILLS_SH"] === "1"), { legacy: "reject" });
   return Promise.resolve();
 }
