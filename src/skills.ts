@@ -36,11 +36,13 @@ export function validateRevision(revision: string | undefined): void {
 }
 
 /** Find a skill by qualified id, or by bare name when exactly one source has it. */
-export function resolveSkill(db: DatabaseSync, input: string, revision?: string): IndexEntry {
+export function resolveSkill(db: DatabaseSync, input: string, revision?: string, allowedSources?: ReadonlySet<string>): IndexEntry {
   validateRevision(revision);
   const exact = db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE id = ?`).get(input) as IndexEntry | undefined;
-  if (exact !== undefined) return exact;
-  const byName = db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE name = ?`).all(input) as unknown as IndexEntry[];
+  if (exact !== undefined && (allowedSources === undefined || allowedSources.has(exact.source))) return exact;
+  const byName = (db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE name = ?`).all(input) as unknown as IndexEntry[]).filter(
+    (entry) => allowedSources === undefined || allowedSources.has(entry.source),
+  );
   if (byName.length === 1 && byName[0] !== undefined) return byName[0];
   if (byName.length > 1) {
     const ids = byName
@@ -76,14 +78,16 @@ const FIND_FTS = `WITH hits AS MATERIALIZED (
 const FIND_EXACT_ONLY = "WITH cand AS (SELECT rowid, 0 AS s FROM skills WHERE name_lc = ? OR id_lc = ?)";
 const FIND_TAIL = `SELECT k.rowid, k.id, k.name, k.description, k.hash AS revision, (k.name_lc = ? OR k.id_lc = ?) AS exact,
   c.s + CASE WHEN k.name_lc = ? OR k.id_lc = ? THEN ${NAME_BONUS} ELSE 0 END AS score
-FROM cand c JOIN skills k ON k.rowid = c.rowid`;
+FROM cand c JOIN skills k ON k.rowid = c.rowid
+WHERE (? IS NULL OR k.source IN (SELECT value FROM json_each(?)))`;
 
 /** BM25 over the FTS columns. An exact name or id match ranks first. Ties break by id in byte order. */
-export function findSkills(db: DatabaseSync, task: string, limit: unknown, explain = false): FindHit[] {
+export function findSkills(db: DatabaseSync, task: string, limit: unknown, explain = false, scope?: ReadonlySet<string>): FindHit[] {
   // The MATCH text comes only from tokenize() output, never from the raw task.
   const terms = queryTerms(task);
   const q = task.trim().toLowerCase();
   const exact = [q, q, q, q, q, q];
+  const scopeJson = scope === undefined ? null : JSON.stringify([...scope]);
   type Row = {
     rowid: number;
     id: string | null;
@@ -101,7 +105,7 @@ export function findSkills(db: DatabaseSync, task: string, limit: unknown, expla
       .prepare(
         `${FIND_EXACT_ONLY} SELECT ranked.*, NULL AS col, NULL AS term FROM (${FIND_TAIL}) ranked ORDER BY exact DESC, score DESC, id`,
       )
-      .all(q, q, q, q, q, q) as unknown as Row[];
+      .all(q, q, q, q, q, q, scopeJson, scopeJson) as unknown as Row[];
   } else {
     db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS temp.find_vocab USING fts5vocab(main, fts, instance)");
     const sql = `${FIND_FTS}, ranked AS MATERIALIZED (${FIND_TAIL}), evidence AS MATERIALIZED (
@@ -109,7 +113,7 @@ export function findSkills(db: DatabaseSync, task: string, limit: unknown, expla
     ) SELECT rowid, id, name, description, revision, exact, score, NULL AS col, NULL AS term, 0 AS kind FROM ranked
       UNION ALL SELECT doc, NULL, NULL, NULL, NULL, 0, 0, col, term, 1 FROM evidence
       ORDER BY kind, exact DESC, score DESC, id, col, term`;
-    rows = db.prepare(sql).all(terms.map((t) => `"${t}"`).join(" OR "), ...exact, ...terms) as unknown as Row[];
+    rows = db.prepare(sql).all(terms.map((t) => `"${t}"`).join(" OR "), ...exact, scopeJson, scopeJson, ...terms) as unknown as Row[];
   }
   const hits = new Map<number, FindHit & { recommended: boolean; exact: boolean; matchedTerms: MatchedTerms }>();
   for (const row of rows) {

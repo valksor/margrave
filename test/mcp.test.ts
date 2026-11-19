@@ -253,3 +253,63 @@ test("many failing tool calls leave no open index handle: reindex rebuilds the d
   const open = (await fsp.readdir("/dev/fd")).length;
   assert.ok(open < 200, `${open} open file descriptors`);
 });
+
+test("stdio source allowlists scope search and both reads", async (t) => {
+  const home = await tmp("mg-home-");
+  const fakeBin = await fakeRipwire();
+  const ids: string[] = [];
+  for (const description of ["Shared terraform modules", "Shared terraform modules terraform modules"]) {
+    const dir = await tmp("mg-scope-");
+    const skill = await writeSkill(dir, "shared", description);
+    await writeFile(path.join(skill, "reference.txt"), description);
+    const result = await runCli(["install", dir], { home, fakeBin });
+    assert.equal(result.code, 0, result.stderr);
+    ids.push(/^installed (\S+)/u.exec(result.stdout)?.[1] ?? "");
+  }
+  const [visible, hidden] = ids as [string, string];
+  const cli = await runCli(["find", "terraform modules", "--limit", "10"], { home, fakeBin, extra: { MARGRAVE_ALLOWED_SOURCES: "" } });
+  assert.equal(cli.code, 0, cli.stderr);
+  assert.ok(cli.stdout.includes(visible) && cli.stdout.includes(hidden));
+  for (const scope of [undefined, `${visible}, ${visible},missing`, ""]) {
+    const env: Record<string, string> = { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home };
+    if (scope !== undefined) env["MARGRAVE_ALLOWED_SOURCES"] = scope;
+    const client = new Client({ name: "scope-test", version: "1" });
+    await client.connect(new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp"], env }));
+    t.after(() => client.close());
+    const found = await call(client, "find_skills", { task: "terraform modules", limit: 1, explain: true });
+    if (scope === "") assert.match(found.text, /no match/u);
+    else if (scope !== undefined) {
+      assert.ok(found.text.includes(visible));
+      assert.ok(!found.text.includes(hidden));
+      assert.ok(!found.text.includes("terraform modules terraform modules"));
+    } else assert.ok(found.text.includes(hidden));
+    const bare = await call(client, "load_skill", { id: "shared" });
+    if (scope === undefined) assert.match(bare.text, /ambiguous/u);
+    else assert.equal(bare.isError, scope === "");
+    const revision = /revision: (sha256:[0-9a-f]{64})/u.exec(
+      (await call(client, "find_skills", { task: "shared", explain: true })).text,
+    )?.[1];
+    for (const tool of ["load_skill", "read_skill_file"]) {
+      for (const token of [undefined, revision ?? `sha256:${"a".repeat(64)}`]) {
+        const args = (id: string) => ({
+          id,
+          ...(tool === "read_skill_file" ? { path: "reference.txt" } : {}),
+          ...(token === undefined ? {} : { revision: token }),
+        });
+        const unknown = await call(client, tool, args("unknown/shared"));
+        const hiddenResult = await call(client, tool, args(`${hidden}/shared`));
+        if (scope !== undefined)
+          assert.deepEqual(hiddenResult, { ...unknown, text: unknown.text.replace("unknown/shared", `${hidden}/shared`) });
+        const visibleResult = await call(client, tool, args(`${visible}/shared`));
+        if (scope === "")
+          assert.deepEqual(visibleResult, { ...unknown, text: unknown.text.replace("unknown/shared", `${visible}/shared`) });
+        else if (token === undefined || scope !== undefined) assert.equal(visibleResult.isError, false);
+      }
+    }
+  }
+  for (const value of [",", `${visible},`, "bad/id", " .,ok"]) {
+    const result = await runCli(["mcp"], { home, extra: { MARGRAVE_ALLOWED_SOURCES: value } });
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /MARGRAVE_ALLOWED_SOURCES must contain comma-separated source IDs/u);
+  }
+});

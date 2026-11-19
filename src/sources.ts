@@ -41,7 +41,7 @@ export function sanitizeId(s: string): string {
   return s.replace(/[^A-Za-z0-9._-]/gu, "-");
 }
 
-function checkId(id: string): string {
+export function checkId(id: string): string {
   if (id === "" || id === "." || id === ".." || !ID_RE.test(id)) {
     throw new UsageError(`cannot derive a valid source id (got "${id}")`);
   }

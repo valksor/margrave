@@ -17,6 +17,7 @@ import {
 import type { Context, FindText } from "./skills.ts";
 import { RequestError } from "./store.ts";
 import type { IndexEntry } from "./store.ts";
+import { checkId } from "./sources.ts";
 
 export const SERVER_INSTRUCTIONS =
   "This server gives access to installed skills that the agent does not load by default. Before a task in an unfamiliar domain, tool, or framework, call find_skills with the task in plain words. Call load_skill only for a recommended result. Call read_skill_file for a file that the skill names.";
@@ -86,15 +87,37 @@ export function version(): string {
 }
 
 /** Resolve an id, then close the handle: nothing else needs the database. */
-function resolveEntry(ctx: Context, id: string, revision?: string): IndexEntry {
+function resolveEntry(ctx: Context, id: string, revision: string | undefined, allowedSources: ReadonlySet<string> | undefined): IndexEntry {
   try {
-    return resolveSkill(ctx.db, id, revision);
+    return resolveSkill(ctx.db, id, revision, allowedSources);
   } finally {
     ctx.db.close();
   }
 }
 
-export function createServer(variant: Variant = LOCAL): McpServer {
+export interface ServerOptions {
+  allowedSources?: readonly string[];
+}
+
+function validateAllowedSources(value: unknown, invalidMessage: string): ReadonlySet<string> | undefined {
+  if (value === undefined) return undefined;
+  try {
+    if (!Array.isArray(value)) throw new Error();
+    for (const id of value) {
+      if (typeof id !== "string") throw new Error();
+      checkId(id);
+    }
+    return new Set(value);
+  } catch {
+    throw new Error(invalidMessage);
+  }
+}
+
+export function createServer(variant: Variant = LOCAL, options: ServerOptions = {}): McpServer {
+  return buildServer(variant, validateAllowedSources(options.allowedSources, "allowedSources must contain valid source IDs"));
+}
+
+function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | undefined): McpServer {
   const server = new McpServer({ name: "margrave", version: version() }, { instructions: SERVER_INSTRUCTIONS });
 
   server.registerTool(
@@ -108,7 +131,7 @@ export function createServer(variant: Variant = LOCAL): McpServer {
         const ctx = await loadContext();
         if (ctx === null) return ok(variant.noSources);
         try {
-          return ok(formatFind(findSkills(ctx.db, task, limit, explain), variant.findText));
+          return ok(formatFind(findSkills(ctx.db, task, limit, explain, allowedSources), variant.findText));
         } finally {
           ctx.db.close();
         }
@@ -127,7 +150,7 @@ export function createServer(variant: Variant = LOCAL): McpServer {
         const ctx = await loadContext();
         if (ctx === null)
           return variant.fail(new RequestError(revision === undefined ? variant.noSources : "skill revision changed; search again"));
-        const entry = resolveEntry(ctx, id, revision);
+        const entry = resolveEntry(ctx, id, revision, allowedSources);
         return ok(formatLoad(await loadSkill(entry, ctx.sources, revision), { hostPaths: variant.showHostPaths }));
       } catch (err) {
         return variant.fail(err);
@@ -144,7 +167,7 @@ export function createServer(variant: Variant = LOCAL): McpServer {
         const ctx = await loadContext();
         if (ctx === null)
           return variant.fail(new RequestError(revision === undefined ? variant.noSources : "skill revision changed; search again"));
-        const entry = resolveEntry(ctx, id, revision);
+        const entry = resolveEntry(ctx, id, revision, allowedSources);
         return ok(await readSelectedFile(entry, path, revision));
       } catch (err) {
         return variant.fail(err);
@@ -156,5 +179,8 @@ export function createServer(variant: Variant = LOCAL): McpServer {
 }
 
 export async function runMcp(): Promise<void> {
-  await createServer().connect(new StdioServerTransport());
+  const value = process.env["MARGRAVE_ALLOWED_SOURCES"];
+  const ids = value === undefined ? undefined : value.trim() === "" ? [] : value.split(",").map((id) => id.trim());
+  const allowedSources = validateAllowedSources(ids, "MARGRAVE_ALLOWED_SOURCES must contain comma-separated source IDs");
+  await buildServer(LOCAL, allowedSources).connect(new StdioServerTransport());
 }

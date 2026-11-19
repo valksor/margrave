@@ -246,9 +246,15 @@ Limit: the baseline compares the flagged line, not the lines around it. A known 
 
 Supply the search result's revision to verify a load or a supporting file read.
 
+Set `MARGRAVE_ALLOWED_SOURCES` for a stdio server to a comma-separated list of source IDs from `margrave list`. Leave the variable unset to serve all sources. Set it to an empty string to serve none.
+
+Scoped servers apply this list to search, skill loads, and supporting-file reads. Scores still use the shared index. Use separate stores where ranking statistics must also be isolated.
+
 ### Hosted MCP
 
-`import { handleHostedMcp } from "margrave/hosted"` gives a `(Request) => Promise<Response>` handler for MCP Streamable HTTP. margrave starts no server. The host app mounts the handler on one route.
+`import { handleHostedMcp } from "margrave/hosted"` gives a `(Request, options?) => Promise<Response>` handler for MCP Streamable HTTP. margrave starts no server. The host app mounts the handler on one route.
+
+Pass `{ allowedSources: ["owner__repo"] }` as the second argument to `handleHostedMcp` to scope a hosted request. An empty array serves no sources. The hosted application chooses this option in trusted server code.
 
 It has the same three tools and the same inputs as `margrave mcp`. It reads the store in `MARGRAVE_HOME` of the host process on every call. It needs read access to `MARGRAVE_HOME`; it does not need write access, so a read-only mount or a separate user works. It is stateless and POST-only. Other methods get 405.
 
@@ -267,7 +273,7 @@ A remote client sees these differences:
 - With no skills installed, the text is `no skills are installed on this server`.
 - An error caused by the client's input (unknown id, bad path) keeps its text. Any other error returns `the skill store on this server is not available; the server log has details`, and the full error goes to `console.error`.
 
-The handler serves every skill in the store, including any installed with `--allow-unsafe`. Skill ids carry the source id (see [Ids](#ids)), so a remote client sees the basename of a local source's directory, and the host and repository path of a git source (GitHub `owner/repo` with any subpath, `https://`, `git@`, and `file://` specs alike).
+By default, the handler serves every skill in the store, including any installed with `--allow-unsafe`. Skill ids carry the source id (see [Ids](#ids)), so a remote client sees the basename of a local source's directory, and the host and repository path of a git source (GitHub `owner/repo` with any subpath, `https://`, `git@`, and `file://` specs alike).
 
 margrave does no auth, TLS, CORS, Host/Origin checks, or rate limiting. The host app must do them. Do not expose the handler without auth.
 

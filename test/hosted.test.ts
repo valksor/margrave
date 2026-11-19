@@ -27,10 +27,16 @@ async function call(client: Client, name: string, args: Record<string, unknown>)
 }
 
 /** A client of handleHostedMcp. The fetch goes straight to the handler, so no network is used. */
-async function connectHosted(t: { after: (fn: () => Promise<void>) => void }): Promise<Client> {
+async function connectHosted(t: { after: (fn: () => Promise<void>) => void }, allowedSources?: readonly string[]): Promise<Client> {
   const client = new Client({ name: "margrave-test", version: "0.0.0" });
   await client.connect(
-    new StreamableHTTPClientTransport(new URL("http://test/mcp"), { fetch: (url, init) => handleHostedMcp(new Request(url, init)) }),
+    new StreamableHTTPClientTransport(new URL("http://test/mcp?allowedSources=all"), {
+      fetch: (url, init) => {
+        const headers = new Headers(init?.headers);
+        headers.set("allowedSources", "all");
+        return handleHostedMcp(new Request(url, { ...init, headers }), allowedSources === undefined ? {} : { allowedSources });
+      },
+    }),
   );
   t.after(() => client.close());
   return client;
@@ -323,4 +329,60 @@ test("hosted: a read-only MARGRAVE_HOME (mode 555) still serves find_skills, loa
     isError: false,
     text: "---\nname: terraform-modules\ndescription: Design reusable Terraform modules\n---\n# terraform-modules\n\nBody of terraform-modules.\n",
   });
+});
+
+test("hosted source options isolate requests on the same store", async (t) => {
+  const home = await useHome(t);
+  const fakeBin = await fakeRipwire();
+  const ids: string[] = [];
+  for (const description of ["Shared terraform modules", "Shared terraform modules terraform modules"]) {
+    const dir = await tmp("mg-scope-");
+    const skill = await writeSkill(dir, "shared", description);
+    await writeFile(path.join(skill, "reference.txt"), description);
+    const result = await runCli(["install", dir], { home, fakeBin });
+    assert.equal(result.code, 0, result.stderr);
+    ids.push(/^installed (\S+)/u.exec(result.stdout)?.[1] ?? "");
+  }
+  const [first, second] = ids as [string, string];
+  for (const scope of [undefined, [first, first, "missing"], [second], []]) {
+    const client = await connectHosted(t, scope);
+    const found = await call(client, "find_skills", {
+      task: "terraform modules",
+      limit: 1,
+      explain: true,
+      allowedSources: [first, second],
+    });
+    if (scope?.length === 0) assert.match(found.text, /no match/u);
+    else if (scope !== undefined) {
+      assert.ok(found.text.includes(scope[0] ?? ""));
+      assert.ok(!found.text.includes(scope[0] === first ? second : first));
+    } else assert.ok(found.text.includes(second));
+    const bare = await call(client, "load_skill", { id: "shared" });
+    if (scope === undefined) assert.match(bare.text, /ambiguous/u);
+    else assert.equal(bare.isError, scope.length === 0);
+    const revision = /revision: (sha256:[0-9a-f]{64})/u.exec(
+      (await call(client, "find_skills", { task: "shared", explain: true })).text,
+    )?.[1];
+    for (const tool of ["load_skill", "read_skill_file"]) {
+      for (const token of [undefined, revision ?? `sha256:${"a".repeat(64)}`]) {
+        const args = (id: string) => ({
+          id,
+          ...(tool === "read_skill_file" ? { path: "reference.txt" } : {}),
+          ...(token === undefined ? {} : { revision: token }),
+        });
+        const unknown = await call(client, tool, args("unknown/shared"));
+        for (const id of ids) {
+          const result = await call(client, tool, args(`${id}/shared`));
+          if (scope !== undefined && !scope.includes(id))
+            assert.deepEqual(result, { ...unknown, text: unknown.text.replace("unknown/shared", `${id}/shared`) });
+          else if (token === undefined || scope?.[0] === id) assert.equal(result.isError, false);
+        }
+      }
+    }
+  }
+  for (const allowedSources of ["bad", [123], ["bad/id"], [""]]) {
+    await assert.rejects(handleHostedMcp(new Request("http://test/mcp", { method: "POST" }), { allowedSources } as never), {
+      message: "allowedSources must contain valid source IDs",
+    });
+  }
 });
