@@ -7,7 +7,21 @@ import path from "node:path";
 import test from "node:test";
 import { atomicWrite } from "../src/store.ts";
 import { resolveScanRoot } from "../src/sources.ts";
-import { CLI, fakeRipwire, git, head, indexIds, indexRows, link, makeRepo, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
+import {
+  CLI,
+  fakeRipwire,
+  git,
+  head,
+  indexIds,
+  indexRows,
+  leaveHotJournal,
+  link,
+  makeRepo,
+  runCli,
+  skillMd,
+  tmp,
+  writeSkill,
+} from "./helpers.ts";
 import type { Run } from "./helpers.ts";
 
 interface Env {
@@ -1362,4 +1376,274 @@ test("a Git skill at the snapshot root reports drift", async () => {
   await writeFile(path.join(env.home, "sources", id, "SKILL.md"), skillMd("root-skill", "changed"));
   const result = await mg(env, ["load", skill, "--revision", revision]);
   assert.match(result.stderr, /skill files changed since indexing/u);
+});
+
+test("lock export and restore pins an annotated tag and verifies installed bytes", async () => {
+  const from = await setup();
+  const to = await setup();
+  const repo = await makeRepo();
+  const support = path.join(repo.dir, "skills", "react-perf", "guide.txt");
+  await writeFile(support, "original");
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-q", "-m", "support");
+  await git(repo.dir, "tag", "-a", "v1", "-m", "annotated");
+  const sha = await head(repo.dir);
+  const installed = await mg(from, ["install", repo.url, "--ref", "refs/tags/v1"]);
+  assert.equal(installed.code, 0, installed.stderr);
+  const id = sourceId(installed);
+  const exported = await mg(from, ["lock", "export"]);
+  assert.equal(exported.code, 0, exported.stderr);
+  const lock = JSON.parse(exported.stdout) as { sources: { id: string; commit: string; ref: string; skills: { revision: string }[] }[] };
+  assert.equal(lock.sources[0]?.id, id);
+  assert.equal(lock.sources[0]?.commit, sha);
+  assert.equal(lock.sources[0]?.ref, "refs/tags/v1");
+  assert.match(lock.sources[0]?.skills[0]?.revision ?? "", /^sha256:[a-f0-9]{64}$/u);
+  const file = path.join(await tmp(), "lock.json");
+  await writeFile(file, exported.stdout);
+  await writeFile(support, "newer");
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-q", "-m", "advance");
+  const restored = await mg(to, ["lock", "restore", file]);
+  assert.equal(restored.code, 0, restored.stderr);
+  assert.equal(restored.stdout, `restored ${id}\n`);
+  assert.equal(await readFile(path.join(to.home, "sources", id, "skills", "react-perf", "guide.txt"), "utf8"), "original");
+  const inode = (await stat(path.join(to.home, "sources.json"))).ino;
+  assert.equal((await mg(to, ["lock", "restore", file])).stdout, `already restored ${id}\n`);
+  assert.equal((await stat(path.join(to.home, "sources.json"))).ino, inode);
+  await writeFile(path.join(to.home, "sources", id, "skills", "react-perf", "guide.txt"), "changed");
+  const conflict = await mg(to, ["lock", "restore", file]);
+  assert.equal(conflict.code, 1);
+  assert.match(conflict.stderr, /installed source differs from the lock/u);
+  await rm(path.join(to.home, "sources", id, "skills", "react-perf", "guide.txt"));
+  assert.equal((await mg(to, ["lock", "restore", file])).code, 1);
+});
+
+test("lock validation and staging failures do not publish", async () => {
+  const from = await setup();
+  const to = await setup();
+  const repo = await makeRepo();
+  const install = await mg(from, ["install", repo.url]);
+  assert.equal(install.code, 0, install.stderr);
+  const exported = await mg(from, ["lock", "export"]);
+  const lock = JSON.parse(exported.stdout) as { sources: { spec: string; url: string; commit: string; skills: { revision: string }[] }[] };
+  const file = path.join(await tmp(), "lock.json");
+  await writeFile(file, "{");
+  assert.match((await mg(to, ["lock", "restore", file])).stderr, /lock file is malformed/u);
+  const bad = structuredClone(lock);
+  Object.assign(bad.sources[0] as object, { unexpected: true });
+  await writeFile(file, JSON.stringify(bad));
+  assert.match((await mg(to, ["lock", "restore", file])).stderr, /lock file is malformed/u);
+  const credential = structuredClone(lock);
+  if (credential.sources[0] !== undefined) credential.sources[0].spec = "https:////user:secret@example.com/repo";
+  await writeFile(file, JSON.stringify(credential));
+  const redacted = await mg(to, ["lock", "restore", file]);
+  assert.match(redacted.stderr, /lock source URL must not contain credentials/u);
+  assert.doesNotMatch(redacted.stderr, /secret|user/u);
+  const unavailable = structuredClone(lock);
+  if (unavailable.sources[0] !== undefined) unavailable.sources[0].commit = "0".repeat(40);
+  await writeFile(file, JSON.stringify(unavailable));
+  assert.match((await mg(to, ["lock", "restore", file])).stderr, /locked commit is unavailable/u);
+  const incorrect = structuredClone(lock);
+  if (incorrect.sources[0]?.skills[0] !== undefined) incorrect.sources[0].skills[0].revision = `sha256:${"0".repeat(64)}`;
+  await writeFile(file, JSON.stringify(incorrect));
+  assert.match((await mg(to, ["lock", "restore", file])).stderr, /staged skills differ/u);
+  await writeFile(file, exported.stdout);
+  assert.equal((await mg(to, ["lock", "restore", file], { FAKE_RIPWIRE_EXIT: "2" })).code, 1);
+  assert.deepEqual(await names(path.join(to.home, "sources")), []);
+});
+
+test("lock restore resumes after interruption before SQLite commit", async () => {
+  const from = await setup();
+  const to = await setup();
+  const repo = await makeRepo();
+  const install = await mg(from, ["install", repo.url]);
+  const id = sourceId(install);
+  const exported = await mg(from, ["lock", "export"]);
+  const dir = await tmp();
+  const file = path.join(dir, "lock.json");
+  const preload = path.join(dir, "kill.mjs");
+  await writeFile(file, exported.stdout);
+  await writeFile(
+    preload,
+    `import { DatabaseSync } from "node:sqlite";\nimport { existsSync } from "node:fs";\nconst original = DatabaseSync.prototype.exec;\nDatabaseSync.prototype.exec = function(sql) { if (sql === "COMMIT" && existsSync(process.env.MARGRAVE_HOME + "/restore-pending/${id}.json")) process.kill(process.pid, "SIGKILL"); return original.call(this, sql); };\n`,
+  );
+  const unrelated = path.join(to.home, "snapshots", "other", "keep");
+  await mkdir(unrelated, { recursive: true });
+  await writeFile(path.join(unrelated, "data"), "keep");
+  const interrupted = await runCli(["lock", "restore", file], { home: to.home, fakeBin: to.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(interrupted.code, 1);
+  assert.ok(await stat(path.join(to.home, "restore-pending", `${id}.json`)));
+  await leaveHotJournal(path.join(to.home, "index.db"));
+  const retry = await mg(to, ["lock", "restore", file]);
+  assert.equal(retry.code, 0, retry.stderr);
+  assert.equal(retry.stdout, `restored ${id}\n`);
+  assert.equal(await readFile(path.join(unrelated, "data"), "utf8"), "keep");
+  assert.equal((await mg(to, ["lock", "restore", file])).stdout, `already restored ${id}\n`);
+});
+
+test("lock export requires explicit Git selection in mixed stores", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(env, ["install", repo.url]);
+  const id = sourceId(installed);
+  const local = await tmp();
+  await writeSkill(local, "local", "Local skill");
+  const localInstall = await mg(env, ["install", local]);
+  const localId = sourceId(localInstall);
+  assert.match((await mg(env, ["lock", "export"])).stderr, /select Git sources with --source/u);
+  for (const selected of [localId, "missing"])
+    assert.match((await mg(env, ["lock", "export", "--source", selected])).stderr, /--source must be an installed Git source ID/u);
+  const exported = await mg(env, ["lock", "export", "--source", id]);
+  assert.equal(exported.code, 0, exported.stderr);
+});
+
+test("lock restore stages every missing source before publication", async () => {
+  const from = await setup();
+  const to = await setup();
+  const first = await makeRepo();
+  const second = await makeRepo();
+  assert.equal((await mg(from, ["install", first.url])).code, 0);
+  assert.equal((await mg(from, ["install", second.url])).code, 0);
+  const exported = await mg(from, ["lock", "export"]);
+  const lock = JSON.parse(exported.stdout) as { sources: { skills: { revision: string }[] }[] };
+  assert.equal(lock.sources.length, 2);
+  if (lock.sources[1]?.skills[0] !== undefined) lock.sources[1].skills[0].revision = `sha256:${"0".repeat(64)}`;
+  const file = path.join(await tmp(), "lock.json");
+  await writeFile(file, JSON.stringify(lock));
+  const result = await mg(to, ["lock", "restore", file]);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /staged skills differ from the lock/u);
+  assert.deepEqual(await names(path.join(to.home, "sources")), []);
+});
+
+test("lock round trips shorthand and subpath IDs using a local URL rewrite", async () => {
+  const from = await setup();
+  const to = await setup();
+  const repo = await makeRepo();
+  const env = {
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: `url.${repo.url}.insteadOf`,
+    GIT_CONFIG_VALUE_0: "https://github.com/example/repo.git",
+  };
+  for (const spec of ["example/repo", "example/repo/skills/react-perf"]) {
+    const installed = await mg(from, ["install", spec], env);
+    assert.equal(installed.code, 0, installed.stderr);
+  }
+  const exported = await mg(from, ["lock", "export"], env);
+  assert.equal(exported.code, 0, exported.stderr);
+  const lock = JSON.parse(exported.stdout) as { sources: { id: string; skills: { id: string }[] }[] };
+  assert.deepEqual(
+    lock.sources.map((s) => s.id),
+    ["example__repo", "example__repo__skills__react-perf"],
+  );
+  assert.deepEqual(
+    lock.sources[1]?.skills.map((s) => s.id),
+    ["example__repo__skills__react-perf/react-perf"],
+  );
+  const file = path.join(await tmp(), "lock.json");
+  await writeFile(file, exported.stdout);
+  const restored = await mg(to, ["lock", "restore", file], env);
+  assert.equal(restored.code, 0, restored.stderr);
+  assert.deepEqual(indexIds(to.home), lock.sources.flatMap((s) => s.skills.map((skill) => skill.id)).sort());
+});
+
+test("lock round trips a SHA-256 Git repository", async () => {
+  const from = await setup();
+  const to = await setup();
+  const repo = await tmp("mg-sha256-");
+  await git(repo, "init", "-q", "-b", "main", "--object-format=sha256");
+  await writeSkill(repo, "sha-skill", "SHA skill");
+  await git(repo, "add", "-A");
+  await git(repo, "commit", "-qm", "initial");
+  const installed = await mg(from, ["install", `file://${repo}`]);
+  assert.equal(installed.code, 0, installed.stderr);
+  const id = sourceId(installed);
+  const exported = await mg(from, ["lock", "export"]);
+  const lock = JSON.parse(exported.stdout) as { sources: { commit: string }[] };
+  assert.match(lock.sources[0]?.commit ?? "", /^[a-f0-9]{64}$/u);
+  const file = path.join(await tmp(), "lock.json");
+  await writeFile(file, exported.stdout);
+  const restored = await mg(to, ["lock", "restore", file]);
+  assert.equal(restored.code, 0, restored.stderr);
+  assert.deepEqual(indexIds(to.home), [`${id}/sha-skill`]);
+});
+
+test("lock restore rejects a competing pending marker without deleting its snapshot", async () => {
+  const from = await setup();
+  const to = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(from, ["install", repo.url]);
+  const id = sourceId(installed);
+  const exported = await mg(from, ["lock", "export"]);
+  const source = (
+    JSON.parse(exported.stdout) as { sources: { spec: string; id: string; url: string; subpath: string; ref: string; commit: string }[] }
+  ).sources[0]!;
+  const snapshotKey = `${source.commit}-0123456789abcdef`;
+  const record = { ...source, kind: "git", snapshot: snapshotKey, installedAt: "2026-01-01T00:00:00.000Z" };
+  delete (record as { skills?: unknown }).skills;
+  const marker = JSON.stringify({ source, record });
+  const dir = await tmp();
+  const file = path.join(dir, "lock.json");
+  const preload = path.join(dir, "compete.mjs");
+  await writeFile(file, exported.stdout);
+  const markerFile = path.join(to.home, "restore-pending", `${id}.json`);
+  const competing = path.join(to.home, "snapshots", id, snapshotKey);
+  await mkdir(competing, { recursive: true });
+  await writeFile(path.join(competing, "keep"), "untouched");
+  await writeFile(
+    preload,
+    `import { DatabaseSync } from "node:sqlite";
+import { mkdirSync, writeFileSync } from "node:fs";
+const original = DatabaseSync.prototype.exec; let begins = 0;
+DatabaseSync.prototype.exec = function(sql) { if (sql === "BEGIN IMMEDIATE" && ++begins === 2) { mkdirSync(${JSON.stringify(path.dirname(markerFile))}, { recursive: true }); writeFileSync(${JSON.stringify(markerFile)}, ${JSON.stringify(marker)}); } return original.call(this, sql); };
+`,
+  );
+  const result = await runCli(["lock", "restore", file], { home: to.home, fakeBin: to.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /restore is pending for a different lock source/u);
+  assert.equal(await readFile(markerFile, "utf8"), marker);
+  assert.equal(await readFile(path.join(competing, "keep"), "utf8"), "untouched");
+});
+
+test("lock restore validates only selected pending markers", async () => {
+  const from = await setup();
+  const to = await setup();
+  const repo = await makeRepo();
+  const id = sourceId(await mg(from, ["install", repo.url]));
+  const exported = await mg(from, ["lock", "export"]);
+  const file = path.join(await tmp(), "lock.json");
+  await writeFile(file, exported.stdout);
+  const pending = path.join(to.home, "restore-pending");
+  await mkdir(pending, { recursive: true });
+  await writeFile(path.join(pending, "unrelated.json"), "not json");
+  await writeFile(path.join(pending, "other.tmp"), "temporary");
+  await writeFile(path.join(pending, `${id}.json`), "not json");
+  const malformed = await mg(to, ["lock", "restore", file]);
+  assert.equal(malformed.code, 1);
+  assert.match(malformed.stderr, /pending restore record is malformed/u);
+  await rm(path.join(pending, `${id}.json`));
+  const restored = await mg(to, ["lock", "restore", file]);
+  assert.equal(restored.code, 0, restored.stderr);
+  assert.equal(await readFile(path.join(pending, "unrelated.json"), "utf8"), "not json");
+});
+
+test("lock restore reports publication when marker cleanup fails", async () => {
+  const from = await setup();
+  const to = await setup();
+  const repo = await makeRepo();
+  const id = sourceId(await mg(from, ["install", repo.url]));
+  const exported = await mg(from, ["lock", "export"]);
+  const dir = await tmp();
+  const file = path.join(dir, "lock.json");
+  const preload = path.join(dir, "fail-cleanup.mjs");
+  await writeFile(file, exported.stdout);
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";\nimport { syncBuiltinESMExports } from "node:module";\nconst original = fs.rm;\nfs.rm = function(file, ...args) { if (file === ${JSON.stringify(path.join(to.home, "restore-pending", `${id}.json`))}) return Promise.reject(new Error("cleanup failed")); return original.call(this, file, ...args); };\nsyncBuiltinESMExports();\n`,
+  );
+  const failed = await runCli(["lock", "restore", file], { home: to.home, fakeBin: to.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.equal(failed.stdout, `restored ${id}\n`);
+  assert.match(failed.stderr, /restore partially completed: cleanup failed/u);
+  assert.equal((await mg(to, ["lock", "restore", file])).stdout, `already restored ${id}\n`);
 });

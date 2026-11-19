@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // margrave CLI. Exit codes: 0 ok, 1 error, 2 usage.
 import { parseArgs } from "node:util";
+import { exportLock, readLock, restoreLock } from "./lock.ts";
 import { runMcp, version } from "./mcp.ts";
 import {
   NO_SOURCES_MESSAGE,
@@ -25,6 +26,8 @@ const USAGE = `usage: margrave <command>
   install <spec> [--ref R] [--allow-unsafe]   add a skill source (owner/repo[/sub/path], git URL, or local path)
   update [source] [--ref R] [--allow-unsafe]  refresh one source, or all
   check [source] [--json]                     check for updates and installed-file drift
+  lock export [--source <id> ...]             export installed Git sources
+  lock restore <file>                         restore locked Git sources
   remove <source>                             remove a source (never deletes a local directory)
   list [--skills] [--json]                    list sources, and with --skills every skill
   find "<task>" [--limit N] [--json] [--explain]  rank installed skills for a task
@@ -134,6 +137,21 @@ async function run(argv: string[]): Promise<void> {
   const ctx = (allowUnsafe: boolean): Ctx => ({ log: err, allowUnsafe });
 
   switch (command) {
+    case "lock": {
+      const [action, ...args] = rest;
+      if (action === "export") {
+        const p = parse(args, { source: { type: "string", multiple: true } });
+        positionals(p, 0, 0, "lock export [--source <id> ...]");
+        json(await exportLock((p.values["source"] as string[] | undefined) ?? []));
+        return;
+      }
+      if (action === "restore") {
+        const [file] = positionals(parse(args, {}), 1, 1, "lock restore <file>");
+        await restoreLock(await readLock(file as string), ctx(false), out);
+        return;
+      }
+      throw new UsageError("expected lock export or lock restore");
+    }
     case "install": {
       const p = parse(rest, { ref: { type: "string" }, "allow-unsafe": { type: "boolean" } });
       const [spec] = positionals(p, 1, 1, "install <spec>");

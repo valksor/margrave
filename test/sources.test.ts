@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { parseLock } from "../src/lock.ts";
 import fsp, { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { homedir } from "node:os";
@@ -807,4 +808,32 @@ test("missing and foreign aliases do not delete another directory", async (t) =>
     await assert.rejects(fsp.stat(installed), /ENOENT/u);
     assert.equal((await fsp.stat(other)).isDirectory(), true);
   });
+});
+
+test("lock identity validation supports Git specs and rejects malformed records", () => {
+  for (const spec of ["owner/repo", "owner/repo/skills/react", "https://example.com/a/repo.git", "file:///tmp/repo"]) {
+    const parsed = parseSpec(spec);
+    assert.equal(parsed.kind, "git");
+    if (parsed.kind !== "git") continue;
+    const source = {
+      spec,
+      id: parsed.id,
+      url: parsed.url,
+      subpath: parsed.subpath,
+      ref: "refs/heads/main",
+      commit: "a".repeat(40),
+      skills: [{ id: `${parsed.id}/skill`, revision: `sha256:${"b".repeat(64)}` }],
+    };
+    assert.equal(parseLock({ version: 1, sources: [source] }).sources[0]?.id, parsed.id);
+    assert.throws(() => parseLock({ version: 1, sources: [{ ...source, id: "wrong" }] }), /lock source does not match its install spec/u);
+    assert.throws(() => parseLock({ version: 1, sources: [{ ...source, ref: "main" }] }), /lock file is malformed/u);
+    assert.throws(() => parseLock({ version: 1, sources: [source, source] }), /lock file is malformed/u);
+  }
+  assert.deepEqual(parseLock({ version: 1, sources: [] }), { version: 1, sources: [] });
+  for (const spec of ["https://example.com/a?", "https://example.com/a#", "https:////user:secret@example.com/a"]) {
+    assert.throws(
+      () => parseLock({ version: 1, sources: [{ spec }] }),
+      /lock source URL must not contain credentials, a query, or a fragment/u,
+    );
+  }
 });

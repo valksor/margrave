@@ -142,6 +142,12 @@ margrave load <id from the result>
 
 `margrave check [source] [--json]` reports updates and installed-file drift without changing the store. It exits 1 when a source needs attention.
 
+`margrave lock export > margrave-lock.json` records installed Git commits and whole-skill revisions. Repeat `--source <id>` to export selected Git sources from a mixed store.
+
+`margrave lock restore margrave-lock.json` verifies and restores the locked Git sources. Use a clean store for an exact catalog. Restore keeps unrelated installed sources and rejects conflicting copies.
+
+If a restore stops during publication, run the same command again. Margrave verifies completed content and resumes the missing sources.
+
 `margrave update <source> --ref refs/heads/<name>` selects a different branch. Use `refs/tags/<name>` for a tag. The new tracking ref is saved after a successful update.
 
 ### Specs

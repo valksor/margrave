@@ -402,7 +402,7 @@ async function checkIndex(sources: readonly SourceRecord[]): Promise<void> {
  */
 async function commit(
   mode: "existing" | "create" | "reindex",
-  change: (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[] | Promise<SourceRecord[]>,
+  change: (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[] | undefined | Promise<SourceRecord[] | undefined>,
   rollback?: () => Promise<void>,
 ): Promise<void> {
   const db = await openIndexWrite(mode);
@@ -410,11 +410,11 @@ async function commit(
     db.exec("BEGIN IMMEDIATE");
     const fresh = await readSources();
     const next = await change(fresh, db);
-    await writeSources(next);
+    if (next !== undefined) await writeSources(next);
     try {
       db.exec("COMMIT");
     } catch (err) {
-      await writeSources(fresh).catch(() => undefined);
+      if (next !== undefined) await writeSources(fresh).catch(() => undefined);
       throw err;
     }
   } catch (err) {
@@ -885,3 +885,5 @@ export async function listSources(
     db.close();
   }
 }
+
+export { commit, git, gitDir, installMode, logWarnings, qualifiedRef, scanInstalledSource, switchAlias, toEntries, trackingRef };
