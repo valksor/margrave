@@ -208,13 +208,13 @@ interface Probe {
  * So is user_version 0 with any schema object: margrave creates its schema in one transaction, so another program wrote it.
  */
 function readProbe(db: DatabaseSync, file: string): Probe {
-  const version = Number((db.prepare("PRAGMA user_version").get() as { user_version: number | bigint }).user_version);
-  if (version !== 0 && version !== SCHEMA_VERSION) throw new MargraveError(foreignMessage(file));
   const counts = db
     .prepare(
-      "SELECT count(*) AS total, count(CASE WHEN type = 'table' AND name IN ('skills', 'fts') THEN 1 END) AS ours FROM sqlite_master",
+      "SELECT (SELECT user_version FROM pragma_user_version) AS user_version, count(*) AS total, count(CASE WHEN type = 'table' AND name IN ('skills', 'fts') THEN 1 END) AS ours FROM sqlite_master",
     )
-    .get() as { total: number | bigint; ours: number | bigint };
+    .get() as { user_version: number | bigint; total: number | bigint; ours: number | bigint };
+  const version = Number(counts.user_version);
+  if (version !== 0 && version !== SCHEMA_VERSION) throw new MargraveError(foreignMessage(file));
   if (version === 0 && Number(counts.total) > 0) throw new MargraveError(foreignMessage(file));
   return { version, tables: Number(counts.ours) };
 }

@@ -484,6 +484,30 @@ test("a foreign index.db is refused by every command, reindex included, and marg
   }
 });
 
+test("the schema probe sees a concurrent initial commit as one snapshot", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  const file = path.join(home, "index.db");
+  new DatabaseSync(file).close();
+  const { prepare } = DatabaseSync.prototype as unknown as {
+    prepare: (this: DatabaseSync, sql: string) => ReturnType<DatabaseSync["prepare"]>;
+  };
+  let committed = false;
+  mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql.includes("pragma_user_version") && !committed) {
+      committed = true;
+      const writer = new DatabaseSync(file);
+      writer.exec("BEGIN IMMEDIATE; CREATE TABLE skills(id TEXT); CREATE TABLE fts(id TEXT); PRAGMA user_version = 1; COMMIT");
+      writer.close();
+    }
+    return prepare.call(this, sql);
+  });
+  t.after(() => mock.restoreAll());
+  const db = await openIndexRead();
+  db.close();
+  assert.equal(committed, true);
+});
+
 test("a schema-less index.db is an error for reads; reindex initializes it in place", async () => {
   for (const bad of SCHEMALESS_DBS) {
     const s = await withBadDb(bad);
