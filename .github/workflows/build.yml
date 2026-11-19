@@ -263,13 +263,13 @@ jobs:
           MARGRAVE_HOME="$RUNNER_TEMP/home-vendored" "$BUNDLE/bin/margrave" find "Say hello" > "$RUNNER_TEMP/find.txt"
           grep -q smoke "$RUNNER_TEMP/find.txt"
 
-          # The MCP server answers `initialize` with the version from the
+          # The MCP server answers `server/discover` with the version from the
           # bundle's package.json. Without that file it reports a fallback
           # version, which this check would catch. It exits when stdin closes.
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' | MARGRAVE_HOME="$RUNNER_TEMP/home-vendored" "$BUNDLE/bin/margrave" mcp > "$RUNNER_TEMP/mcp.jsonl"
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"smoke","version":"0"},"io.modelcontextprotocol/clientCapabilities":{}}}}' | MARGRAVE_HOME="$RUNNER_TEMP/home-vendored" "$BUNDLE/bin/margrave" mcp > "$RUNNER_TEMP/mcp.jsonl"
           # shellcheck disable=SC2016
-          if ! "$JQ" -e --arg v "$VERSION" 'select(.id == 1) | .result.serverInfo.version == $v' "$RUNNER_TEMP/mcp.jsonl" > /dev/null; then
-            echo "::error::The MCP initialize reply does not report serverInfo.version $VERSION. serverInfo: $("$JQ" -c 'select(.id == 1) | .result.serverInfo' "$RUNNER_TEMP/mcp.jsonl" || true)"
+          if ! "$JQ" -e --arg v "$VERSION" 'select(.id == 1) | .result._meta["io.modelcontextprotocol/serverInfo"].version == $v' "$RUNNER_TEMP/mcp.jsonl" > /dev/null; then
+            echo "::error::The MCP server/discover reply does not report serverInfo.version $VERSION. Reply: $("$JQ" -c 'select(.id == 1)' "$RUNNER_TEMP/mcp.jsonl" || true)"
             exit 1
           fi
 
