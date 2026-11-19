@@ -220,6 +220,7 @@ export function findSource(sources: readonly SourceRecord[], arg: string): Sourc
 // ---- git ----
 
 const GIT_ENV_PROTOCOLS = "https:ssh:git:file";
+const qualifiedRef = (ref: string): boolean => /^refs\/(heads|tags)\//u.test(ref);
 
 function git(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -239,21 +240,90 @@ function git(args: string[]): Promise<string> {
         }
         const cmd = `git ${args.join(" ")}`;
         if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-          reject(new MargraveError(`git was not found on PATH (command: ${cmd})`));
+          reject(new MargraveError(`git was not found on PATH (command: ${cmd})`, { cause: err }));
           return;
         }
-        reject(new MargraveError(`command failed: ${cmd}\n${stderr.trim() || err.message}`));
+        reject(new MargraveError(`command failed: ${cmd}\n${stderr.trim() || err.message}`, { cause: err }));
       },
     );
   });
 }
 
 async function gitClone(url: string, ref: string | null, dest: string): Promise<string> {
+  const qualified = ref !== null && qualifiedRef(ref);
   const args = ["clone", "--depth", "1"];
-  if (ref !== null) args.push("--branch", ref);
+  if (ref !== null && !qualified) args.push("--branch", ref);
   args.push("--", url, dest);
   await git(args);
+  if (qualified) {
+    await git(["-C", dest, "fetch", "--depth", "1", "origin", ref]);
+    await git(["-C", dest, "checkout", "--detach", "FETCH_HEAD"]);
+  }
   return (await git(["-C", dest, "rev-parse", "HEAD"])).trim();
+}
+
+async function installedRef(clone: string, ref: string | null): Promise<string> {
+  if (ref !== null && qualifiedRef(ref)) return ref;
+  if (ref === null) return (await git(["-C", clone, "symbolic-ref", "HEAD"])).trim();
+  return git(["-C", clone, "symbolic-ref", "-q", "HEAD"])
+    .then((head) => head.trim())
+    .catch(() => `refs/tags/${ref}`);
+}
+
+async function validateUpdateRef(ref: string | null, source: SourceRecord | undefined): Promise<void> {
+  if (ref === null) return;
+  if (source?.kind !== "git") throw new UsageError("update --ref requires one Git source");
+  if (!qualifiedRef(ref)) throw new UsageError("update --ref requires a fully qualified Git branch or tag");
+  await validateGitRef(ref, "update --ref requires a fully qualified Git branch or tag");
+}
+
+async function validateGitRef(ref: string, message?: string): Promise<void> {
+  try {
+    await git(["check-ref-format", ref]);
+  } catch (err) {
+    if (err instanceof MargraveError && (err.cause as { code?: string | number } | undefined)?.code === 1) {
+      throw new UsageError(message ?? err.message);
+    }
+    throw err;
+  }
+}
+
+async function remoteRefs(url: string, ref: string): Promise<Map<string, string>> {
+  const names = qualifiedRef(ref) ? [ref] : [`refs/heads/${ref}`, `refs/tags/${ref}`];
+  let output: string;
+  try {
+    output = await git(["ls-remote", "--", url, ...names, ...names.map((name) => `${name}^{}`)]);
+  } catch {
+    throw new MargraveError("cannot read remote tracking ref");
+  }
+  const found = new Map<string, string>();
+  const peeled = new Map<string, string>();
+  for (const line of output.trim().split("\n")) {
+    const [sha, name] = line.split("\t");
+    if (sha === undefined || name === undefined) continue;
+    if (name.endsWith("^{}")) peeled.set(name.slice(0, -3), sha);
+    else if (names.includes(name)) found.set(name, sha);
+  }
+  for (const [name, sha] of peeled) if (found.has(name)) found.set(name, sha);
+  return found;
+}
+
+async function trackingRef(rec: SourceRecord, check: boolean): Promise<{ ref: string; sha: string }> {
+  const ref = rec.ref;
+  if (ref === null) throw new MargraveError("source tracking ref is unresolved; run margrave update <source> --ref <fully-qualified-ref>");
+  if (qualifiedRef(ref)) await validateGitRef(ref);
+  const refs = await remoteRefs(rec.url as string, ref);
+  if (qualifiedRef(ref)) {
+    const sha = refs.get(ref);
+    if (sha === undefined) throw new MargraveError("remote tracking ref was not found");
+    return { ref, sha };
+  }
+  const matches = [...refs];
+  if (matches.length !== 1 || (check && matches[0]?.[1] !== rec.commit)) {
+    throw new MargraveError("source tracking ref is unresolved; run margrave update <source> --ref <fully-qualified-ref>");
+  }
+  const [name, sha] = matches[0] as [string, string];
+  return { ref: name, sha };
 }
 
 async function withStaging<T>(fn: (stage: string) => Promise<T>): Promise<T> {
@@ -385,6 +455,7 @@ export async function installSource(spec: string, refArg: string | null, ctx: Ct
     if (ref !== null) throw new UsageError("--ref is not allowed with a local source");
     return installLocal(spec, parsed.path, ctx);
   }
+  if (ref !== null && qualifiedRef(ref)) await validateGitRef(ref);
   return installGit(spec, parsed, ref, ctx);
 }
 
@@ -453,7 +524,7 @@ async function installGit(
     const sha = await gitClone(parsed.url, ref, clone);
     // No --ref: pin the branch the remote's default resolved to, so a later
     // `update` stays on it even if the remote changes its default branch.
-    const pinned = ref ?? (await git(["-C", clone, "symbolic-ref", "--short", "HEAD"])).trim();
+    const pinned = await installedRef(clone, ref);
     // The store serves files from here; clone metadata holds the remote URL and the operator's identity.
     await rm(path.join(clone, ".git"), { recursive: true, force: true });
     const realClone = await realpath(clone);
@@ -523,16 +594,19 @@ function diffEntries(before: ReadonlyMap<string, string>, next: readonly NewEntr
 export async function updateSources(
   arg: string | null,
   ctx: Ctx,
+  ref: string | null = null,
 ): Promise<{ results: UpdateResult[]; errors: { id: string; message: string }[] }> {
+  if (ref !== null && arg === null) throw new UsageError("update --ref requires one Git source");
   const sources = await readSources();
   // A missing, legacy, or invalid index fails once here, not once per source.
   if (arg === null) await checkIndex(sources);
   const targets = arg === null ? sources : [findSource(sources, arg)];
+  await validateUpdateRef(ref, targets[0]);
   const results: UpdateResult[] = [];
   const errors: { id: string; message: string }[] = [];
   for (const t of targets) {
     try {
-      results.push(await updateOne(t.id, ctx));
+      results.push(await updateOne(t.id, ctx, ref));
     } catch (err) {
       if (arg !== null) throw err;
       errors.push({ id: t.id, message: err instanceof Error ? err.message : String(err) });
@@ -562,7 +636,7 @@ function replaceSource(
   };
 }
 
-async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
+async function updateOne(id: string, ctx: Ctx, ref: string | null): Promise<UpdateResult> {
   // Re-read state so that several updates in a row see each other's writes.
   const sources = await readSources();
   const rec = sources.find((s) => s.id === id);
@@ -579,9 +653,10 @@ async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
   // readSources() only returns a git record with a url.
   const url = rec.url as string;
 
+  const selected = ref ?? (await trackingRef(rec, false)).ref;
   return withStaging(async (stage) => {
     const clone = path.join(stage, "repo");
-    const sha = await gitClone(url, rec.ref, clone);
+    const sha = await gitClone(url, selected, clone);
     // The store serves files from here; clone metadata holds the remote URL and the operator's identity.
     await rm(path.join(clone, ".git"), { recursive: true, force: true });
     const realClone = await realpath(clone);
@@ -600,12 +675,7 @@ async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
         async (fresh, db) => {
           const current = fresh.find((s) => s.id === id);
           if (current === undefined) throw new MargraveError(`no source "${id}"`);
-          if (
-            current.kind !== "git" ||
-            current.snapshot !== rec.snapshot ||
-            current.commit !== rec.commit ||
-            current.installedAt !== rec.installedAt
-          ) {
+          if (JSON.stringify(current) !== JSON.stringify(rec)) {
             throw new MargraveError("source changed during update; run margrave update again");
           }
           alias = await switchAlias(id, current, destination);
@@ -613,7 +683,7 @@ async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
           deleteSourceSkills(db, id);
           insertSkills(db, entries);
           diff.value = diffEntries(before, entries);
-          return fresh.map((s) => (s.id === id ? { ...s, commit: sha, snapshot } : s));
+          return fresh.map((s) => (s.id === id ? { ...s, commit: sha, snapshot, ref: selected } : s));
         },
         async () => {
           await alias?.rollback();
@@ -648,6 +718,61 @@ async function scanLocal(rec: SourceRecord, ctx: Ctx): Promise<NewEntry[]> {
   const scan = await scanSource(root, { followSymlinks: true, strict: true });
   logWarnings(ctx, scan.warnings);
   return toEntries(rec.id, scan.skills, (d) => d);
+}
+
+export interface CheckResult {
+  id: string;
+  updateAvailable: boolean;
+  added: string[];
+  changed: string[];
+  removed: string[];
+  error: string | null;
+  oldCommit: string | null;
+  newCommit: string | null;
+}
+
+export async function checkSources(arg: string | null): Promise<CheckResult[]> {
+  const sources = await readSources();
+  const targets = arg === null ? sources : [findSource(sources, arg)];
+  if (targets.length === 0) return [];
+  const db = await openIndexRead();
+  try {
+    const results: CheckResult[] = [];
+    for (const rec of targets) {
+      const result: CheckResult = {
+        id: rec.id,
+        updateAvailable: false,
+        added: [],
+        changed: [],
+        removed: [],
+        error: null,
+        oldCommit: rec.commit,
+        newCommit: null,
+      };
+      try {
+        const before = skillHashes(db, rec.id);
+        const entries = await scanInstalledSource(rec, { log: () => {}, allowUnsafe: false });
+        Object.assign(result, diffEntries(before, entries));
+        if (rec.kind === "git") {
+          const remote = await trackingRef(rec, true);
+          result.newCommit = remote.sha;
+          result.updateAvailable = remote.sha !== rec.commit;
+        }
+      } catch (err) {
+        result.error = err instanceof Error ? err.message : String(err);
+      }
+      try {
+        const current = (await readSources()).find((source) => source.id === rec.id);
+        if (JSON.stringify(current) !== JSON.stringify(rec)) result.error = "source changed during check; run margrave check again";
+      } catch (err) {
+        result.error = err instanceof Error ? err.message : String(err);
+      }
+      results.push(result);
+    }
+    return results;
+  } finally {
+    db.close();
+  }
 }
 
 // ---- remove ----

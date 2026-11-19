@@ -31,6 +31,17 @@ async function snapshot(home: string): Promise<{ sources: string | null; index: 
   return { sources: await read("sources.json"), index };
 }
 
+async function storeFiles(dir: string): Promise<Record<string, string>> {
+  const files: Record<string, string> = {};
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const file = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      for (const [name, bytes] of Object.entries(await storeFiles(file))) files[path.join(entry.name, name)] = bytes;
+    } else if (entry.isFile()) files[entry.name] = (await readFile(file)).toString("base64");
+  }
+  return files;
+}
+
 async function names(dir: string): Promise<string[]> {
   return (await readdir(dir).catch((): string[] => [])).sort();
 }
@@ -58,7 +69,7 @@ test("git source via file://: install, duplicate, find, load, update, remove", a
   assert.equal(rec[0]?.["kind"], "git");
   assert.equal(rec[0]?.["commit"], first);
   assert.equal(rec[0]?.["url"], repo.url);
-  assert.equal(rec[0]?.["ref"], "main", "no --ref pins the default branch");
+  assert.equal(rec[0]?.["ref"], "refs/heads/main", "no --ref pins the default branch");
 
   // duplicate install errors and changes nothing
   const before = await snapshot(env.home);
@@ -132,7 +143,7 @@ test("git source via file://: install, duplicate, find, load, update, remove", a
 
   // list
   const list = await mg(env, ["list"]);
-  assert.equal(list.stdout.trim(), `${id}  git  ref=main  commit=${second.slice(0, 7)}  skills=3`);
+  assert.equal(list.stdout.trim(), `${id}  git  ref=refs/heads/main  commit=${second.slice(0, 7)}  skills=3`);
   const listSkills = await mg(env, ["list", "--skills"]);
   assert.ok(listSkills.stdout.includes(`  ${id}/vue-perf: Optimize Vue rendering performance`));
 
@@ -164,7 +175,7 @@ test("--ref installs a branch and update keeps it", async () => {
   assert.equal(inst.code, 0, inst.stderr);
   assert.match(inst.stdout, /\(4 skills\)/u);
   const rec = JSON.parse((await snapshot(env.home)).sources ?? "[]") as { ref: string }[];
-  assert.equal(rec[0]?.ref, "feature");
+  assert.equal(rec[0]?.ref, "refs/heads/feature");
   const upd = await mg(env, ["update"]);
   assert.equal(upd.code, 0, upd.stderr);
   assert.match((await mg(env, ["list", "--skills"])).stdout, /only-on-feature/u);
@@ -175,6 +186,140 @@ test("--ref installs a branch and update keeps it", async () => {
   assert.match(r.stderr, /git clone/u);
   assert.equal((await snapshot(bad.home)).sources, null);
   assert.equal((await mg(bad, ["install", repo.url, "--ref", "-x"])).code, 2);
+  assert.equal((await mg(bad, ["install", repo.url, "--ref", "refs/heads/bad..ref"])).code, 2);
+});
+
+test("short tag install records its full ref and peeled commit", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const commit = await head(repo.dir);
+  await git(repo.dir, "tag", "-a", "release", "-m", "release");
+  const result = await mg(env, ["install", repo.url, "--ref", "release"]);
+  assert.equal(result.code, 0, result.stderr);
+  const records = JSON.parse(await readFile(path.join(env.home, "sources.json"), "utf8")) as { ref: string; commit: string }[];
+  assert.equal(records[0]?.ref, "refs/tags/release");
+  assert.equal(records[0]?.commit, commit);
+});
+
+test("check and explicit Git tracking refs", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  await git(repo.dir, "branch", "refs/topic");
+  await git(repo.dir, "tag", "-a", "shared", "-m", "tag");
+  await git(repo.dir, "branch", "shared");
+  const sharedEnv = await setup();
+  const shared = await mg(sharedEnv, ["install", repo.url, "--ref", "shared"]);
+  assert.equal(shared.code, 0, shared.stderr);
+  const sharedRecords = JSON.parse(await readFile(path.join(sharedEnv.home, "sources.json"), "utf8")) as { ref: string }[];
+  assert.equal(sharedRecords[0]?.ref, "refs/heads/shared");
+  const inst = await mg(env, ["install", repo.url, "--ref", "refs/topic"]);
+  assert.equal(inst.code, 0, inst.stderr);
+  const id = sourceId(inst);
+  const sourceFile = path.join(env.home, "sources.json");
+  const indexFile = path.join(env.home, "index.db");
+  const record = async (): Promise<{ ref: string; commit: string }[]> =>
+    JSON.parse(await readFile(sourceFile, "utf8")) as { ref: string; commit: string }[];
+  assert.equal((await record())[0]?.ref, "refs/heads/refs/topic");
+  const taggedCommit = (await record())[0]?.commit;
+  const before = await storeFiles(env.home);
+  const current = await mg(env, ["check", id, "--json"]);
+  assert.equal(current.code, 0, current.stderr);
+  assert.equal((JSON.parse(current.stdout) as { updateAvailable: boolean }[])[0]?.updateAvailable, false);
+  assert.deepEqual(await storeFiles(env.home), before);
+  const originalSources = await readFile(sourceFile, "utf8");
+  const invalidRecords = JSON.parse(originalSources) as { ref: string }[];
+  assert.ok(invalidRecords[0]);
+  invalidRecords[0].ref = "refs/heads/bad..ref";
+  await writeFile(sourceFile, JSON.stringify(invalidRecords));
+  assert.equal((await mg(env, ["check", id])).code, 1);
+  await writeFile(sourceFile, originalSources);
+  await writeSkill(path.join(repo.dir, "skills"), "branch-only", "A branch skill");
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-qm", "branch commit");
+  await git(repo.dir, "branch", "-f", "shared", "HEAD");
+  const tag = await mg(env, ["update", id, "--ref", "refs/tags/shared"]);
+  assert.equal(tag.code, 0, tag.stderr);
+  assert.equal((await record())[0]?.ref, "refs/tags/shared");
+  assert.equal((await record())[0]?.commit, taggedCommit);
+  assert.equal((await mg(env, ["check", id])).code, 0);
+  await git(repo.dir, "tag", "-d", "shared");
+  const missingBefore = await storeFiles(env.home);
+  assert.equal((await mg(env, ["check", id])).code, 1);
+  assert.deepEqual(await storeFiles(env.home), missingBefore);
+  const failed = await mg(env, ["update", id, "--ref", "refs/heads/missing"]);
+  assert.equal(failed.code, 1);
+  assert.equal((await record())[0]?.ref, "refs/tags/shared");
+  const branch = await mg(env, ["update", id, "--ref", "refs/heads/shared"]);
+  assert.equal(branch.code, 0, branch.stderr);
+  assert.equal((await record())[0]?.commit, await head(repo.dir));
+  await writeSkill(path.join(repo.dir, "skills"), "later", "A later skill");
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-qm", "later commit");
+  await git(repo.dir, "branch", "-f", "shared", "HEAD");
+  const available = await mg(env, ["check", id]);
+  assert.equal(available.code, 1);
+  assert.match(available.stdout, /update available/u);
+  assert.equal((await mg(env, ["update", "--ref", "refs/heads/main"])).code, 2);
+  assert.equal((await mg(env, ["update", id, "--ref", "main"])).code, 2);
+  assert.equal((await mg(env, ["update", id, "--ref", "refs/heads/bad..ref"])).code, 2);
+  await writeFile(path.join(env.home, "sources", id, "skills", "react-perf", "SKILL.md"), skillMd("react-perf", "changed"));
+  const driftBefore = [await readFile(sourceFile), await readFile(indexFile)];
+  const drift = await mg(env, ["check", id, "--json"]);
+  assert.equal(drift.code, 1, drift.stderr);
+  assert.deepEqual((JSON.parse(drift.stdout) as { changed: string[] }[])[0]?.changed, [`${id}/react-perf`]);
+  assert.equal((JSON.parse(drift.stdout) as { updateAvailable: boolean }[])[0]?.updateAvailable, true);
+  assert.deepEqual([await readFile(sourceFile), await readFile(indexFile)], driftBefore);
+});
+
+test("check reports local additions, removals, and supporting file changes", async () => {
+  const env = await setup();
+  const root = await tmp("mg-local-");
+  await writeSkill(root, "old", "Old skill");
+  await writeSkill(root, "kept", "Kept skill");
+  const inst = await mg(env, ["install", root]);
+  assert.equal(inst.code, 0, inst.stderr);
+  const id = sourceId(inst);
+  await writeFile(path.join(root, "kept", "support.txt"), "new bytes");
+  await rm(path.join(root, "old"), { recursive: true });
+  await writeSkill(root, "new", "New skill");
+  const before = [await readFile(path.join(env.home, "sources.json")), await readFile(path.join(env.home, "index.db"))];
+  const checked = await mg(env, ["check", root, "--json"]);
+  assert.equal(checked.code, 1, checked.stderr);
+  const rows = JSON.parse(checked.stdout) as { added: string[]; changed: string[]; removed: string[] }[];
+  assert.deepEqual(rows[0]?.added, [`${id}/new`]);
+  assert.deepEqual(rows[0]?.changed, [`${id}/kept`]);
+  assert.deepEqual(rows[0]?.removed, [`${id}/old`]);
+  assert.deepEqual([await readFile(path.join(env.home, "sources.json")), await readFile(path.join(env.home, "index.db"))], before);
+  assert.equal((await mg(env, ["update", id, "--ref", "refs/heads/main"])).code, 2);
+});
+
+test("legacy short refs resolve only when safe", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  await git(repo.dir, "branch", "legacy");
+  const inst = await mg(env, ["install", repo.url, "--ref", "legacy"]);
+  assert.equal(inst.code, 0, inst.stderr);
+  const id = sourceId(inst);
+  const file = path.join(env.home, "sources.json");
+  const records = JSON.parse(await readFile(file, "utf8")) as { ref: string }[];
+  assert.ok(records[0]);
+  records[0].ref = "legacy";
+  await writeFile(file, JSON.stringify(records));
+  assert.equal((await mg(env, ["check", id])).code, 0);
+  await git(repo.dir, "tag", "-a", "legacy", "-m", "tag");
+  const ambiguous = await mg(env, ["check", id]);
+  assert.equal(ambiguous.code, 1);
+  assert.match(ambiguous.stderr, /source tracking ref is unresolved/u);
+  assert.equal((await mg(env, ["update", id])).code, 1);
+  await git(repo.dir, "tag", "-d", "legacy");
+  await writeSkill(path.join(repo.dir, "skills"), "added", "A new skill");
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-qm", "new commit");
+  await git(repo.dir, "branch", "-f", "legacy", "HEAD");
+  assert.equal((await mg(env, ["check", id])).code, 1);
+  const updated = await mg(env, ["update", id]);
+  assert.equal(updated.code, 0, updated.stderr);
+  assert.equal((JSON.parse(await readFile(file, "utf8")) as { ref: string }[])[0]?.ref, "refs/heads/legacy");
 });
 
 test("a failed install leaves no staging, no store dir, and no sources.json change", async () => {
@@ -319,10 +464,10 @@ function newFindings(text: string): string[] {
 }
 
 /** A refused update leaves the old copy live: same sources.json and index.db rows, same files, no staging. */
-async function refusedUpdate(m: Marked, extra?: Record<string, string>): Promise<Run> {
+async function refusedUpdate(m: Marked, extra?: Record<string, string>, ref?: string): Promise<Run> {
   const before = await snapshot(m.env.home);
   const oldFile = await installedFile(m);
-  const r = await mg(m.env, ["update", m.id], extra);
+  const r = await mg(m.env, ["update", m.id, ...(ref === undefined ? [] : ["--ref", ref])], extra);
   assert.equal(r.code, 1, r.stderr);
   assert.match(r.stderr, /refused/u);
   assert.match(r.stderr, /--allow-unsafe/u);
@@ -378,7 +523,11 @@ test("update refuses one new critical finding and lists only that one", async ()
     "# d\nboom FAKE-CRIT EXFILTRATE:new-one\n",
   );
   await commitAll(m.repo.dir, "new crit");
-  const r = await refusedUpdate(m);
+  await git(m.repo.dir, "branch", "unsafe");
+  const before = JSON.parse((await snapshot(m.env.home)).sources ?? "[]") as { ref: string }[];
+  const r = await refusedUpdate(m, undefined, "refs/heads/unsafe");
+  const after = JSON.parse((await snapshot(m.env.home)).sources ?? "[]") as { ref: string }[];
+  assert.equal(after[0]?.ref, before[0]?.ref);
   assert.match(r.stderr, /; 1 new vs installed copy/u);
   assert.deepEqual(newFindings(r.stderr), ["skills/docker-compose/SKILL.md:6  EXFILTRATE:new-one  critical"]);
 });
@@ -659,7 +808,7 @@ test("git source: the stored copy keeps no .git after install, and update drops 
   const stored = path.join(env.home, "sources", id);
   await assert.rejects(stat(path.join(stored, ".git")), { code: "ENOENT" });
   assert.equal((await stat(path.join(stored, "SKILL.md"))).isFile(), true);
-  assert.match((await mg(env, ["list"])).stdout, new RegExp(`^${id}  git  ref=main `, "mu"));
+  assert.match((await mg(env, ["list"])).stdout, new RegExp(`^${id}  git  ref=refs/heads/main `, "mu"));
 
   // A copy installed by an earlier version still holds the clone's .git.
   await mkdir(path.join(stored, ".git"));

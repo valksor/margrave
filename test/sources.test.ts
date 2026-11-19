@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import {
   checkRef,
+  checkSources,
   findSource,
   installSource,
   localId,
@@ -555,6 +556,44 @@ test("reindex: a rejection that is not an Error is logged as text and the source
   });
 });
 
+test("check reports a source record changed during its scan", async (t) => {
+  await inStore(t, async (home) => {
+    const root = await tmp("mg-source-");
+    await writeSkill(root, "alpha", "alpha skill");
+    const { id } = await installSource(root, null, quiet);
+    const file = path.join(home, "sources.json");
+    const real = fsp.readdir;
+    let changed = false;
+    mock.method(fsp, "readdir", (async (p: string, ...args: unknown[]) => {
+      if (p === root && !changed) {
+        changed = true;
+        const records = JSON.parse(await fsp.readFile(file, "utf8")) as SourceRecord[];
+        assert.ok(records[0]);
+        records[0].installedAt = "changed";
+        await fsp.writeFile(file, JSON.stringify(records));
+      }
+      return (real as (...x: unknown[]) => Promise<unknown>)(p, ...args);
+    }) as typeof fsp.readdir);
+    syncBuiltinESMExports();
+    const results = await checkSources(id);
+    assert.equal(changed, true);
+    assert.equal(results[0]?.error, "source changed during check; run margrave check again");
+  });
+});
+
+test("update propagates a missing Git executable for a valid ref", async (t) => {
+  await inStore(t, async () => {
+    const repo = await makeRepo();
+    const { id } = await installSource(repo.url, null, quiet);
+    process.env["PATH"] = await tmp("mg-empty-path-");
+    await assert.rejects(updateSources(id, quiet, "refs/heads/main"), (err: unknown) => {
+      assert.ok(err instanceof MargraveError);
+      assert.match(err.message, /git was not found on PATH/u);
+      return true;
+    });
+  });
+});
+
 test("reindex: control characters in a failure message are logged as text", async (t) => {
   await inStore(t, async (home) => {
     const repo = await makeRepo();
@@ -603,6 +642,10 @@ test("reindex preserves unreadable source rows and migration rejects an unreadab
       ? Promise.reject(Object.assign(new Error("denied"), { code: "EACCES" }))
       : (actual as (...x: unknown[]) => unknown)(p, ...args)) as typeof fsp.readdir);
   syncBuiltinESMExports();
+  const checked = await checkSources(null);
+  assert.equal(checked.length, 2);
+  assert.match(checked[0]?.error ?? "", /denied/u);
+  assert.deepEqual(checked[1]?.changed, [`${localId(other)}/beta`]);
   const logs: string[] = [];
   await reindexAll({ log: (line) => logs.push(line), allowUnsafe: false });
   const after = indexRows(home);

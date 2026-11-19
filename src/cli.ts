@@ -15,7 +15,7 @@ import {
   resolveSkill,
   validateRevision,
 } from "./skills.ts";
-import { installSource, listSources, reindexAll, removeSource, updateSources } from "./sources.ts";
+import { checkSources, installSource, listSources, reindexAll, removeSource, updateSources } from "./sources.ts";
 import type { Ctx } from "./sources.ts";
 import { MargraveError, RequestError, UsageError } from "./store.ts";
 import { wrap } from "./wrap.ts";
@@ -23,7 +23,8 @@ import { wrap } from "./wrap.ts";
 const USAGE = `usage: margrave <command>
 
   install <spec> [--ref R] [--allow-unsafe]   add a skill source (owner/repo[/sub/path], git URL, or local path)
-  update [source] [--allow-unsafe]            refresh one source, or all
+  update [source] [--ref R] [--allow-unsafe]  refresh one source, or all
+  check [source] [--json]                     check for updates and installed-file drift
   remove <source>                             remove a source (never deletes a local directory)
   list [--skills] [--json]                    list sources, and with --skills every skill
   find "<task>" [--limit N] [--json] [--explain]  rank installed skills for a task
@@ -62,6 +63,63 @@ const json = (v: unknown): void => out(JSON.stringify(v, null, 2));
 
 const short = (sha: string | null): string => (sha === null ? "-" : sha.slice(0, 7));
 
+async function updateCommand(rest: string[]): Promise<void> {
+  const ctx = (allowUnsafe: boolean): Ctx => ({ log: err, allowUnsafe });
+  const p = parse(rest, { ref: { type: "string" }, "allow-unsafe": { type: "boolean" } });
+  if (p.values["ref"] !== undefined && p.positionals.length !== 1) throw new UsageError("update --ref requires one Git source");
+  const [source] = positionals(p, 0, 1, "update [source]");
+  const { results, errors } = await updateSources(
+    source ?? null,
+    ctx(p.values["allow-unsafe"] === true),
+    typeof p.values["ref"] === "string" ? p.values["ref"] : null,
+  );
+  for (const r of results) {
+    out(r.kind === "git" ? `${clean(r.id)}: ${short(r.oldCommit)} → ${short(r.newCommit)}` : `${clean(r.id)}: reindexed`);
+    for (const id of r.added) out(`  added: ${clean(id)}`);
+    for (const id of r.changed) out(`  changed: ${clean(id)}`);
+    for (const id of r.removed) out(`  removed: ${clean(id)}`);
+  }
+  if (results.length === 0 && errors.length === 0) out(NO_SOURCES_MESSAGE);
+  for (const e of errors) err(`margrave: update ${clean(e.id)} failed: ${e.message}`);
+  if (errors.length > 0) process.exitCode = 1;
+  return;
+}
+
+async function checkCommand(rest: string[]): Promise<void> {
+  const p = parse(rest, { json: { type: "boolean" } });
+  const [source] = positionals(p, 0, 1, "check [source] [--json]");
+  const results = await checkSources(source ?? null);
+  if (results.length === 0) out(NO_SOURCES_MESSAGE);
+  else if (p.values["json"] === true) {
+    json(
+      results.map(({ id, updateAvailable, added, changed, removed, error }) => ({
+        id: clean(id),
+        updateAvailable,
+        added: added.map(clean),
+        changed: changed.map(clean),
+        removed: removed.map(clean),
+        error: error === null ? null : cleanBlock(error),
+      })),
+    );
+  } else {
+    for (const r of results) {
+      const drift = r.added.length + r.changed.length + r.removed.length > 0;
+      if (r.updateAvailable) out(`${clean(r.id)}: update available (${short(r.oldCommit)} → ${short(r.newCommit)})`);
+      if (drift) {
+        out(`${clean(r.id)}: installed files changed`);
+        for (const id of r.added) out(`  added: ${clean(id)}`);
+        for (const id of r.changed) out(`  changed: ${clean(id)}`);
+        for (const id of r.removed) out(`  removed: ${clean(id)}`);
+      }
+      if (r.error !== null) err(`${clean(r.id)}: ${r.error}`);
+      if (!r.updateAvailable && !drift && r.error === null) out(`${clean(r.id)}: current`);
+    }
+  }
+  if (results.some((r) => r.updateAvailable || r.added.length + r.changed.length + r.removed.length > 0 || r.error !== null))
+    process.exitCode = 1;
+  return;
+}
+
 async function run(argv: string[]): Promise<void> {
   const [command, ...rest] = argv;
   if (command === undefined) throw new UsageError("missing command");
@@ -88,21 +146,10 @@ async function run(argv: string[]): Promise<void> {
       for (const s of r.skills) out(`  ${clean(s)}`);
       return;
     }
-    case "update": {
-      const p = parse(rest, { "allow-unsafe": { type: "boolean" } });
-      const [source] = positionals(p, 0, 1, "update [source]");
-      const { results, errors } = await updateSources(source ?? null, ctx(p.values["allow-unsafe"] === true));
-      for (const r of results) {
-        out(r.kind === "git" ? `${clean(r.id)}: ${short(r.oldCommit)} → ${short(r.newCommit)}` : `${clean(r.id)}: reindexed`);
-        for (const id of r.added) out(`  added: ${clean(id)}`);
-        for (const id of r.changed) out(`  changed: ${clean(id)}`);
-        for (const id of r.removed) out(`  removed: ${clean(id)}`);
-      }
-      if (results.length === 0 && errors.length === 0) out(NO_SOURCES_MESSAGE);
-      for (const e of errors) err(`margrave: update ${clean(e.id)} failed: ${e.message}`);
-      if (errors.length > 0) process.exitCode = 1;
-      return;
-    }
+    case "update":
+      return updateCommand(rest);
+    case "check":
+      return checkCommand(rest);
     case "remove": {
       const p = parse(rest, {});
       const [source] = positionals(p, 1, 1, "remove <source>");
