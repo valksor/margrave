@@ -1,7 +1,7 @@
 // stdio MCP server. Read-only: it opens index.db on every call.
 import { readFileSync } from "node:fs";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { McpServer } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import {
   NO_SOURCES_MESSAGE,
@@ -124,7 +124,7 @@ function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | und
     "find_skills",
     {
       description: FIND_DESCRIPTION,
-      inputSchema: { task: z.string(), limit: z.number().int().optional(), explain: z.boolean().optional() },
+      inputSchema: z.object({ task: z.string(), limit: z.number().int().optional(), explain: z.boolean().optional() }),
     },
     async ({ task, limit, explain }) => {
       try {
@@ -143,7 +143,7 @@ function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | und
 
   server.registerTool(
     "load_skill",
-    { description: variant.loadDescription, inputSchema: { id: z.string(), revision: z.string().optional() } },
+    { description: variant.loadDescription, inputSchema: z.object({ id: z.string(), revision: z.string().optional() }) },
     async ({ id, revision }) => {
       try {
         validateRevision(revision);
@@ -160,7 +160,7 @@ function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | und
 
   server.registerTool(
     "read_skill_file",
-    { description: variant.readDescription, inputSchema: { id: z.string(), path: z.string(), revision: z.string().optional() } },
+    { description: variant.readDescription, inputSchema: z.object({ id: z.string(), path: z.string(), revision: z.string().optional() }) },
     async ({ id, path, revision }) => {
       try {
         validateRevision(revision);
@@ -178,9 +178,10 @@ function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | und
   return server;
 }
 
-export async function runMcp(): Promise<void> {
+export function runMcp(): Promise<void> {
   const value = process.env["MARGRAVE_ALLOWED_SOURCES"];
   const ids = value === undefined ? undefined : value.trim() === "" ? [] : value.split(",").map((id) => id.trim());
   const allowedSources = validateAllowedSources(ids, "MARGRAVE_ALLOWED_SOURCES must contain comma-separated source IDs");
-  await buildServer(LOCAL, allowedSources).connect(new StdioServerTransport());
+  serveStdio(() => buildServer(LOCAL, allowedSources), { legacy: "reject" });
+  return Promise.resolve();
 }

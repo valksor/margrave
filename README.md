@@ -246,7 +246,9 @@ Limit: the baseline compares the flagged line, not the lines around it. A known 
 
 ## MCP server
 
-`margrave mcp` is read-only. `install`, `update`, and `remove` are not exposed. It opens `index.db` on every call, so a new install shows up without a restart. After you upgrade margrave, restart running `margrave mcp` sessions: a session started by an older version still reads `index.json`.
+`margrave mcp` and `margrave/hosted` require a client that supports MCP protocol revision `2026-07-28`.
+
+`margrave mcp` is read-only. `install`, `update`, and `remove` are not exposed. It opens `index.db` on every call, so a new install shows up without a restart. After upgrading Margrave, restart running `margrave mcp` sessions.
 
 | Tool              | Input                        | Result                                                                                                                                  |
 | ----------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
@@ -266,7 +268,7 @@ Scoped servers apply this list to search, skill loads, and supporting-file reads
 
 Pass `{ allowedSources: ["owner__repo"] }` as the second argument to `handleHostedMcp` to scope a hosted request. An empty array serves no sources. The hosted application chooses this option in trusted server code.
 
-It has the same three tools and the same inputs as `margrave mcp`. It reads the store in `MARGRAVE_HOME` of the host process on every call. It needs read access to `MARGRAVE_HOME`; it does not need write access, so a read-only mount or a separate user works. It is stateless and POST-only. Other methods get 405.
+It has the same three tools and the same inputs as `margrave mcp`. It reads the store in `MARGRAVE_HOME` of the host process on every call. It needs read access to `MARGRAVE_HOME`; it does not need write access, so a read-only mount or a separate user works. The handler serves MCP requests over stateless Streamable HTTP. It is POST-only. Other methods get 405.
 
 To upgrade (see also [Upgrading](#upgrading)):
 

@@ -2,9 +2,8 @@ import assert from "node:assert/strict";
 import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test, { mock } from "node:test";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { createMcpHandler } from "@modelcontextprotocol/server";
 import { handleHostedMcp } from "../src/hosted.ts";
 import {
   FIND_DESCRIPTION,
@@ -28,13 +27,18 @@ async function call(client: Client, name: string, args: Record<string, unknown>)
 
 /** A client of handleHostedMcp. The fetch goes straight to the handler, so no network is used. */
 async function connectHosted(t: { after: (fn: () => Promise<void>) => void }, allowedSources?: readonly string[]): Promise<Client> {
-  const client = new Client({ name: "margrave-test", version: "0.0.0" });
+  const client = new Client({ name: "margrave-test", version: "0.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
   await client.connect(
     new StreamableHTTPClientTransport(new URL("http://test/mcp?allowedSources=all"), {
-      fetch: (url, init) => {
+      fetch: async (url, init) => {
         const headers = new Headers(init?.headers);
         headers.set("allowedSources", "all");
-        return handleHostedMcp(new Request(url, { ...init, headers }), allowedSources === undefined ? {} : { allowedSources });
+        const response = await handleHostedMcp(
+          new Request(url, { ...init, headers }),
+          allowedSources === undefined ? {} : { allowedSources },
+        );
+        if (response.ok) assert.match(response.headers.get("content-type") ?? "", /^application\/json\b/u);
+        return response;
       },
     }),
   );
@@ -42,12 +46,13 @@ async function connectHosted(t: { after: (fn: () => Promise<void>) => void }, al
   return client;
 }
 
-/** A client of the stdio server's createServer(), linked over memory. */
+/** A client of the stdio server's createServer(), using a stateless handler. */
 async function connectLocal(t: { after: (fn: () => Promise<void>) => void }): Promise<Client> {
-  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-  await createServer().connect(serverSide);
-  const client = new Client({ name: "margrave-test", version: "0.0.0" });
-  await client.connect(clientSide);
+  const handler = createMcpHandler(() => createServer(), { legacy: "reject" });
+  const client = new Client({ name: "margrave-test", version: "0.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL("http://test/mcp"), { fetch: (url, init) => handler.fetch(new Request(url, init)) }),
+  );
   t.after(() => client.close());
   return client;
 }
@@ -385,4 +390,22 @@ test("hosted source options isolate requests on the same store", async (t) => {
       message: "allowedSources must contain valid source IDs",
     });
   }
+});
+
+test("hosted rejects an older protocol negotiation", async () => {
+  const response = await handleHostedMcp(
+    new Request("http://test/mcp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1" } },
+      }),
+    }),
+  );
+  const body = (await response.json()) as { id: number; error: { code: number } };
+  assert.equal(body.id, 1);
+  assert.equal(body.error.code, -32022);
 });

@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import fsp, { mkdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import test, { mock } from "node:test";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { createMcpHandler } from "@modelcontextprotocol/server";
 import { FIND_DESCRIPTION, LOAD_DESCRIPTION, READ_DESCRIPTION, SERVER_INSTRUCTIONS, createServer } from "../src/mcp.ts";
 import { CLI, fakeRipwire, runCli, tmp, writeSkill } from "./helpers.ts";
 
@@ -28,7 +29,7 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
     args: [CLI, "mcp"],
     env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home },
   });
-  const client = new Client({ name: "margrave-test", version: "0.0.0" });
+  const client = new Client({ name: "margrave-test", version: "0.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
   await client.connect(transport);
   t.after(async () => {
     await client.close();
@@ -126,12 +127,13 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   assert.equal(tools.length, 3);
 });
 
-/** Run createServer() in this process, linked to a client over memory. */
+/** Run createServer() in this process through a stateless handler. */
 async function connectInMemory(t: { after: (fn: () => Promise<void>) => void }): Promise<Client> {
-  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-  await createServer().connect(serverSide);
-  const client = new Client({ name: "margrave-test", version: "0.0.0" });
-  await client.connect(clientSide);
+  const handler = createMcpHandler(() => createServer(), { legacy: "reject" });
+  const client = new Client({ name: "margrave-test", version: "0.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL("http://test/mcp"), { fetch: (url, init) => handler.fetch(new Request(url, init)) }),
+  );
   t.after(() => client.close());
   return client;
 }
@@ -236,10 +238,11 @@ test("many failing tool calls leave no open index handle: reindex rebuilds the d
   await writeSkill(dir, "alpha", "alpha skill");
   const fakeBin = await fakeRipwire();
   assert.equal((await runCli(["install", dir], { home, fakeBin })).code, 0);
-  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-  await createServer().connect(serverSide);
-  const client = new Client({ name: "margrave-test", version: "0.0.0" });
-  await client.connect(clientSide);
+  const handler = createMcpHandler(() => createServer(), { legacy: "reject" });
+  const client = new Client({ name: "margrave-test", version: "0.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL("http://test/mcp"), { fetch: (url, init) => handler.fetch(new Request(url, init)) }),
+  );
   t.after(() => client.close());
 
   for (let i = 0; i < 300; i++) {
@@ -273,7 +276,7 @@ test("stdio source allowlists scope search and both reads", async (t) => {
   for (const scope of [undefined, `${visible}, ${visible},missing`, ""]) {
     const env: Record<string, string> = { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home };
     if (scope !== undefined) env["MARGRAVE_ALLOWED_SOURCES"] = scope;
-    const client = new Client({ name: "scope-test", version: "1" });
+    const client = new Client({ name: "scope-test", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
     await client.connect(new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp"], env }));
     t.after(() => client.close());
     const found = await call(client, "find_skills", { task: "terraform modules", limit: 1, explain: true });
@@ -312,4 +315,18 @@ test("stdio source allowlists scope search and both reads", async (t) => {
     assert.notEqual(result.code, 0);
     assert.match(result.stderr, /MARGRAVE_ALLOWED_SOURCES must contain comma-separated source IDs/u);
   }
+});
+
+test("stdio rejects an older protocol negotiation", () => {
+  const request = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1" } },
+  };
+  const result = spawnSync(process.execPath, [CLI, "mcp"], { input: `${JSON.stringify(request)}\n`, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  const response = JSON.parse(result.stdout) as { id: number; error: { code: number } };
+  assert.equal(response.id, 1);
+  assert.equal(response.error.code, -32022);
 });

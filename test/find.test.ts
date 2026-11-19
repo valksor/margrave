@@ -3,8 +3,8 @@ import { rm } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { Client } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { BODY_TOKEN_LIMIT, FIELD_WEIGHTS, NAME_BONUS, queryTerms } from "../src/bm25.ts";
 import { findSkills } from "../src/skills.ts";
 import { CLI, fakeRipwire, runCli, tmp, writeSkill } from "./helpers.ts";
@@ -180,7 +180,7 @@ test("search relevance and CLI/MCP parity on an installed corpus", async (t) => 
     }
     const ids = (JSON.parse(cli.stdout) as { results: { id: string }[] }).results.map((hit) => hit.id);
     assert.equal(ids.length, 2);
-    const client = new Client({ name: "find-test", version: "1" });
+    const client = new Client({ name: "find-test", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [CLI, "mcp"],
