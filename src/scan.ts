@@ -1,25 +1,33 @@
 // SKILL.md discovery, frontmatter parsing, headings.
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
 import { open, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import YAML from "yaml";
 import { buildFieldTokens } from "./bm25.ts";
+import { listFiles, readSkillFileBytes } from "./skill-files.ts";
 import type { TokenStrings } from "./bm25.ts";
 
-const SKIP_DIRS = new Set([".git", "node_modules"]);
+const SKIP_DIRS = new Set(["node_modules"]);
 
-/** Open flags for reading a file we must not follow: no symlink as the last component, and a FIFO does not block the open. */
-export const READ_NO_FOLLOW = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+export { READ_NO_FOLLOW } from "./skill-files.ts";
+import { READ_NO_FOLLOW } from "./skill-files.ts";
 
 export interface ScannedSkill {
   name: string;
   description: string;
   /** Absolute path of the skill directory as walked (under the scan root). */
   dir: string;
-  hash: string;
+  revision: string;
+  manifest: ManifestEntry[];
+  frontmatter: string;
   /** Token strings for the FTS columns, built from name, description, headings, and body. */
   tokens: TokenStrings;
+}
+
+export interface ManifestEntry {
+  path: string;
+  digest: string;
+  size: number;
 }
 
 export interface ScanResult {
@@ -35,6 +43,7 @@ export interface ScanOptions {
    * Defaults to the scan root. A git source with a subpath passes the clone root.
    */
   boundary?: string;
+  strict?: boolean;
 }
 
 /** True when `child` is `parent` or inside it. Compares with a trailing separator. */
@@ -82,7 +91,7 @@ export function extractHeadings(body: string): string[] {
   return out;
 }
 
-type Parsed = { ok: true; skill: Omit<ScannedSkill, "dir"> } | { ok: false; reason: string };
+type Parsed = { ok: true; skill: Omit<ScannedSkill, "dir" | "manifest" | "frontmatter" | "revision"> } | { ok: false; reason: string };
 
 export function parseSkillMd(text: string): Parsed {
   const { rawFrontmatter, body } = splitSkillMd(text);
@@ -109,104 +118,133 @@ export function parseSkillMd(text: string): Parsed {
     skill: {
       name: name.trim(),
       description: description.trim(),
-      hash: createHash("sha256").update(text).digest("hex"),
       tokens: buildFieldTokens({ name: name.trim(), description: description.trim(), headings, body }),
     },
   };
 }
 
+interface ScanState {
+  opts: ScanOptions;
+  boundary: string;
+  visited: Set<string>;
+  names: Set<string>;
+  skills: ScannedSkill[];
+  warnings: string[];
+}
+
+async function buildSkillManifest(dir: string, skillBytes: Buffer): Promise<{ manifest: ManifestEntry[]; revision: string }> {
+  const manifest: ManifestEntry[] = [];
+  for (const rel of await listFiles(dir, true)) {
+    const data = rel === "SKILL.md" ? skillBytes : await readSkillFileBytes(dir, rel, true, true);
+    manifest.push({ path: rel, digest: `sha256:${createHash("sha256").update(data).digest("hex")}`, size: data.length });
+  }
+  if (!manifest.some((entry) => entry.path === "SKILL.md")) throw new Error("SKILL.md disappeared during manifest construction");
+  const revision = `sha256:${createHash("sha256")
+    .update(JSON.stringify(manifest.map((e) => [e.path, e.digest, e.size])))
+    .digest("hex")}`;
+  return { manifest, revision };
+}
+
+async function ingestSkill(state: ScanState, dir: string, skillMdIsSymlink: boolean): Promise<void> {
+  const file = path.join(dir, "SKILL.md");
+  if (skillMdIsSymlink) {
+    state.warnings.push(`skipped ${file}: SKILL.md is a symlink`);
+    return;
+  }
+  const realDir = await realpath(dir);
+  if (!state.opts.followSymlinks && !isInside(realDir, state.boundary)) {
+    state.warnings.push(`skipped ${dir}: resolves outside the source`);
+    return;
+  }
+  let bytes: Buffer;
+  try {
+    const fh = await open(file, READ_NO_FOLLOW);
+    try {
+      if (!(await fh.stat()).isFile()) {
+        state.warnings.push(`skipped ${file}: not a regular file`);
+        return;
+      }
+      bytes = await fh.readFile();
+    } finally {
+      await fh.close();
+    }
+  } catch (err) {
+    if (state.opts.strict) throw err;
+    state.warnings.push(`skipped ${file}: ${(err as Error).message}`);
+    return;
+  }
+  const text = bytes.toString("utf8");
+  const parsed = parseSkillMd(text);
+  if (!parsed.ok) {
+    state.warnings.push(`skipped ${file}: ${parsed.reason}`);
+    return;
+  }
+  if (state.names.has(parsed.skill.name)) {
+    state.warnings.push(`skipped ${file}: duplicate skill name "${parsed.skill.name}" in this source`);
+    return;
+  }
+  let collected: { manifest: ManifestEntry[]; revision: string };
+  try {
+    collected = await buildSkillManifest(dir, bytes);
+  } catch (err) {
+    if (state.opts.strict) throw err;
+    state.warnings.push(`skipped ${file}: ${(err as Error).message}`);
+    return;
+  }
+  state.names.add(parsed.skill.name);
+  state.skills.push({ ...parsed.skill, ...collected, frontmatter: splitSkillMd(text).rawFrontmatter as string, dir });
+}
+
+async function walkSource(state: ScanState, dir: string): Promise<void> {
+  const realDir = await realpath(dir).catch((err: NodeJS.ErrnoException) => {
+    if (state.opts.strict) throw err;
+    return null;
+  });
+  if (realDir === null || state.visited.has(realDir)) return;
+  state.visited.add(realDir);
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (err) {
+    if (state.opts.strict) throw err;
+    state.warnings.push(`cannot read ${dir}: ${(err as Error).message}`);
+    return;
+  }
+  entries.sort((a, b) => (a.name < b.name ? -1 : 1));
+  const skillMd = entries.find((entry) => entry.name === "SKILL.md");
+  if (skillMd !== undefined) {
+    await ingestSkill(state, dir, skillMd.isSymbolicLink());
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.name.toLowerCase() === ".git" || SKIP_DIRS.has(entry.name)) continue;
+    const child = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await walkSource(state, child);
+    } else if (entry.isSymbolicLink()) {
+      const st = await stat(child).catch((err: NodeJS.ErrnoException) => {
+        if (state.opts.strict && err.code !== "ENOENT") throw err;
+        return null;
+      });
+      if (st === null || !st.isDirectory()) continue;
+      if (state.opts.followSymlinks) await walkSource(state, child);
+      else state.warnings.push(`skipped symlink ${child} (git sources follow no symlinks)`);
+    }
+  }
+}
+
 /** Walk `root` for skill directories (a directory that holds a SKILL.md). */
 export async function scanSource(root: string, opts: ScanOptions): Promise<ScanResult> {
-  const skills: ScannedSkill[] = [];
-  const warnings: string[] = [];
   const realRoot = await realpath(root);
-  const realBoundary = opts.boundary !== undefined ? await realpath(opts.boundary) : realRoot;
-  // Realpaths of every directory walked, so a symlink cycle or a second path to a directory is walked once.
-  const visited = new Set<string>();
-  const seenNames = new Set<string>();
-
-  async function walk(dir: string): Promise<void> {
-    const realDir = await realpath(dir).catch(() => null);
-    if (realDir === null || visited.has(realDir)) return;
-    visited.add(realDir);
-    let entries;
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch (err) {
-      warnings.push(`cannot read ${dir}: ${(err as Error).message}`);
-      return;
-    }
-    // Names in one directory are unique, so two names are never equal.
-    entries.sort((a, b) => (a.name < b.name ? -1 : 1));
-
-    const skillMd = entries.find((e) => e.name === "SKILL.md");
-    if (skillMd !== undefined) {
-      await addSkill(dir, skillMd.isSymbolicLink());
-      return;
-    }
-
-    for (const e of entries) {
-      if (SKIP_DIRS.has(e.name)) continue;
-      const child = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        await walk(child);
-      } else if (e.isSymbolicLink()) {
-        if (!opts.followSymlinks) {
-          // Git sources: a symlink might be a skill dir. Report only when it is a directory.
-          const st = await stat(child).catch(() => null);
-          if (st?.isDirectory()) warnings.push(`skipped symlink ${child} (git sources follow no symlinks)`);
-          continue;
-        }
-        const st = await stat(child).catch(() => null);
-        if (st === null || !st.isDirectory()) continue;
-        await walk(child);
-      }
-    }
-  }
-
-  async function addSkill(dir: string, skillMdIsSymlink: boolean): Promise<void> {
-    const file = path.join(dir, "SKILL.md");
-    if (skillMdIsSymlink) {
-      warnings.push(`skipped ${file}: SKILL.md is a symlink`);
-      return;
-    }
-    // Local sources follow symlinks on purpose, so only git sources are held to the boundary.
-    const realDir = await realpath(dir);
-    if (!opts.followSymlinks && !isInside(realDir, realBoundary)) {
-      warnings.push(`skipped ${dir}: resolves outside the source`);
-      return;
-    }
-    let text: string;
-    try {
-      const fh = await open(file, READ_NO_FOLLOW);
-      try {
-        if (!(await fh.stat()).isFile()) {
-          warnings.push(`skipped ${file}: not a regular file`);
-          return;
-        }
-        text = await fh.readFile("utf8");
-      } finally {
-        await fh.close();
-      }
-    } catch (err) {
-      warnings.push(`skipped ${file}: ${(err as Error).message}`);
-      return;
-    }
-    const parsed = parseSkillMd(text);
-    if (!parsed.ok) {
-      warnings.push(`skipped ${file}: ${parsed.reason}`);
-      return;
-    }
-    if (seenNames.has(parsed.skill.name)) {
-      warnings.push(`skipped ${file}: duplicate skill name "${parsed.skill.name}" in this source`);
-      return;
-    }
-    seenNames.add(parsed.skill.name);
-    skills.push({ ...parsed.skill, dir });
-  }
-
-  await walk(root);
-  // Names are unique within a source (see seenNames), so two names are never equal.
-  skills.sort((a, b) => (a.name < b.name ? -1 : 1));
-  return { skills, warnings };
+  const state: ScanState = {
+    opts,
+    boundary: opts.boundary !== undefined ? await realpath(opts.boundary) : realRoot,
+    visited: new Set(),
+    names: new Set(),
+    skills: [],
+    warnings: [],
+  };
+  await walkSource(state, root);
+  state.skills.sort((a, b) => (a.name < b.name ? -1 : 1));
+  return { skills: state.skills, warnings: state.warnings };
 }

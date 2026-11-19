@@ -214,7 +214,9 @@ export function newEntry(source: string, name: string, description = `desc ${nam
     description,
     source,
     dir: `/x/${source}/${name}`,
-    hash: "h",
+    revision: "h",
+    manifest: "[]",
+    frontmatter: "",
     tokens: buildFieldTokens({ name, description, headings: [], body }),
   };
 }
@@ -250,8 +252,8 @@ const db = new DatabaseSync(process.argv[1], { timeout: 5000 });
 db.exec("PRAGMA cache_size = 10");
 db.exec("BEGIN IMMEDIATE");
 db.exec("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000) " +
-  "INSERT INTO skills(id, id_lc, name, name_lc, description, source, dir, hash) " +
-  "SELECT 'k' || i, 'k' || i, 'n', 'n', hex(randomblob(400)), 'zz', '/x', 'h' FROM n");
+  "INSERT INTO skills(id, id_lc, name, name_lc, description, source, dir, hash, manifest, frontmatter) " +
+  "SELECT 'k' || i, 'k' || i, 'n', 'n', hex(randomblob(400)), 'zz', '/x', 'h', '[]', '' FROM n");
 process.stdout.write("ready\\n");
 setInterval(() => {}, 1000);
 `;

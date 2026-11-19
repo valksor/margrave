@@ -15,6 +15,7 @@ import {
   deleteSourceSkills,
   ensureDirs,
   insertSkills,
+  migrateSkillIndex,
   openIndexRead,
   openIndexWrite,
   readSources,
@@ -219,7 +220,8 @@ export async function resolveScanRoot(clone: string, subpath: string): Promise<s
   let real: string;
   try {
     real = await realpath(target);
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     throw new MargraveError(`subpath "${subpath}" does not exist in the repository`);
   }
   if (!isInside(real, await realpath(clone))) throw new MargraveError(`refused subpath "${subpath}": resolves outside the clone`);
@@ -236,7 +238,9 @@ function toEntries(sourceId: string, skills: readonly ScannedSkill[], mapDir: (d
     description: s.description,
     source: sourceId,
     dir: mapDir(s.dir),
-    hash: s.hash,
+    revision: s.revision,
+    manifest: JSON.stringify(s.manifest),
+    frontmatter: s.frontmatter,
     tokens: s.tokens,
   }));
 }
@@ -251,7 +255,10 @@ async function checkIndex(sources: readonly SourceRecord[]): Promise<void> {
  * source list, writes sources.json, then commits. Any failure leaves the index as it was.
  * `mode` is "create" for a store with no sources or a reindex: a missing index, or one with user_version 0, is initialized.
  */
-async function commit(mode: "existing" | "create", change: (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[]): Promise<void> {
+async function commit(
+  mode: "existing" | "create" | "reindex",
+  change: (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[],
+): Promise<void> {
   const db = await openIndexWrite(mode);
   try {
     db.exec("BEGIN IMMEDIATE");
@@ -322,7 +329,7 @@ async function installLocal(spec: string, dir: string, ctx: Ctx): Promise<Instal
   if (sources.some((s) => s.id === id)) throw duplicate(id);
   await checkIndex(sources);
 
-  const scan = await scanSource(real, { followSymlinks: true });
+  const scan = await scanSource(real, { followSymlinks: true, strict: true });
   logWarnings(ctx, scan.warnings);
   if (scan.skills.length === 0) throw new MargraveError(`no valid skills (SKILL.md with name and description) found in ${real}`);
   await scanWithRipwire(real, { ...ctx, sourceId: id, skills: scan.skills });
@@ -374,7 +381,7 @@ async function installGit(
     await rm(path.join(clone, ".git"), { recursive: true, force: true });
     const realClone = await realpath(clone);
     const scanRoot = await realpath(await resolveScanRoot(realClone, parsed.subpath));
-    const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone });
+    const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone, strict: true });
     logWarnings(ctx, scan.warnings);
     if (scan.skills.length === 0) {
       throw new MargraveError(`no valid skills (SKILL.md with name and description) found in ${spec}`);
@@ -416,7 +423,7 @@ export interface UpdateResult {
 }
 
 function diffEntries(before: ReadonlyMap<string, string>, next: readonly NewEntry[]) {
-  const after = new Map(next.map((e) => [e.id, e.hash]));
+  const after = new Map(next.map((e) => [e.id, e.revision]));
   return {
     added: [...after.keys()].filter((k) => !before.has(k)).sort(),
     removed: [...before.keys()].filter((k) => !after.has(k)).sort(),
@@ -492,7 +499,7 @@ async function updateOne(id: string, ctx: Ctx): Promise<UpdateResult> {
     await rm(path.join(clone, ".git"), { recursive: true, force: true });
     const realClone = await realpath(clone);
     const scanRoot = await realpath(await resolveScanRoot(realClone, rec.subpath));
-    const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone });
+    const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone, strict: true });
     logWarnings(ctx, scan.warnings);
     if (scan.skills.length === 0) throw new MargraveError(`no valid skills found in the new revision of ${id}; kept the old copy`);
     // The baseline: the installed copy, scanned before the swap. It is what the user accepted.
@@ -533,9 +540,11 @@ async function installedScanRoot(final: string, subpath: string): Promise<string
 
 async function scanLocal(rec: SourceRecord, ctx: Ctx): Promise<NewEntry[]> {
   // readSources() only returns a local record with a path.
-  const scan = await scanSource(rec.path as string, { followSymlinks: true }).catch(() => {
-    throw new MargraveError(`${rec.path} is not readable; remove the source or restore the directory`);
+  const root = await realpath(rec.path as string).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT") throw new MargraveError(`${rec.path} is not readable; remove the source or restore the directory`);
+    throw err;
   });
+  const scan = await scanSource(root, { followSymlinks: true, strict: true });
   logWarnings(ctx, scan.warnings);
   return toEntries(rec.id, scan.skills, (d) => d);
 }
@@ -563,38 +572,56 @@ export async function removeSource(arg: string): Promise<SourceRecord> {
 
 // ---- reindex ----
 
-export async function reindexAll(ctx: Ctx): Promise<{ skills: number; sources: number }> {
-  const sources = await readSources();
+interface ReindexScan {
+  entries: NewEntry[];
+  failed: Set<string>;
+}
+
+async function scanInstalledSource(rec: SourceRecord, ctx: Ctx): Promise<NewEntry[]> {
+  if (rec.kind === "local") return scanLocal(rec, ctx);
+  const dir = sourceDir(rec.id);
+  const root = await resolveScanRoot(dir, rec.subpath);
+  const scan = await scanSource(root, { followSymlinks: false, boundary: dir, strict: true });
+  logWarnings(ctx, scan.warnings);
+  return toEntries(rec.id, scan.skills, (d) => d);
+}
+
+async function scanInstalledSources(sources: readonly SourceRecord[], ctx: Ctx): Promise<ReindexScan> {
   const entries: NewEntry[] = [];
+  const failed = new Set<string>();
   for (const rec of sources) {
     try {
-      if (rec.kind === "local") {
-        entries.push(...(await scanLocal(rec, ctx)));
-      } else {
-        const dir = sourceDir(rec.id);
-        const root = await resolveScanRoot(dir, rec.subpath);
-        const scan = await scanSource(root, { followSymlinks: false, boundary: dir });
-        logWarnings(ctx, scan.warnings);
-        entries.push(...toEntries(rec.id, scan.skills, (d) => d));
-      }
+      entries.push(...(await scanInstalledSource(rec, ctx)));
     } catch (err) {
+      failed.add(rec.id);
       ctx.log(`warning: ${rec.id}: ${esc(err instanceof Error ? err.message : String(err))}; skipped`);
     }
   }
-  const scanned = sources.map((s) => s.id).sort();
-  await commit("create", (fresh, db) => {
-    // A source that was added or removed while this reindex scanned or waited would be lost or kept without rows.
-    const now = fresh.map((s) => s.id).sort();
-    if (now.length !== scanned.length || now.some((id, i) => id !== scanned[i])) {
-      throw new MargraveError("sources changed during reindex; run: margrave reindex");
-    }
-    deleteAllSkills(db);
-    insertSkills(db, entries);
-    return fresh;
-  });
+  return { entries, failed };
+}
+
+function applyReindex(sources: readonly SourceRecord[], scan: ReindexScan, fresh: SourceRecord[], db: DatabaseSync): SourceRecord[] {
+  if (JSON.stringify(fresh) !== JSON.stringify(sources)) {
+    throw new MargraveError("sources changed during reindex; run: margrave reindex");
+  }
+  const version = Number((db.prepare("PRAGMA user_version").get() as { user_version: number | bigint }).user_version);
+  if (version === 1) {
+    if (scan.failed.size > 0) throw new MargraveError("cannot upgrade the skill index while a source is unreadable");
+    migrateSkillIndex(db);
+  }
+  if (scan.failed.size === 0) deleteAllSkills(db);
+  else for (const rec of sources) if (!scan.failed.has(rec.id)) deleteSourceSkills(db, rec.id);
+  insertSkills(db, scan.entries);
+  return fresh;
+}
+
+export async function reindexAll(ctx: Ctx): Promise<{ skills: number; sources: number }> {
+  const sources = await readSources();
+  const scan = await scanInstalledSources(sources, ctx);
+  await commit("reindex", (fresh, db) => applyReindex(sources, scan, fresh, db));
   // After the commit only: if the reindex fails, the old index stays.
   await removeLegacyIndex();
-  return { skills: entries.length, sources: sources.length };
+  return { skills: scan.entries.length, sources: sources.length };
 }
 
 // ---- list ----

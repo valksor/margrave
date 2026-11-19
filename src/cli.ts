@@ -11,12 +11,13 @@ import {
   formatLoad,
   loadContext,
   loadSkill,
-  readSkillFile,
+  readSelectedFile,
   resolveSkill,
+  validateRevision,
 } from "./skills.ts";
 import { installSource, listSources, reindexAll, removeSource, updateSources } from "./sources.ts";
 import type { Ctx } from "./sources.ts";
-import { MargraveError, UsageError } from "./store.ts";
+import { MargraveError, RequestError, UsageError } from "./store.ts";
 import { wrap } from "./wrap.ts";
 
 const USAGE = `usage: margrave <command>
@@ -26,8 +27,8 @@ const USAGE = `usage: margrave <command>
   remove <source>                             remove a source (never deletes a local directory)
   list [--skills] [--json]                    list sources, and with --skills every skill
   find "<task>" [--limit N] [--json] [--explain]  rank installed skills for a task
-  load <id> [--json]                          print one skill
-  load <id> --file <path>                     print one file inside a skill directory
+  load <id> [--json] [--revision <hash>]      print one skill
+  load <id> --file <path> [--revision <hash>] print one file inside a skill directory
   reindex                                     rescan all sources
   mcp                                         run the stdio MCP server
   wrap <claude|codex|bb|generic>              print setup text for an agent
@@ -155,23 +156,26 @@ async function run(argv: string[]): Promise<void> {
       return;
     }
     case "load": {
-      const p = parse(rest, { json: { type: "boolean" }, file: { type: "string" } });
+      const p = parse(rest, { json: { type: "boolean" }, file: { type: "string" }, revision: { type: "string" } });
+      const revision = typeof p.values["revision"] === "string" ? p.values["revision"] : undefined;
+      validateRevision(revision);
       const [id] = positionals(p, 1, 1, "load <id>");
       const c = await loadContext();
-      if (c === null) throw new MargraveError(NO_SOURCES_MESSAGE);
+      if (c === null)
+        throw revision === undefined ? new MargraveError(NO_SOURCES_MESSAGE) : new RequestError("skill revision changed; search again");
       let entry;
       try {
-        entry = resolveSkill(c.db, id as string);
+        entry = resolveSkill(c.db, id as string, revision);
       } finally {
         c.db.close();
       }
       if (typeof p.values["file"] === "string") {
-        const content = await readSkillFile(entry.dir, p.values["file"]);
+        const content = await readSelectedFile(entry, p.values["file"], revision);
         if (p.values["json"] === true) json({ id: entry.id, path: p.values["file"], content });
         else process.stdout.write(content);
         return;
       }
-      const r = await loadSkill(entry, c.sources);
+      const r = await loadSkill(entry, c.sources, revision);
       // Written as is: the body is the payload, so no newline is added.
       if (p.values["json"] === true) json(r);
       else process.stdout.write(formatLoad(r));

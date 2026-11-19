@@ -7,7 +7,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { MAX_QUERY_TERMS } from "../src/bm25.ts";
-import { findSkills, formatFind, resolveSkill } from "../src/skills.ts";
+import { findSkills, formatFind, readSelectedFile, resolveSkill } from "../src/skills.ts";
 import { installSource, localId, reindexAll, removeSource, updateSources } from "../src/sources.ts";
 import { deleteSourceSkills, home as storeHome, insertSkills, openIndexRead, openIndexWrite } from "../src/store.ts";
 import type { NewEntry, SourceRecord } from "../src/store.ts";
@@ -83,6 +83,7 @@ test("BM25 ranks the document that matches the query best first", async (t) => {
       id: "s/docker",
       name: "docker",
       description: "Write Docker Compose files",
+      revision: "h",
       score: findSkills(db, "docker", undefined)[0]?.score,
     });
   } finally {
@@ -257,14 +258,14 @@ test("resolveSkill answers from SQL: id, bare name, ambiguity, unknown", async (
 
 // ---- the writer connection ----
 
-test("the index uses the DELETE journal, user_version 1, and leaves no side files after a read", async (t) => {
+test("the index uses the DELETE journal, user_version 2, and leaves no side files after a read", async (t) => {
   const home = await tmp("mg-home-");
   useHome(t, home);
   await seedIndex([newEntry("s", "a")]);
   const db = await openIndexRead();
   try {
     assert.equal((db.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode, "delete");
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 1);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 2);
   } finally {
     db.close();
   }
@@ -497,7 +498,9 @@ test("the schema probe sees a concurrent initial commit as one snapshot", async 
     if (sql.includes("pragma_user_version") && !committed) {
       committed = true;
       const writer = new DatabaseSync(file);
-      writer.exec("BEGIN IMMEDIATE; CREATE TABLE skills(id TEXT); CREATE TABLE fts(id TEXT); PRAGMA user_version = 1; COMMIT");
+      writer.exec(
+        "BEGIN IMMEDIATE; CREATE TABLE skills(rowid INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, id_lc TEXT NOT NULL, name TEXT NOT NULL, name_lc TEXT NOT NULL, description TEXT NOT NULL, source TEXT NOT NULL, dir TEXT NOT NULL, hash TEXT NOT NULL, manifest TEXT NOT NULL, frontmatter TEXT NOT NULL); CREATE INDEX skills_name_lc ON skills(name_lc); CREATE INDEX skills_id_lc ON skills(id_lc); CREATE INDEX skills_source ON skills(source); CREATE VIRTUAL TABLE fts USING fts5(name, description, headings, body, content='', contentless_delete=1, tokenize='unicode61'); PRAGMA user_version = 2; COMMIT",
+      );
       writer.close();
     }
     return prepare.call(this, sql);
@@ -506,6 +509,43 @@ test("the schema probe sees a concurrent initial commit as one snapshot", async 
   const db = await openIndexRead();
   db.close();
   assert.equal(committed, true);
+});
+
+test("a version 2 index with incomplete FTS columns is rejected", async (t) => {
+  const s = await setup();
+  useHome(t, s.home);
+  const db = new DatabaseSync(path.join(s.home, "index.db"));
+  db.exec("DROP TABLE fts; CREATE VIRTUAL TABLE fts USING fts5(name)");
+  db.close();
+  await assert.rejects(openIndexRead(), /not a margrave index/u);
+  await assert.rejects(openIndexWrite("reindex"), /not a margrave index/u);
+  const missingIndex = new DatabaseSync(path.join(s.home, "index.db"));
+  missingIndex.exec("DROP TABLE fts; CREATE VIRTUAL TABLE fts USING fts5(name, description, headings, body); DROP INDEX skills_source");
+  missingIndex.close();
+  await assert.rejects(openIndexRead(), /not a margrave index/u);
+});
+
+test("a version 1 schema committed before the create lock is rejected", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  const file = path.join(home, "index.db");
+  new DatabaseSync(file).close();
+  let fired = false;
+  mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && !fired) {
+      fired = true;
+      const writer = new DatabaseSync(file);
+      realExec.call(
+        writer,
+        "CREATE TABLE skills(rowid INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, id_lc TEXT NOT NULL, name TEXT NOT NULL, name_lc TEXT NOT NULL, description TEXT NOT NULL, source TEXT NOT NULL, dir TEXT NOT NULL, hash TEXT NOT NULL); CREATE INDEX skills_name_lc ON skills(name_lc); CREATE INDEX skills_id_lc ON skills(id_lc); CREATE INDEX skills_source ON skills(source); CREATE VIRTUAL TABLE fts USING fts5(name, description, headings, body, content='', contentless_delete=1, tokenize='unicode61'); PRAGMA user_version = 1",
+      );
+      writer.close();
+    }
+    return realExec.call(this, sql);
+  });
+  t.after(() => mock.restoreAll());
+  await assert.rejects(openIndexWrite("create"), /older schema; run: margrave reindex/u);
+  assert.equal(fired, true);
 });
 
 test("a schema-less index.db is an error for reads; reindex initializes it in place", async () => {
@@ -976,4 +1016,67 @@ test("a reader during an open write transaction gets the old results with no err
   } finally {
     lock.release();
   }
+});
+
+test("v1 migration rolls back scan and schema failures and can be retried", async (t) => {
+  const s = await setup();
+  useHome(t, s.home);
+  const file = path.join(s.home, "index.db");
+  const db = new DatabaseSync(file);
+  db.exec("ALTER TABLE skills DROP COLUMN manifest; ALTER TABLE skills DROP COLUMN frontmatter; PRAGMA user_version = 1");
+  db.close();
+  const before = indexRows(s.home);
+  const checkOld = () => {
+    const old = new DatabaseSync(file);
+    assert.equal((old.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 1);
+    assert.deepEqual(old.prepare("SELECT id, name, source, hash FROM skills ORDER BY id").all(), before);
+    old.close();
+  };
+  await assert.rejects(openIndexRead(), /older schema; run: margrave reindex/u);
+  await assert.rejects(openIndexWrite("create"), /older schema; run: margrave reindex/u);
+  await rename(s.dir, `${s.dir}-hidden`);
+  await assert.rejects(reindexAll(quiet), /source is unreadable/u);
+  checkOld();
+  await rename(`${s.dir}-hidden`, s.dir);
+  mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql.startsWith("ALTER TABLE skills ADD COLUMN")) {
+      realExec.call(this, sql);
+      throw new Error("forced migration failure");
+    }
+    return realExec.call(this, sql);
+  });
+  t.after(() => mock.restoreAll());
+  await assert.rejects(reindexAll(quiet), /forced migration failure/u);
+  mock.restoreAll();
+  checkOld();
+  await reindexAll(quiet);
+  const upgraded = new DatabaseSync(file);
+  assert.equal((upgraded.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 2);
+  assert.equal((upgraded.prepare("SELECT count(*) AS n FROM skills WHERE manifest <> ''").get() as { n: number }).n, 1);
+  upgraded.close();
+});
+
+test("a selected revision reports an operational read error and an index change", async (t) => {
+  const s = await setup();
+  useHome(t, s.home);
+  const db = await openIndexRead();
+  const entry = resolveSkill(db, `${s.id}/alpha`);
+  db.close();
+  const actual = fsp.realpath;
+  mock.method(fsp, "realpath", ((p: string, ...args: unknown[]) =>
+    p === entry.dir
+      ? Promise.reject(Object.assign(new Error("read denied"), { code: "EACCES" }))
+      : (actual as (...args: unknown[]) => unknown)(p, ...args)) as typeof fsp.realpath);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  await assert.rejects(readSelectedFile(entry, "SKILL.md", entry.revision), /read denied/u);
+  mock.restoreAll();
+  syncBuiltinESMExports();
+  const writer = new DatabaseSync(path.join(s.home, "index.db"));
+  writer.prepare("UPDATE skills SET hash = ? WHERE id = ?").run(`sha256:${"b".repeat(64)}`, entry.id);
+  writer.close();
+  await assert.rejects(readSelectedFile(entry, "SKILL.md", entry.revision), /skill revision changed; search again/u);
 });

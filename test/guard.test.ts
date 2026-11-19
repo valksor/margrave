@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, writeFile } from "node:fs/promises";
+import fsp, { mkdir, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
-import test from "node:test";
+import test, { mock } from "node:test";
 import { MargraveError } from "../src/store.ts";
+import { readSkillFileBytes } from "../src/skill-files.ts";
 import { listFiles, loadSkill, readSkillFile } from "../src/skills.ts";
 import type { IndexEntry } from "../src/store.ts";
 import { link, mkfifo, releaseFifo, tmp, writeSkill } from "./helpers.ts";
@@ -90,7 +92,9 @@ test("--file allows a file in a skill dir that is reached through a symlink", as
     description: "s",
     source: "s",
     dir: via,
-    hash: "h",
+    revision: "h",
+    manifest: "[]",
+    frontmatter: "",
   };
   const loaded = await loadSkill(entry, []);
   assert.deepEqual(loaded.files, ["SKILL.md", "references/x.md"]);
@@ -104,7 +108,9 @@ test("load reports a missing directory and says to run reindex", async () => {
     description: "x",
     source: "s",
     dir: path.join(await tmp(), "does-not-exist"),
-    hash: "h",
+    revision: "h",
+    manifest: "[]",
+    frontmatter: "",
   };
   await assert.rejects(loadSkill(entry, []), /margrave reindex/u);
 });
@@ -144,11 +150,40 @@ test("load of a SKILL.md without frontmatter returns an empty frontmatter and th
     description: "x",
     source: "s",
     dir,
-    hash: "h",
+    revision: "h",
+    manifest: "[]",
+    frontmatter: "",
   };
   const r = await loadSkill(entry, []);
   assert.equal(r.frontmatter, "");
   assert.equal(r.body, "# plain\n\nno frontmatter here\n");
   assert.equal(r.spec, "");
   assert.equal(r.commit, null);
+});
+
+test("byte reads preserve missing, access, and canonical path failures", async (t) => {
+  const root = await tmp();
+  const dir = await writeSkill(root, "skill", "test");
+  const ref = path.join(dir, "ref.md");
+  await writeFile(ref, "inside");
+  await link(ref, path.join(dir, "alias.md"));
+  await assert.rejects(readSkillFileBytes(dir, "alias.md", true, true), /path changed/u);
+  await assert.rejects(readSkillFileBytes(dir, "missing", true), /ENOENT/u);
+  await assert.rejects(readSkillFileBytes(path.join(root, "missing"), "x", true), /ENOENT/u);
+  const original = fsp.realpath;
+  const denied = Object.assign(new Error("injected denial"), { code: "EACCES" });
+  mock.method(fsp, "realpath", ((p: string, ...args: unknown[]) =>
+    p === dir || p === ref ? Promise.reject(denied) : (original as (...a: unknown[]) => unknown)(p, ...args)) as typeof fsp.realpath);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  await assert.rejects(readSkillFileBytes(dir, "ref.md", true), /injected denial/u);
+  mock.restoreAll();
+  syncBuiltinESMExports();
+  mock.method(fsp, "realpath", ((p: string, ...args: unknown[]) =>
+    p === ref ? Promise.reject(denied) : (original as (...a: unknown[]) => unknown)(p, ...args)) as typeof fsp.realpath);
+  syncBuiltinESMExports();
+  await assert.rejects(readSkillFileBytes(dir, "ref.md", true), /injected denial/u);
 });

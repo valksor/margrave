@@ -86,6 +86,7 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   const found = await call(client, "find_skills", { task: "terraform modules", limit: 3 });
   assert.equal(found.isError, false);
   assert.match(found.text, new RegExp(`^1\\. ${id}/terraform-modules `, "u"));
+  assert.match(found.text, /\n   revision: sha256:[0-9a-f]{64}\n/u);
   assert.match(found.text, new RegExp(`load: margrave load ${id}/terraform-modules$`, "u"));
 
   // no match: empty result plus a hint, not a tool error

@@ -12,6 +12,7 @@ import {
   localId,
   parseSpec,
   reindexAll,
+  resolveScanRoot,
   sanitizeId,
   sourceDir,
   updateSources,
@@ -19,7 +20,7 @@ import {
 import { MargraveError, UsageError, home as storeHome, openIndexRead, readSources } from "../src/store.ts";
 import type { SourceRecord } from "../src/store.ts";
 import { resolveSkill } from "../src/skills.ts";
-import { fakeRipwire, git, indexIds, makeRepo, newEntry, realExec, runCli, seedIndex, tmp, writeSkill } from "./helpers.ts";
+import { fakeRipwire, git, indexIds, indexRows, makeRepo, newEntry, realExec, runCli, seedIndex, tmp, writeSkill } from "./helpers.ts";
 
 test("spec parsing is checked in order: local, git URL, GitHub", () => {
   assert.deepEqual(parseSpec("./skills"), { kind: "local", path: path.resolve("./skills") });
@@ -51,6 +52,31 @@ test("spec parsing is checked in order: local, git URL, GitHub", () => {
     subpath: "skills/react",
     id: "owner__repo__skills__react",
   });
+});
+
+test("source realpath access errors stay visible", async (t) => {
+  const prev = process.env["MARGRAVE_HOME"];
+  const home = await tmp("mg-home-");
+  process.env["MARGRAVE_HOME"] = home;
+  const root = await tmp("mg-source-");
+  await writeSkill(root, "alpha", "skill");
+  const result = await runCli(["install", root], { home, fakeBin: await fakeRipwire() });
+  assert.equal(result.code, 0, result.stderr);
+  const original = fsp.realpath;
+  const denied = Object.assign(new Error("access denied"), { code: "EACCES" });
+  mock.method(fsp, "realpath", ((p: string, ...args: unknown[]) =>
+    p === root || p === path.join(root, "alpha")
+      ? Promise.reject(denied)
+      : (original as (...a: unknown[]) => unknown)(p, ...args)) as typeof fsp.realpath);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    if (prev === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prev;
+  });
+  await assert.rejects(updateSources(localId(root), { log: () => {}, allowUnsafe: false }), /access denied/u);
+  await assert.rejects(resolveScanRoot(root, "alpha"), /access denied/u);
 });
 
 test("owner/repo is GitHub even when a relative directory with that name exists", async () => {
@@ -539,4 +565,55 @@ test("reindex: control characters in a failure message are logged as text", asyn
     assert.deepEqual(logs, [`warning: ${id}: bad \\x1b[2J name; skipped`]);
     assert.ok(!logs.join("").includes("\u001b"));
   });
+});
+
+test("reindex preserves unreadable source rows and migration rejects an unreadable supporting directory", async (t) => {
+  const prev = process.env["MARGRAVE_HOME"];
+  const home = await tmp("mg-home-");
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(() => {
+    if (prev === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prev;
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  const root = await tmp("mg-source-");
+  const skill = await writeSkill(root, "alpha", "test skill");
+  const refs = path.join(skill, "references");
+  await mkdir(refs);
+  await writeFile(path.join(refs, "x.md"), "text");
+  const result = await runCli(["install", root], { home, fakeBin: await fakeRipwire() });
+  assert.equal(result.code, 0, result.stderr);
+  const other = await tmp("mg-source-");
+  const otherSkill = await writeSkill(other, "beta", "other skill");
+  const second = await runCli(["install", other], { home, fakeBin: await fakeRipwire() });
+  assert.equal(second.code, 0, second.stderr);
+  const rows = indexRows(home);
+  await writeFile(path.join(otherSkill, "reference.md"), "new content");
+  const actual = fsp.readdir;
+  mock.method(fsp, "readdir", ((p: string, ...args: unknown[]) =>
+    p === refs
+      ? Promise.reject(Object.assign(new Error("denied"), { code: "EACCES" }))
+      : (actual as (...x: unknown[]) => unknown)(p, ...args)) as typeof fsp.readdir);
+  syncBuiltinESMExports();
+  const logs: string[] = [];
+  await reindexAll({ log: (line) => logs.push(line), allowUnsafe: false });
+  const after = indexRows(home);
+  assert.deepEqual(
+    after.find((row) => row.name === "alpha"),
+    rows.find((row) => row.name === "alpha"),
+  );
+  assert.notEqual(after.find((row) => row.name === "beta")?.hash, rows.find((row) => row.name === "beta")?.hash);
+  assert.match(logs.join("\n"), /denied/u);
+  const db = new DatabaseSync(path.join(home, "index.db"));
+  db.exec("ALTER TABLE skills DROP COLUMN manifest; ALTER TABLE skills DROP COLUMN frontmatter; PRAGMA user_version = 1");
+  db.close();
+  await assert.rejects(reindexAll({ log: () => {}, allowUnsafe: false }), /source is unreadable/u);
+  const old = new DatabaseSync(path.join(home, "index.db"));
+  assert.equal((old.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 1);
+  assert.equal((old.prepare("SELECT count(*) AS n FROM skills").get() as { n: number }).n, 2);
+  old.close();
+  mock.restoreAll();
+  syncBuiltinESMExports();
+  await reindexAll({ log: () => {}, allowUnsafe: false });
 });

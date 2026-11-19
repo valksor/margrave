@@ -3,7 +3,17 @@ import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { NO_SOURCES_MESSAGE, findSkills, formatFind, formatLoad, loadContext, loadSkill, readSkillFile, resolveSkill } from "./skills.ts";
+import {
+  NO_SOURCES_MESSAGE,
+  findSkills,
+  formatFind,
+  formatLoad,
+  loadContext,
+  loadSkill,
+  readSelectedFile,
+  resolveSkill,
+  validateRevision,
+} from "./skills.ts";
 import type { Context, FindText } from "./skills.ts";
 import { RequestError } from "./store.ts";
 import type { IndexEntry } from "./store.ts";
@@ -76,9 +86,9 @@ export function version(): string {
 }
 
 /** Resolve an id, then close the handle: nothing else needs the database. */
-function resolveEntry(ctx: Context, id: string): IndexEntry {
+function resolveEntry(ctx: Context, id: string, revision?: string): IndexEntry {
   try {
-    return resolveSkill(ctx.db, id);
+    return resolveSkill(ctx.db, id, revision);
   } finally {
     ctx.db.close();
   }
@@ -108,26 +118,34 @@ export function createServer(variant: Variant = LOCAL): McpServer {
     },
   );
 
-  server.registerTool("load_skill", { description: variant.loadDescription, inputSchema: { id: z.string() } }, async ({ id }) => {
-    try {
-      const ctx = await loadContext();
-      if (ctx === null) return variant.fail(new RequestError(variant.noSources));
-      const entry = resolveEntry(ctx, id);
-      return ok(formatLoad(await loadSkill(entry, ctx.sources), { hostPaths: variant.showHostPaths }));
-    } catch (err) {
-      return variant.fail(err);
-    }
-  });
+  server.registerTool(
+    "load_skill",
+    { description: variant.loadDescription, inputSchema: { id: z.string(), revision: z.string().optional() } },
+    async ({ id, revision }) => {
+      try {
+        validateRevision(revision);
+        const ctx = await loadContext();
+        if (ctx === null)
+          return variant.fail(new RequestError(revision === undefined ? variant.noSources : "skill revision changed; search again"));
+        const entry = resolveEntry(ctx, id, revision);
+        return ok(formatLoad(await loadSkill(entry, ctx.sources, revision), { hostPaths: variant.showHostPaths }));
+      } catch (err) {
+        return variant.fail(err);
+      }
+    },
+  );
 
   server.registerTool(
     "read_skill_file",
-    { description: variant.readDescription, inputSchema: { id: z.string(), path: z.string() } },
-    async ({ id, path }) => {
+    { description: variant.readDescription, inputSchema: { id: z.string(), path: z.string(), revision: z.string().optional() } },
+    async ({ id, path, revision }) => {
       try {
+        validateRevision(revision);
         const ctx = await loadContext();
-        if (ctx === null) return variant.fail(new RequestError(variant.noSources));
-        const entry = resolveEntry(ctx, id);
-        return ok(await readSkillFile(entry.dir, path));
+        if (ctx === null)
+          return variant.fail(new RequestError(revision === undefined ? variant.noSources : "skill revision changed; search again"));
+        const entry = resolveEntry(ctx, id, revision);
+        return ok(await readSelectedFile(entry, path, revision));
       } catch (err) {
         return variant.fail(err);
       }

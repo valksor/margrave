@@ -175,6 +175,9 @@ test("search relevance and CLI/MCP parity on an installed corpus", async (t) => 
     const query = "profile rendering performance";
     const cli = await runCli(["find", query, "--limit", "2", "--json"], { home, fakeBin });
     assert.equal(cli.code, 0, cli.stderr);
+    for (const hit of (JSON.parse(cli.stdout) as { results: { revision: string }[] }).results) {
+      assert.match(hit.revision, /^sha256:[0-9a-f]{64}$/u);
+    }
     const ids = (JSON.parse(cli.stdout) as { results: { id: string }[] }).results.map((hit) => hit.id);
     assert.equal(ids.length, 2);
     const client = new Client({ name: "find-test", version: "1" });

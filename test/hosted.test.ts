@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test, { mock } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -98,6 +98,15 @@ test("hosted: with no sources, find_skills answers and the other two tools fail,
     isError: true,
     text: HOSTED_NO_SOURCES_MESSAGE,
   });
+  const revision = `sha256:${"a".repeat(64)}`;
+  assert.deepEqual(await call(client, "load_skill", { id: "x", revision }), {
+    isError: true,
+    text: "skill revision changed; search again",
+  });
+  assert.deepEqual(await call(client, "read_skill_file", { id: "x", path: "SKILL.md", revision }), {
+    isError: true,
+    text: "skill revision changed; search again",
+  });
 });
 
 test("hosted: find, load, read, and request errors, with no server path in any text", async (t) => {
@@ -120,6 +129,42 @@ test("hosted: find, load, read, and request errors, with no server path in any t
 
   const found = await call(client, "find_skills", { task: "terraform modules", limit: 3 });
   assert.equal(found.isError, false);
+  const revision = /revision: (sha256:[0-9a-f]{64})/u.exec(found.text)?.[1];
+  assert.ok(revision);
+  assert.deepEqual(await call(client, "load_skill", { id: "removed", revision }), {
+    isError: true,
+    text: "skill revision changed; search again",
+  });
+  assert.equal((await call(client, "load_skill", { id, revision })).isError, false);
+  assert.deepEqual(await call(client, "read_skill_file", { id, path: "references/x.md", revision }), {
+    isError: false,
+    text: "reference text\n",
+  });
+  for (const [args, message] of [
+    [{ id, revision: "bad" }, "revision must be a SHA-256 digest"],
+    [{ id, revision: `sha256:${"0".repeat(64)}` }, "skill revision changed; search again"],
+  ] as const)
+    assert.deepEqual(await call(client, "load_skill", args), { isError: true, text: message });
+  assert.deepEqual(await call(client, "read_skill_file", { id, path: "../secret.txt", revision }), {
+    isError: true,
+    text: "file is not in the selected skill revision",
+  });
+  await writeFile(path.join(skillDir, "references", "x.md"), "x".repeat("reference text\n".length));
+  assert.deepEqual(await call(client, "read_skill_file", { id, path: "references/x.md", revision }), {
+    isError: true,
+    text: "skill files changed since indexing; ask the store operator to run margrave reindex, then search again",
+  });
+  await rm(path.join(skillDir, "references", "x.md"));
+  assert.deepEqual(await call(client, "read_skill_file", { id, path: "references/x.md", revision }), {
+    isError: true,
+    text: "skill files changed since indexing; ask the store operator to run margrave reindex, then search again",
+  });
+  await writeFile(path.join(skillDir, "references", "x.md"), "changed\n");
+  assert.deepEqual(await call(client, "read_skill_file", { id, path: "references/x.md", revision }), {
+    isError: true,
+    text: "skill files changed since indexing; ask the store operator to run margrave reindex, then search again",
+  });
+  await writeFile(path.join(skillDir, "references", "x.md"), "reference text\n");
   const lines = found.text.split("\n");
   assert.match(lines[0] ?? "", new RegExp(`^1\\. ${id} `, "u"));
   assert.equal(lines.at(-1), `load: call load_skill with id ${id}`);

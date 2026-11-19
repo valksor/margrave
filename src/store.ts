@@ -37,8 +37,9 @@ export interface IndexEntry {
   description: string;
   source: string;
   dir: string;
-  /** Hash of SKILL.md, used by `update` to report changed skills. */
-  hash: string;
+  revision: string;
+  manifest: string;
+  frontmatter: string;
 }
 
 /** An entry to write: the row plus the token strings for the FTS columns. */
@@ -130,7 +131,7 @@ export async function writeSources(sources: readonly SourceRecord[]): Promise<vo
 
 // ---- index.db ----
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const READ_TIMEOUT_MS = 5000;
 const WRITE_TIMEOUT_MS = 30000;
 const SQLITE_NOTADB = 26;
@@ -149,7 +150,9 @@ CREATE TABLE IF NOT EXISTS skills(
   description TEXT NOT NULL,
   source TEXT NOT NULL,
   dir TEXT NOT NULL,
-  hash TEXT NOT NULL
+  hash TEXT NOT NULL,
+  manifest TEXT NOT NULL,
+  frontmatter TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS skills_name_lc ON skills(name_lc);
 CREATE INDEX IF NOT EXISTS skills_id_lc ON skills(id_lc);
@@ -199,24 +202,42 @@ interface OpenOptions {
 
 interface Probe {
   version: number;
-  /** How many of the tables `skills` and `fts` exist. */
-  tables: number;
 }
 
 /**
- * Reads the version and the table count of an open database. A version other than 0 and 1 is a file that is not ours.
+ * Reads the version and schema of an open database. Only versions 0, 1, and 2 are recognized.
  * So is user_version 0 with any schema object: margrave creates its schema in one transaction, so another program wrote it.
  */
 function readProbe(db: DatabaseSync, file: string): Probe {
   const counts = db
     .prepare(
-      "SELECT (SELECT user_version FROM pragma_user_version) AS user_version, count(*) AS total, count(CASE WHEN type = 'table' AND name IN ('skills', 'fts') THEN 1 END) AS ours FROM sqlite_master",
+      "SELECT (SELECT user_version FROM pragma_user_version) AS user_version, count(*) AS total, count(CASE WHEN type = 'table' AND name IN ('skills', 'fts') THEN 1 END) AS ours, count(CASE WHEN type = 'index' AND tbl_name = 'skills' AND name IN ('skills_name_lc','skills_id_lc','skills_source') THEN 1 END) AS indexes, (SELECT count(*) FROM pragma_table_info('skills') WHERE name IN ('rowid','id','id_lc','name','name_lc','description','source','dir','hash')) AS base_columns, (SELECT count(*) FROM pragma_table_info('skills') WHERE name IN ('manifest','frontmatter')) AS extra_columns, (SELECT count(*) FROM pragma_table_info('fts') WHERE name IN ('name','description','headings','body')) AS fts_columns, count(CASE WHEN type = 'table' AND name = 'fts' AND lower(sql) LIKE '%using fts5%' THEN 1 END) AS fts FROM sqlite_master",
     )
-    .get() as { user_version: number | bigint; total: number | bigint; ours: number | bigint };
+    .get() as {
+    user_version: number | bigint;
+    total: number | bigint;
+    ours: number | bigint;
+    indexes: number | bigint;
+    base_columns: number | bigint;
+    extra_columns: number | bigint;
+    fts_columns: number | bigint;
+    fts: number | bigint;
+  };
   const version = Number(counts.user_version);
-  if (version !== 0 && version !== SCHEMA_VERSION) throw new MargraveError(foreignMessage(file));
+  if (version !== 0 && version !== 1 && version !== SCHEMA_VERSION) throw new MargraveError(foreignMessage(file));
   if (version === 0 && Number(counts.total) > 0) throw new MargraveError(foreignMessage(file));
-  return { version, tables: Number(counts.ours) };
+  if (
+    version !== 0 &&
+    (Number(counts.ours) !== 2 ||
+      Number(counts.indexes) !== 3 ||
+      Number(counts.base_columns) !== 9 ||
+      Number(counts.fts) !== 1 ||
+      Number(counts.fts_columns) !== 4 ||
+      (version === 1 && Number(counts.extra_columns) !== 0) ||
+      (version === 2 && Number(counts.extra_columns) !== 2))
+  )
+    throw new MargraveError(foreignMessage(file));
+  return { version };
 }
 
 /**
@@ -244,13 +265,14 @@ function openProbed(file: string, options: OpenOptions): { db: DatabaseSync; pro
   }
 }
 
-/** Opens a database that must be a complete margrave index (user_version 1 with both tables). */
+/** Opens a database that must be a complete current margrave index. */
 function openCurrent(file: string, options: OpenOptions): DatabaseSync {
   const { db, probe } = openProbed(file, options);
-  if (probe.version === SCHEMA_VERSION && probe.tables === 2) return db;
+  if (probe.version === SCHEMA_VERSION) return db;
   db.close();
-  // user_version 0 here has no tables (readProbe refuses the rest), so reindex can fill it. Version 1 with a table missing is not something reindex can fix.
-  throw new MargraveError(probe.version === 0 ? invalidMessage(file) : foreignMessage(file));
+  if (probe.version === 1) throw new MargraveError("the skill index uses an older schema; run: margrave reindex");
+  // Version 0 has no schema: reindex can fill it.
+  throw new MargraveError(invalidMessage(file));
 }
 
 /**
@@ -266,10 +288,11 @@ export async function openIndexRead(): Promise<DatabaseSync> {
 /**
  * Open index.db for writing. The caller closes it. margrave never deletes index.db.
  * "existing": the index must exist and be complete (a store that has sources).
- * "create": reindex, or a write into a store with no sources. A missing file, or a file with user_version 0 and no
+ * "create": a write into a store with no sources. A missing file, or a file with user_version 0 and no
  * tables (including 0 bytes), is initialized in place under the write lock. A file that is not ours is refused.
+ * "reindex": also opens a complete version 1 index for migration by the caller.
  */
-export async function openIndexWrite(mode: "existing" | "create"): Promise<DatabaseSync> {
+export async function openIndexWrite(mode: "existing" | "create" | "reindex"): Promise<DatabaseSync> {
   const file = indexDbFile();
   const st = await statIndexDb(file);
   if (mode === "existing") await requireCurrentIndex(file, st);
@@ -280,12 +303,17 @@ export async function openIndexWrite(mode: "existing" | "create"): Promise<Datab
   let db: DatabaseSync | undefined;
   try {
     await mkdir(home(), { recursive: true });
-    db = setWriterPragmas(st === null ? new DatabaseSync(file, options) : openProbed(file, options).db);
+    const opened = st === null ? null : openProbed(file, options);
+    db = setWriterPragmas(opened === null ? new DatabaseSync(file, options) : opened.db);
+    if (opened?.probe.version === 1) {
+      if (mode !== "reindex") throw new MargraveError("the skill index uses an older schema; run: margrave reindex");
+      return db;
+    }
     // The schema is checked again under the lock: a second creator that waited finds it complete and changes nothing.
     db.exec("BEGIN IMMEDIATE");
     const now = readProbe(db, file);
     if (now.version === 0) db.exec(SCHEMA);
-    else if (now.tables !== 2) throw new MargraveError(foreignMessage(file));
+    else if (now.version === 1) throw new MargraveError("the skill index uses an older schema; run: margrave reindex");
     db.exec("COMMIT");
     return db;
   } catch (err) {
@@ -310,6 +338,12 @@ export function deleteAllSkills(db: DatabaseSync): void {
   db.exec("DELETE FROM fts; DELETE FROM skills");
 }
 
+export function migrateSkillIndex(db: DatabaseSync): void {
+  db.exec(
+    "ALTER TABLE skills ADD COLUMN manifest TEXT NOT NULL DEFAULT '[]'; ALTER TABLE skills ADD COLUMN frontmatter TEXT NOT NULL DEFAULT ''; PRAGMA user_version = 2",
+  );
+}
+
 export function deleteSourceSkills(db: DatabaseSync, source: string): void {
   db.prepare("DELETE FROM fts WHERE rowid IN (SELECT rowid FROM skills WHERE source = ?)").run(source);
   db.prepare("DELETE FROM skills WHERE source = ?").run(source);
@@ -322,11 +356,24 @@ export function skillHashes(db: DatabaseSync, source: string): Map<string, strin
 }
 
 export function insertSkills(db: DatabaseSync, entries: readonly NewEntry[]): void {
-  const skill = db.prepare("INSERT INTO skills(id, id_lc, name, name_lc, description, source, dir, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+  const skill = db.prepare(
+    "INSERT INTO skills(id, id_lc, name, name_lc, description, source, dir, hash, manifest, frontmatter) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
   const fts = db.prepare("INSERT INTO fts(rowid, name, description, headings, body) VALUES (?, ?, ?, ?, ?)");
   for (const e of entries) {
     // lastInsertRowid is a bigint on the writer connection (readBigInts); it binds as is.
-    const { lastInsertRowid } = skill.run(e.id, e.id.toLowerCase(), e.name, e.name.toLowerCase(), e.description, e.source, e.dir, e.hash);
+    const { lastInsertRowid } = skill.run(
+      e.id,
+      e.id.toLowerCase(),
+      e.name,
+      e.name.toLowerCase(),
+      e.description,
+      e.source,
+      e.dir,
+      e.revision,
+      e.manifest,
+      e.frontmatter,
+    );
     fts.run(lastInsertRowid, e.tokens.name, e.tokens.description, e.tokens.headings, e.tokens.body);
   }
 }

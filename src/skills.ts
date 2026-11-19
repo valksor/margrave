@@ -1,37 +1,19 @@
 // find / load / read-file, id resolution, path guard, terminal-safe text.
-import { lstat, open, readdir, realpath } from "node:fs/promises";
-import path from "node:path";
+import { lstat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { FIELDS, FIELD_WEIGHTS, NAME_BONUS, clampLimit, hasRecommendationEvidence, queryTerms } from "./bm25.ts";
 import type { Field, MatchedTerms } from "./bm25.ts";
-import { READ_NO_FOLLOW, splitSkillMd } from "./scan.ts";
+import { splitSkillMd } from "./scan.ts";
+import { listFiles, readSkillFile, readSkillFileBytes } from "./skill-files.ts";
+import type { ManifestEntry } from "./scan.ts";
+import { clean, cleanBlock, shellQuote } from "./text.ts";
+export { listFiles, readSkillFile } from "./skill-files.ts";
+export { clean, cleanBlock, shellQuote } from "./text.ts";
 import { MargraveError, RequestError, openIndexRead, readSources } from "./store.ts";
 import type { IndexEntry, SourceRecord } from "./store.ts";
 
 export const NO_SOURCES_MESSAGE = "no skill sources installed; run: margrave install <owner/repo|path>";
-
-// oxlint-disable-next-line no-control-regex -- intentional: this strips control characters
-const ANSI = /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\u001b[@-_]/gu;
-// C0 and C1 control characters, minus tab and newline.
-// oxlint-disable-next-line no-control-regex -- intentional: this strips control characters
-const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/gu;
-
-/** One-line text for human output: strips ANSI escapes and control characters. */
-export function clean(s: string): string {
-  return s
-    .replace(ANSI, "")
-    .replace(/[\t\n]/gu, " ")
-    .replace(CONTROL, "");
-}
-
-/** Multi-line text for human output: like clean(), but keeps newlines and tabs. */
-export function cleanBlock(s: string): string {
-  return s.replace(ANSI, "").replace(CONTROL, "");
-}
-
-export function shellQuote(s: string): string {
-  return /^[A-Za-z0-9_/.:=@%+,~-]+$/u.test(s) ? s : `'${s.replace(/'/gu, `'\\''`)}'`;
-}
 
 /** The sources and one read-only handle on index.db. The caller closes `db` in `finally`. */
 export interface Context {
@@ -46,10 +28,15 @@ export async function loadContext(): Promise<Context | null> {
   return { sources, db: await openIndexRead() };
 }
 
-const SKILL_COLUMNS = "id, name, description, source, dir, hash";
+const SKILL_COLUMNS = "id, name, description, source, dir, hash AS revision, manifest, frontmatter";
+
+export function validateRevision(revision: string | undefined): void {
+  if (revision !== undefined && !/^sha256:[0-9a-f]{64}$/u.test(revision)) throw new RequestError("revision must be a SHA-256 digest");
+}
 
 /** Find a skill by qualified id, or by bare name when exactly one source has it. */
-export function resolveSkill(db: DatabaseSync, input: string): IndexEntry {
+export function resolveSkill(db: DatabaseSync, input: string, revision?: string): IndexEntry {
+  validateRevision(revision);
   const exact = db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE id = ?`).get(input) as IndexEntry | undefined;
   if (exact !== undefined) return exact;
   const byName = db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE name = ?`).all(input) as unknown as IndexEntry[];
@@ -61,6 +48,7 @@ export function resolveSkill(db: DatabaseSync, input: string): IndexEntry {
       .join("\n");
     throw new RequestError(`"${clean(input)}" is ambiguous; use one of these ids:\n${ids}`);
   }
+  if (revision !== undefined) throw new RequestError("skill revision changed; search again");
   throw new RequestError(`no skill "${clean(input)}"; run: margrave find "<task>" or margrave list --skills`);
 }
 
@@ -68,6 +56,7 @@ export interface FindHit {
   id: string;
   name: string;
   description: string;
+  revision: string;
   score: number;
   recommended?: boolean;
   exact?: boolean;
@@ -84,7 +73,7 @@ const FIND_FTS = `WITH hits AS MATERIALIZED (
   UNION ALL SELECT rowid, 0 FROM skills WHERE (name_lc = ? OR id_lc = ?) AND rowid NOT IN (SELECT rowid FROM hits)
 )`;
 const FIND_EXACT_ONLY = "WITH cand AS (SELECT rowid, 0 AS s FROM skills WHERE name_lc = ? OR id_lc = ?)";
-const FIND_TAIL = `SELECT k.rowid, k.id, k.name, k.description, (k.name_lc = ? OR k.id_lc = ?) AS exact,
+const FIND_TAIL = `SELECT k.rowid, k.id, k.name, k.description, k.hash AS revision, (k.name_lc = ? OR k.id_lc = ?) AS exact,
   c.s + CASE WHEN k.name_lc = ? OR k.id_lc = ? THEN ${NAME_BONUS} ELSE 0 END AS score
 FROM cand c JOIN skills k ON k.rowid = c.rowid`;
 
@@ -99,6 +88,7 @@ export function findSkills(db: DatabaseSync, task: string, limit: unknown, expla
     id: string | null;
     name: string | null;
     description: string | null;
+    revision: string | null;
     score: number;
     exact: number;
     col: Field | null;
@@ -115,19 +105,20 @@ export function findSkills(db: DatabaseSync, task: string, limit: unknown, expla
     db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS temp.find_vocab USING fts5vocab(main, fts, instance)");
     const sql = `${FIND_FTS}, ranked AS MATERIALIZED (${FIND_TAIL}), evidence AS MATERIALIZED (
       SELECT doc, col, term FROM temp.find_vocab WHERE term IN (${terms.map(() => "?").join(",")}) GROUP BY doc, col, term
-    ) SELECT rowid, id, name, description, exact, score, NULL AS col, NULL AS term, 0 AS kind FROM ranked
-      UNION ALL SELECT doc, NULL, NULL, NULL, 0, 0, col, term, 1 FROM evidence
+    ) SELECT rowid, id, name, description, revision, exact, score, NULL AS col, NULL AS term, 0 AS kind FROM ranked
+      UNION ALL SELECT doc, NULL, NULL, NULL, NULL, 0, 0, col, term, 1 FROM evidence
       ORDER BY kind, exact DESC, score DESC, id, col, term`;
     rows = db.prepare(sql).all(terms.map((t) => `"${t}"`).join(" OR "), ...exact, ...terms) as unknown as Row[];
   }
   const hits = new Map<number, FindHit & { recommended: boolean; exact: boolean; matchedTerms: MatchedTerms }>();
   for (const row of rows) {
     let hit = hits.get(row.rowid);
-    if (hit === undefined && row.id !== null && row.name !== null && row.description !== null) {
+    if (hit === undefined && row.id !== null && row.name !== null && row.description !== null && row.revision !== null) {
       hit = {
         id: row.id,
         name: row.name,
         description: row.description,
+        revision: row.revision,
         score: row.score,
         recommended: false,
         exact: Boolean(row.exact),
@@ -143,7 +134,7 @@ export function findSkills(db: DatabaseSync, task: string, limit: unknown, expla
     0,
     clampLimit(limit),
   );
-  return explain ? selected : selected.map(({ id, name, description, score }) => ({ id, name, description, score }));
+  return explain ? selected : selected.map(({ id, name, description, revision, score }) => ({ id, name, description, revision, score }));
 }
 
 export interface FindText {
@@ -164,6 +155,7 @@ export function formatFind(hits: readonly FindHit[], text: FindText = CLI_FIND_T
   hits.forEach((h, i) => {
     lines.push(`${i + 1}. ${clean(h.id)}  (score ${h.score.toFixed(3)}${h.recommended === false ? ", weak match" : ""})`);
     lines.push(`   ${clean(h.description)}`);
+    lines.push(`   revision: ${h.revision}`);
     if (h.exact === true) lines.push("   exact name or id");
     if (h.matchedTerms !== undefined) {
       const matched = h.matchedTerms;
@@ -177,73 +169,6 @@ export function formatFind(hits: readonly FindHit[], text: FindText = CLI_FIND_T
 }
 
 const MAX_LISTED_FILES = 200;
-const SKIP_DIRS = new Set([".git", "node_modules"]);
-
-/** True when a path relative to the skill dir has a component named .git (case-insensitive, for APFS). HFS+ ignorable code points are not covered. */
-function isGitPath(rel: string): boolean {
-  return rel.split(path.sep).some((s) => s.toLowerCase() === ".git");
-}
-
-/** Regular files inside a skill dir, relative, sorted. Follows no symlink. */
-export async function listFiles(dir: string): Promise<string[]> {
-  const out: string[] = [];
-  async function walk(d: string, prefix: string): Promise<void> {
-    let entries;
-    try {
-      entries = await readdir(d, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      if (e.isDirectory()) {
-        if (!SKIP_DIRS.has(e.name)) await walk(path.join(d, e.name), `${prefix}${e.name}/`);
-      } else if (e.isFile()) {
-        out.push(`${prefix}${e.name}`);
-      }
-    }
-  }
-  await walk(dir, "");
-  out.sort();
-  return out;
-}
-
-/**
- * Read one file inside a skill directory. realpath(file) must start with
- * realpath(dir) plus a separator. Refuses absolute paths and anything that escapes.
- */
-export async function readSkillFile(dir: string, rel: string): Promise<string> {
-  if (rel === "") throw new RequestError("path is empty");
-  if (path.isAbsolute(rel)) throw new RequestError("path must be relative to the skill directory");
-  let realDir: string;
-  try {
-    realDir = await realpath(dir);
-  } catch {
-    throw new MargraveError(`skill directory ${clean(dir)} is gone; run: margrave reindex`);
-  }
-  const prefix = realDir.endsWith(path.sep) ? realDir : realDir + path.sep;
-  const joined = path.resolve(realDir, rel);
-  // Lexical check first, so a path outside the directory never reveals whether it exists.
-  if (!joined.startsWith(prefix)) throw new RequestError(`path ${clean(rel)} is outside the skill directory`);
-  if (isGitPath(path.relative(realDir, joined))) throw new RequestError(`path ${clean(rel)} is inside .git, which is not served`);
-  let realFile: string;
-  try {
-    realFile = await realpath(joined);
-  } catch {
-    throw new RequestError(`no such file in the skill directory: ${clean(rel)}`);
-  }
-  if (!realFile.startsWith(prefix)) {
-    throw new RequestError(`path ${clean(rel)} is outside the skill directory`);
-  }
-  if (isGitPath(path.relative(realDir, realFile))) throw new RequestError(`path ${clean(rel)} is inside .git, which is not served`);
-  const fh = await open(realFile, READ_NO_FOLLOW);
-  try {
-    if (!(await fh.stat()).isFile()) throw new RequestError(`not a file: ${clean(rel)}`);
-    return await fh.readFile("utf8");
-  } finally {
-    await fh.close();
-  }
-}
-
 export interface LoadResult {
   id: string;
   source: string;
@@ -255,10 +180,36 @@ export interface LoadResult {
   body: string;
 }
 
-export async function loadSkill(entry: IndexEntry, sources: readonly SourceRecord[]): Promise<LoadResult> {
-  const st = await lstat(entry.dir).catch(() => null);
+export async function readSelectedFile(entry: IndexEntry, rel: string, revision?: string): Promise<string> {
+  if (revision === undefined) return readSkillFile(entry.dir, rel);
+  validateRevision(revision);
+  if (entry.revision !== revision) throw new RequestError("skill revision changed; search again");
+  const item = (JSON.parse(entry.manifest) as ManifestEntry[]).find((f) => f.path === rel);
+  if (item === undefined) throw new RequestError("file is not in the selected skill revision");
+  let bytes: Buffer | undefined;
+  try {
+    bytes = await readSkillFileBytes(entry.dir, rel, true);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (!(err instanceof RequestError) && code !== "ENOENT" && code !== "ENOTDIR") throw err;
+  }
+  const db = await openIndexRead();
+  try {
+    const row = db.prepare("SELECT hash FROM skills WHERE id = ?").get(entry.id) as { hash: string } | undefined;
+    if (row?.hash !== revision) throw new RequestError("skill revision changed; search again");
+  } finally {
+    db.close();
+  }
+  if (bytes === undefined || bytes.length !== item.size || `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== item.digest) {
+    throw new RequestError("skill files changed since indexing; ask the store operator to run margrave reindex, then search again");
+  }
+  return bytes.toString("utf8");
+}
+
+export async function loadSkill(entry: IndexEntry, sources: readonly SourceRecord[], revision?: string): Promise<LoadResult> {
+  const st = revision === undefined ? await lstat(entry.dir).catch(() => null) : true;
   if (st === null) throw new MargraveError(`skill directory ${clean(entry.dir)} is gone; run: margrave reindex`);
-  const text = await readSkillFile(entry.dir, "SKILL.md");
+  const text = await readSelectedFile(entry, "SKILL.md", revision);
   const { rawFrontmatter, body } = splitSkillMd(text);
   const src = sources.find((s) => s.id === entry.source);
   return {
@@ -268,7 +219,7 @@ export async function loadSkill(entry: IndexEntry, sources: readonly SourceRecor
     commit: src?.commit ?? null,
     base: entry.dir,
     frontmatter: rawFrontmatter ?? "",
-    files: await listFiles(entry.dir),
+    files: revision === undefined ? await listFiles(entry.dir) : (JSON.parse(entry.manifest) as ManifestEntry[]).map((f) => f.path),
     body,
   };
 }

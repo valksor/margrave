@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fsp, { chmod, mkdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
@@ -236,6 +237,7 @@ test("a dangling symlink is ignored, for git rules and for local rules", async (
       `followSymlinks=${followSymlinks}`,
     );
     assert.deepEqual(r.warnings, [], `followSymlinks=${followSymlinks}`);
+    assert.equal((await scanSource(root, { followSymlinks, strict: true })).skills.length, 1);
   }
 });
 
@@ -293,4 +295,114 @@ test("the result is sorted by skill name, whatever order the directories and the
 
 test("splitSkillMd reads an empty frontmatter block", () => {
   assert.deepEqual(splitSkillMd("---\n---\nbody\n"), { rawFrontmatter: "", body: "body\n" });
+});
+
+test("manifests fingerprint sorted paths and binary bytes", async () => {
+  const root = await tmp();
+  const dir = await writeSkill(root, "asset", "asset skill");
+  const scan = async () => (await scanSource(root, { followSymlinks: false, strict: true })).skills[0]!;
+  const before = await scan();
+  await mkdir(path.join(dir, "references"));
+  await mkdir(path.join(dir, ".Git"));
+  await writeFile(path.join(dir, ".Git", "config"), "hidden");
+  await link(path.join(dir, "SKILL.md"), path.join(dir, "alias.md"));
+  await writeFile(path.join(dir, "references", "z.bin"), Buffer.from([0, 255, 1]));
+  await writeFile(path.join(dir, "references", "a.bin"), Buffer.from([1, 2]));
+  const first = await scan();
+  assert.notEqual(first.revision, before.revision);
+  assert.deepEqual(
+    first.manifest.map((e) => e.path),
+    ["SKILL.md", "references/a.bin", "references/z.bin"],
+  );
+  assert.equal(first.manifest[2]?.size, 3);
+  assert.match(first.manifest[2]?.digest ?? "", /^sha256:[0-9a-f]{64}$/u);
+  assert.equal(
+    first.manifest[2]?.digest,
+    `sha256:${createHash("sha256")
+      .update(Buffer.from([0, 255, 1]))
+      .digest("hex")}`,
+  );
+  assert.equal((await scan()).revision, first.revision);
+  await writeFile(path.join(dir, "references", "z.bin"), Buffer.from([0, 255, 2]));
+  const changed = await scan();
+  assert.notEqual(changed.revision, first.revision);
+  assert.notEqual(changed.manifest[2]?.digest, first.manifest[2]?.digest);
+  await fsp.rename(path.join(dir, "references", "a.bin"), path.join(dir, "references", "b.bin"));
+  const renamed = await scan();
+  assert.deepEqual(
+    renamed.manifest.map((e) => e.path),
+    ["SKILL.md", "references/b.bin", "references/z.bin"],
+  );
+  assert.notEqual(renamed.revision, changed.revision);
+  await fsp.rm(path.join(dir, "references", "z.bin"));
+  const removed = await scan();
+  assert.deepEqual(
+    removed.manifest.map((e) => e.path),
+    ["SKILL.md", "references/b.bin"],
+  );
+  assert.notEqual(removed.revision, renamed.revision);
+});
+
+test("strict scans propagate directory, symlink, and skill read errors", async (t) => {
+  const root = await tmp();
+  const dir = await writeSkill(root, "good", "skill");
+  const child = path.join(root, "child");
+  await mkdir(child);
+  const alias = path.join(root, "alias");
+  await link(child, alias);
+  const denied = Object.assign(new Error("injected access failure"), { code: "EACCES" });
+  const actualReadDir = fsp.readdir;
+  mock.method(fsp, "readdir", ((p: string, ...args: unknown[]) =>
+    p === root ? Promise.reject(denied) : (actualReadDir as (...a: unknown[]) => unknown)(p, ...args)) as typeof fsp.readdir);
+  syncBuiltinESMExports();
+  await assert.rejects(scanSource(root, { followSymlinks: false, strict: true }), /injected access failure/u);
+  mock.restoreAll();
+  syncBuiltinESMExports();
+  const real = fsp.realpath;
+  mock.method(fsp, "realpath", ((p: string, ...args: unknown[]) =>
+    p === child ? Promise.reject(denied) : (real as (...a: unknown[]) => unknown)(p, ...args)) as typeof fsp.realpath);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  await assert.rejects(scanSource(root, { followSymlinks: false, strict: true }), /injected access failure/u);
+  mock.restoreAll();
+  syncBuiltinESMExports();
+  const actualStat = fsp.stat;
+  mock.method(fsp, "stat", ((p: string, ...args: unknown[]) =>
+    p === alias ? Promise.reject(denied) : (actualStat as (...a: unknown[]) => unknown)(p, ...args)) as typeof fsp.stat);
+  syncBuiltinESMExports();
+  for (const followSymlinks of [false, true])
+    await assert.rejects(scanSource(root, { followSymlinks, strict: true }), /injected access failure/u);
+  mock.restoreAll();
+  syncBuiltinESMExports();
+  const actualOpen = fsp.open;
+  mock.method(fsp, "open", ((p: string, ...args: unknown[]) =>
+    p === path.join(dir, "SKILL.md")
+      ? Promise.reject(denied)
+      : (actualOpen as (...a: unknown[]) => unknown)(p, ...args)) as typeof fsp.open);
+  syncBuiltinESMExports();
+  await assert.rejects(scanSource(root, { followSymlinks: false, strict: true }), /injected access failure/u);
+});
+
+test("a skill file removed during enumeration aborts its manifest", async (t) => {
+  const root = await tmp();
+  const dir = await writeSkill(root, "good", "skill");
+  const actual = fsp.readdir;
+  let reads = 0;
+  mock.method(fsp, "readdir", ((p: string, ...args: unknown[]) => {
+    if (p === dir && ++reads === 2) return Promise.resolve([]);
+    return (actual as (...a: unknown[]) => unknown)(p, ...args);
+  }) as typeof fsp.readdir);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  await assert.rejects(scanSource(root, { followSymlinks: false, strict: true }), /disappeared during manifest/u);
+  reads = 0;
+  const result = await scanSource(root, { followSymlinks: false });
+  assert.deepEqual(result.skills, []);
+  assert.match(result.warnings[0] ?? "", /disappeared during manifest/u);
 });

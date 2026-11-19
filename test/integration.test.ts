@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { chmod, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -802,6 +803,13 @@ test("with no sources: update, find --json, and list --skills say so", async () 
   assert.deepEqual(JSON.parse(find.stdout), { task: "anything", results: [], message: NO_SOURCES });
   assert.equal((await mg(env, ["list", "--skills"])).stdout.trim(), NO_SOURCES);
   assert.deepEqual(JSON.parse((await mg(env, ["list", "--json", "--skills"])).stdout), { sources: [], skills: [] });
+  const revision = `sha256:${"a".repeat(64)}`;
+  for (const args of [
+    ["load", "missing", "--revision", revision],
+    ["load", "missing", "--file", "SKILL.md", "--revision", revision],
+  ]) {
+    assert.match((await mg(env, args)).stderr, /skill revision changed; search again/u);
+  }
 });
 
 test("list shows a local source with no ref and no commit; --skills adds the skills; load --file prints the file as is", async () => {
@@ -1119,4 +1127,55 @@ test("git source: updating one source leaves the record of another source as it 
   assert.ok(r.stdout.includes(`added: ${idA}/extra-skill`));
   assert.deepEqual(await recordOf(idB), beforeB);
   assert.notDeepEqual(await recordOf(idA), beforeA);
+});
+
+test("reference-only updates change revision and pinned reads detect drift", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const dir = path.join(repo.dir, "skills", "react-perf", "references");
+  await mkdir(dir);
+  await writeFile(path.join(dir, "tips.md"), "first\n");
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-qm", "add reference");
+  const installed = await mg(env, ["install", repo.url]);
+  assert.equal(installed.code, 0, installed.stderr);
+  const id = `${sourceId(installed)}/react-perf`;
+  const find = async () => JSON.parse((await mg(env, ["find", id, "--json"])).stdout) as { results: { revision: string }[] };
+  const old = (await find()).results[0]!.revision;
+  const oldHash = createHash("sha256")
+    .update(await readFile(path.join(repo.dir, "skills", "react-perf", "SKILL.md")))
+    .digest("hex");
+  assert.equal((await mg(env, ["load", id, "--file", "references/tips.md", "--revision", old])).stdout, "first\n");
+  assert.equal(
+    (await mg(env, ["load", id, "--file", "SKILL.md", "--revision", old])).stdout,
+    await readFile(path.join(repo.dir, "skills", "react-perf", "SKILL.md"), "utf8"),
+  );
+  assert.equal((await mg(env, ["load", id, "--revision", old])).code, 0);
+  assert.match((await mg(env, ["load", id, "--revision", "bad"])).stderr, /revision must be a SHA-256 digest/u);
+  assert.match(
+    (await mg(env, ["load", id, "--file", "../secret", "--revision", old])).stderr,
+    /file is not in the selected skill revision/u,
+  );
+  await writeFile(path.join(dir, "tips.md"), "second\n");
+  const unchangedHash = createHash("sha256")
+    .update(await readFile(path.join(repo.dir, "skills", "react-perf", "SKILL.md")))
+    .digest("hex");
+  assert.equal(unchangedHash, oldHash, "the previous SKILL.md-only comparison omits this change");
+  assert.deepEqual(oldHash === unchangedHash ? [] : [id], []);
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-qm", "change reference");
+  const update = await mg(env, ["update"]);
+  assert.equal(update.code, 0, update.stderr);
+  assert.match(update.stdout, /changed: .*react-perf/u);
+  assert.match((await mg(env, ["load", id, "--revision", old])).stderr, /skill revision changed; search again/u);
+  const current = (await find()).results[0]!.revision;
+  const local = path.join(env.home, "sources", sourceId(installed), "skills", "react-perf", "references", "tips.md");
+  await writeFile(local, "drift\n");
+  assert.match(
+    (await mg(env, ["load", id, "--file", "references/tips.md", "--revision", current])).stderr,
+    /skill files changed since indexing/u,
+  );
+  assert.equal((await mg(env, ["reindex"])).code, 0);
+  const refreshed = (await find()).results[0]!.revision;
+  assert.equal((await mg(env, ["load", id, "--file", "references/tips.md", "--revision", refreshed])).stdout, "drift\n");
 });

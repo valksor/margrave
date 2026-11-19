@@ -16,10 +16,12 @@ test("cleanBlock keeps newlines and tabs", () => {
 });
 
 test("find output is cleaned", () => {
-  const text = formatFind([{ id: "s/\u001b[31mx\u001b[0m", name: "x", description: "bad \u0007desc\u001b[2J", score: 1.5 }]);
+  const text = formatFind([
+    { id: "s/\u001b[31mx\u001b[0m", name: "x", description: "bad \u0007desc\u001b[2J", revision: `sha256:${"a".repeat(64)}`, score: 1.5 },
+  ]);
   // oxlint-disable-next-line no-control-regex -- intentional: the test looks for control characters
   assert.equal(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/u.test(text.replace(/\n/gu, "")), false);
-  assert.match(text, /^1\. s\/x {2}\(score 1\.500\)\n {3}bad desc\nload: margrave load s\/x$/u);
+  assert.match(text, /^1\. s\/x {2}\(score 1\.500\)\n {3}bad desc\n {3}revision: sha256:a{64}\nload: margrave load s\/x$/u);
 });
 
 test("find with no hits says no match and suggests list --skills", () => {
