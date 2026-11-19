@@ -294,6 +294,10 @@ async function ensureRestoreAlias(rec: SourceRecord, destination: string): Promi
     if (err.code === "ENOENT") return null;
     throw err;
   });
+  if (rec.snapshot === undefined) {
+    if (existing?.isDirectory()) return;
+    throw new MargraveError(`installed source differs from the lock: ${rec.id}`);
+  }
   if (existing === null) {
     await switchAlias(rec.id, null, destination);
     return;
@@ -397,7 +401,7 @@ async function publishSource(source: LockedSource, plan: RestorePlan): Promise<v
         JSON.stringify(indexedEntries(writer, source.id)) !== plan.indexed
       )
         throw new MargraveError(`installed source differs from the lock: ${source.id}`);
-      if (plan.marker !== undefined) await ensureRestoreAlias(current, destination);
+      await ensureRestoreAlias(current, destination);
       return undefined;
     }
     if (current !== undefined && (plan.marker === undefined || !matchesLock(current, source) || current.snapshot !== plan.record.snapshot))

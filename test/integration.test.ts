@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { chmod, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, readlink, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { atomicWrite } from "../src/store.ts";
@@ -1416,6 +1416,71 @@ test("lock export and restore pins an annotated tag and verifies installed bytes
   assert.match(conflict.stderr, /installed source differs from the lock/u);
   await rm(path.join(to.home, "sources", id, "skills", "react-perf", "guide.txt"));
   assert.equal((await mg(to, ["lock", "restore", file])).code, 1);
+});
+
+for (const aliasState of ["missing", "incorrect"] as const) {
+  test(`lock restore handles a ${aliasState} snapshot alias`, async () => {
+    const env = await setup();
+    const repo = await makeRepo();
+    const installed = await mg(env, ["install", repo.url]);
+    assert.equal(installed.code, 0, installed.stderr);
+    const id = sourceId(installed);
+    const exported = await mg(env, ["lock", "export"]);
+    assert.equal(exported.code, 0, exported.stderr);
+    const file = path.join(await tmp(), "lock.json");
+    await writeFile(file, exported.stdout);
+    const alias = path.join(env.home, "sources", id);
+    const target = await readlink(alias);
+    const expected = await readFile(path.join(alias, "skills", "react-perf", "SKILL.md"), "utf8");
+    await rm(alias);
+    if (aliasState === "incorrect") await link(repo.dir, alias);
+    const restored = await mg(env, ["lock", "restore", file]);
+    if (aliasState === "missing") {
+      assert.equal(restored.code, 0, restored.stderr);
+      assert.equal(await readlink(alias), target);
+      assert.equal(await readFile(path.join(alias, "skills", "react-perf", "SKILL.md"), "utf8"), expected);
+    } else {
+      assert.equal(restored.code, 1);
+      assert.match(restored.stderr, /installed source differs from the lock/u);
+      assert.equal(restored.stdout, "");
+      assert.equal(await readlink(alias), repo.dir);
+      assert.equal(await readFile(path.join(repo.dir, "skills", "react-perf", "SKILL.md"), "utf8"), expected);
+    }
+  });
+}
+
+test("lock restore validates a legacy source directory", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(env, ["install", repo.url]);
+  assert.equal(installed.code, 0, installed.stderr);
+  const id = sourceId(installed);
+  const alias = path.join(env.home, "sources", id);
+  const recordsFile = path.join(env.home, "sources.json");
+  const records = JSON.parse(await readFile(recordsFile, "utf8")) as { snapshot?: string }[];
+  const destination = await realpath(alias);
+  await rm(alias);
+  await rename(destination, alias);
+  delete records[0]!.snapshot;
+  await writeFile(recordsFile, JSON.stringify(records));
+  const reindexed = await mg(env, ["reindex"]);
+  assert.equal(reindexed.code, 0, reindexed.stderr);
+  const exported = await mg(env, ["lock", "export"]);
+  assert.equal(exported.code, 0, exported.stderr);
+  const file = path.join(await tmp(), "lock.json");
+  await writeFile(file, exported.stdout);
+  const restored = await mg(env, ["lock", "restore", file]);
+  assert.equal(restored.code, 0, restored.stderr);
+  assert.equal(restored.stdout, `already restored ${id}\n`);
+  const moved = path.join(env.home, "legacy-source");
+  await rename(alias, moved);
+  await link(moved, alias);
+  const conflict = await mg(env, ["lock", "restore", file]);
+  assert.equal(conflict.code, 1);
+  assert.match(conflict.stderr, /installed source differs from the lock/u);
+  assert.equal(conflict.stdout, "");
+  assert.equal(await readlink(alias), moved);
+  assert.ok((await stat(moved)).isDirectory());
 });
 
 test("lock validation and staging failures do not publish", async () => {
