@@ -77,14 +77,21 @@ test("frozen search benchmark", async (t) => {
     if (expected.length === 0) falseRecommendations += Number(ids.length > 0);
     else {
       top += Number(expected.includes(ids[0] ?? ""));
-      recall += Number(ids.some((id) => expected.includes(id)));
+      recall += expected.filter((id) => ids.includes(id)).length;
+      for (const id of expected) assert.ok(ids.includes(id), `${query}: missing ${id}`);
+    }
+    if (["idempotency", "pieturzīmes", "हिन्दी", "資料", "benchmark-extra/release-notes"].includes(query)) {
+      assert.equal(ids[0], expected[0], query);
     }
     console.log(`benchmark ${query}: ${ids.join(", ") || "abstain"}`);
   }
-  console.log(`benchmark top-1 ${top}/10, recall@5 ${recall}/10, false recommendations ${falseRecommendations}/4`);
+  console.log(`benchmark top-1 ${top}/10, recall@5 ${recall}/11, false recommendations ${falseRecommendations}/4`);
+  // Baseline at 4fa4c0f: top-1 6/10, recall@5 7/11, false recommendations 0/4.
+  assert.ok(top >= 6);
+  assert.ok(recall >= 7);
+  assert.ok(falseRecommendations <= 0);
   assert.equal(top, 10);
-  assert.equal(recall, 10);
-  assert.equal(falseRecommendations, 0);
+  assert.equal(recall, 11);
   assert.deepEqual(findSkills(db, "summaries", 5), []);
   assert.equal(findSkills(db, "summaries", 5, false, new Set(["benchmark-extra"]))[0]?.id, "benchmark-extra/release-notes");
   db.exec("CREATE VIRTUAL TABLE temp.benchmark_vocab USING fts5vocab(main, fts, instance)");
