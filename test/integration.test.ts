@@ -2,24 +2,27 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { chmod, mkdir, readFile, readdir, readlink, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, readdir, readlink, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { atomicWrite } from "../src/store.ts";
 import { resolveScanRoot } from "../src/sources.ts";
 import {
   CLI,
+  ROOT,
+  catalogRecords,
   fakeRipwire,
   git,
   head,
   indexIds,
   indexRows,
-  leaveHotJournal,
   link,
   makeRepo,
   runCli,
   skillMd,
   tmp,
+  writeCatalogRecords,
   writeSkill,
 } from "./helpers.ts";
 import type { Run } from "./helpers.ts";
@@ -37,12 +40,11 @@ const mg = (env: Env, args: string[], extra?: Record<string, string>): Promise<R
   runCli(args, { home: env.home, fakeBin: env.fakeBin, ...(extra === undefined ? {} : { extra }) });
 
 async function snapshot(home: string): Promise<{ sources: string | null; index: string | null }> {
-  const read = (f: string): Promise<string | null> => readFile(path.join(home, f), "utf8").catch(() => null);
   const index = await stat(path.join(home, "index.db")).then(
     () => JSON.stringify(indexRows(home)),
     () => null,
   );
-  return { sources: await read("sources.json"), index };
+  return { sources: index === null ? null : JSON.stringify(catalogRecords(home)), index };
 }
 
 async function storeFiles(dir: string): Promise<Record<string, string>> {
@@ -65,6 +67,1026 @@ function sourceId(r: Run): string {
   assert.ok(m?.[1], `no source id in: ${r.stdout}${r.stderr}`);
   return m[1];
 }
+
+test("a copied Git store loads its own snapshot while the original remains", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(env, ["install", repo.url]);
+  assert.equal(installed.code, 0, installed.stderr);
+  const id = sourceId(installed);
+  const moved = path.join(await tmp(), "store");
+  await cp(env.home, moved, { recursive: true, verbatimSymlinks: true });
+  const originalSkill = path.join(env.home, "sources", id, "skills", "react-perf", "SKILL.md");
+  await writeFile(originalSkill, skillMd("react-perf", "Changed original", "Original store content."));
+  const copied = { ...env, home: moved };
+  const found = await mg(copied, ["find", "react-perf"]);
+  assert.equal(found.code, 0, found.stderr);
+  assert.match(found.stdout, /react-perf/u);
+  const loaded = await mg(copied, ["load", `${id}/react-perf`]);
+  assert.equal(loaded.code, 0, loaded.stderr);
+  assert.match(loaded.stdout, /Body of react-perf/u);
+  assert.doesNotMatch(loaded.stdout, /Original store content/u);
+});
+
+test("Git skill paths cannot escape their managed snapshot", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(env, ["install", repo.url]);
+  const id = sourceId(installed);
+  const db = new DatabaseSync(path.join(env.home, "index.db"));
+  const row = db.prepare("SELECT dir FROM skills WHERE name = ?").get("react-perf") as { dir: string };
+  const update = db.prepare("UPDATE skills SET dir = ? WHERE name = ?");
+  for (const dir of ["../outside", "/tmp/outside"]) {
+    update.run(dir, "react-perf");
+    const loaded = await mg(env, ["load", `${id}/react-perf`]);
+    assert.equal(loaded.code, 1);
+    assert.match(loaded.stderr, /invalid snapshot path/u);
+  }
+  update.run(row.dir, "react-perf");
+  db.prepare("UPDATE skills SET source = 'unknown' WHERE name = 'react-perf'").run();
+  const missingSource = await mg(env, ["load", `${id}/react-perf`]);
+  assert.equal(missingSource.code, 1);
+  assert.match(missingSource.stderr, /invalid snapshot path/u);
+  db.prepare("UPDATE skills SET source = ? WHERE name = 'react-perf'").run(id);
+  db.close();
+  const loaded = await mg(env, ["load", `${id}/react-perf`]);
+  assert.equal(loaded.code, 0, loaded.stderr);
+  const record = catalogRecords(env.home)[0]!;
+  const skill = path.join(env.home, "snapshots", id, record.snapshot!, row.dir);
+  const outside = path.join(await tmp(), "outside");
+  await rename(skill, outside);
+  await link(outside, skill);
+  const escaped = await mg(env, ["load", `${id}/react-perf`]);
+  assert.equal(escaped.code, 1);
+  assert.match(escaped.stderr, /invalid snapshot path/u);
+});
+
+test("first publication can retry after catalog rename fails", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const preload = path.join(await tmp(), "fail-publication.mjs");
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const rename = fs.rename;
+fs.rename = function(from, to) { if (to === ${JSON.stringify(path.join(env.home, "index.db"))}) return Promise.reject(new Error("publication failed")); return rename.call(this, from, to); };
+syncBuiltinESMExports();\n`,
+  );
+  const failed = await runCli(["install", repo.url], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /publication failed/u);
+  const retried = await mg(env, ["install", repo.url]);
+  assert.equal(retried.code, 0, retried.stderr);
+  const loaded = await mg(env, ["load", "react-perf"]);
+  assert.equal(loaded.code, 0, loaded.stderr);
+});
+
+test("first publication distinguishes interruption before and after rename", async () => {
+  for (const checkpoint of ["before", "after"] as const) {
+    const env = await setup();
+    const repo = await makeRepo();
+    const preload = path.join(await tmp(), "interrupt-first-publication.mjs");
+    await writeFile(
+      preload,
+      `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const rename = fs.rename;
+fs.rename = async function(from, to) {
+  if (to !== ${JSON.stringify(path.join(env.home, "index.db"))}) return rename.call(this, from, to);
+  if (${JSON.stringify(checkpoint)} === "after") await rename.call(this, from, to);
+  process.kill(process.pid, "SIGKILL");
+};
+syncBuiltinESMExports();\n`,
+    );
+    const stopped = await runCli(["install", repo.url], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+    assert.notEqual(stopped.code, 0);
+    if (checkpoint === "before") {
+      assert.deepEqual(JSON.parse((await mg(env, ["list", "--json"])).stdout), { sources: [] });
+      const publicationMarker = path.join(env.home, "catalog-published");
+      const markerCopy = path.join(await tmp(), "marker");
+      await rename(publicationMarker, markerCopy);
+      await link(markerCopy, publicationMarker);
+      assert.match((await mg(env, ["list", "--json"])).stderr, /index\.db is missing/u);
+      await rm(publicationMarker);
+      await rename(markerCopy, publicationMarker);
+      const owner = (await readdir(env.home)).find((name) => name.endsWith(".tmp.owner"))!;
+      const ownerFile = path.join(env.home, owner);
+      const outside = path.join(await tmp(), "owner");
+      await rename(ownerFile, outside);
+      await link(outside, ownerFile);
+      assert.match((await mg(env, ["list", "--json"])).stderr, /index\.db is missing/u);
+      await rm(ownerFile);
+      await rename(outside, ownerFile);
+      const retried = await mg(env, ["install", repo.url]);
+      assert.equal(retried.code, 0, retried.stderr);
+      assert.equal((await mg(env, ["load", "react-perf"])).code, 0);
+    } else {
+      assert.equal((await mg(env, ["load", "react-perf"])).code, 0);
+      await rm(path.join(env.home, "index.db"));
+      const missing = await mg(env, ["list", "--json"]);
+      assert.equal(missing.code, 1);
+      assert.match(missing.stderr, /index\.db is missing\. Restore the complete store backup/u);
+      const retry = await mg(env, ["install", repo.url]);
+      assert.equal(retry.code, 1);
+      assert.match(retry.stderr, /index\.db is missing\. Restore the complete store backup/u);
+    }
+  }
+});
+
+test("readers recheck the catalog when pending publication changes", async () => {
+  for (const change of ["publish", "cleanup"] as const) {
+    const env = await setup();
+    const repo = await makeRepo();
+    const dir = await tmp();
+    const stop = path.join(dir, "stop.mjs");
+    await writeFile(
+      stop,
+      `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const rename = fs.rename;
+fs.rename = function(from, to) { if (to === ${JSON.stringify(path.join(env.home, "index.db"))}) process.kill(process.pid, "SIGKILL"); return rename.call(this, from, to); };
+syncBuiltinESMExports();\n`,
+    );
+    await runCli(["install", repo.url], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", stop] });
+    const name = (await readdir(env.home)).find((item) => /^\.catalog-\d+-[0-9a-f]{24}\.tmp$/u.test(item))!;
+    const temp = path.join(env.home, name);
+    const race = path.join(dir, "race.mjs");
+    await writeFile(
+      race,
+      `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const lstat = fs.lstat;
+fs.lstat = async function(file, ...args) {
+  if (file === ${JSON.stringify(temp)}) {
+    if (${JSON.stringify(change)} === "publish") await fs.rename(file, ${JSON.stringify(path.join(env.home, "index.db"))});
+    else { await fs.rm(${JSON.stringify(path.join(env.home, "catalog-published"))}); await fs.rm(file); }
+  }
+  return lstat.call(this, file, ...args);
+};
+syncBuiltinESMExports();\n`,
+    );
+    const result = await runCli(["list", "--json"], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", race] });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).sources.length, change === "publish" ? 1 : 0);
+  }
+});
+
+test("cleanup preserves a pending marker while a catalog exists", async () => {
+  const env = await setup();
+  const dir = await tmp();
+  await writeSkill(dir, "alpha", "alpha skill");
+  assert.equal((await mg(env, ["install", dir])).code, 0);
+  const name = `.catalog-123-${"a".repeat(24)}.tmp`;
+  await writeFile(path.join(env.home, name), "owned temporary catalog");
+  await writeFile(path.join(env.home, `${name}.owner`), "margrave-catalog-v1\n");
+  await writeFile(path.join(env.home, "catalog-published"), `pending ${name}\n`);
+  const result = await mg(env, ["reindex"]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal((await mg(env, ["load", "alpha"])).code, 0);
+});
+
+test("stage ownership initialization failure leaves the writer reusable", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const preload = path.join(await tmp(), "fail-owner.mjs");
+  await writeFile(
+    preload,
+    `import { DatabaseSync } from "node:sqlite";
+const exec = DatabaseSync.prototype.exec;
+DatabaseSync.prototype.exec = function(sql) { if (sql.startsWith("CREATE TABLE owner")) throw new Error("stage initialization failed"); return exec.call(this, sql); };\n`,
+  );
+  const failed = await runCli(["install", repo.url], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /stage initialization failed/u);
+  assert.deepEqual(await readdir(path.join(env.home, "staging")), []);
+  const retried = await mg(env, ["install", repo.url]);
+  assert.equal(retried.code, 0, retried.stderr);
+});
+
+test("stage directory creation failure releases the writer lock", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const preload = path.join(await tmp(), "fail-stage-create.mjs");
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+fs.mkdtemp = () => Promise.reject(Object.assign(new Error("stage creation denied"), { code: "EACCES" }));
+syncBuiltinESMExports();\n`,
+  );
+  const failed = await runCli(["install", repo.url], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /stage creation denied/u);
+  const retried = await mg(env, ["install", repo.url]);
+  assert.equal(retried.code, 0, retried.stderr);
+});
+
+test("stage cleanup failure still releases the writer lock", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const preload = path.join(await tmp(), "fail-stage-cleanup.mjs");
+  await writeFile(
+    preload,
+    `import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const exec = DatabaseSync.prototype.exec; const rm = fs.rm;
+DatabaseSync.prototype.exec = function(sql) { if (sql.startsWith("CREATE TABLE owner")) throw new Error("owner failed"); return exec.call(this, sql); };
+fs.rm = function(file, ...args) { if (String(file).startsWith(${JSON.stringify(path.join(env.home, "staging", "s-"))})) return Promise.reject(new Error("stage cleanup failed")); return rm.call(this, file, ...args); };
+syncBuiltinESMExports();\n`,
+  );
+  const failed = await runCli(["install", repo.url], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /stage cleanup failed/u);
+  const retried = await mg(env, ["install", repo.url]);
+  assert.equal(retried.code, 0, retried.stderr);
+});
+
+test("first lock restore retries after catalog publication fails", async () => {
+  const from = await setup();
+  const to = await setup();
+  const repo = await makeRepo();
+  assert.equal((await mg(from, ["install", repo.url])).code, 0);
+  const exported = await mg(from, ["lock", "export"]);
+  assert.equal(exported.code, 0, exported.stderr);
+  const dir = await tmp();
+  const lock = path.join(dir, "lock.json");
+  const preload = path.join(dir, "fail-publication.mjs");
+  await writeFile(lock, exported.stdout);
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const rename = fs.rename;
+fs.rename = function(from, to) { if (to === ${JSON.stringify(path.join(to.home, "index.db"))}) return Promise.reject(new Error("publication failed")); return rename.call(this, from, to); };
+syncBuiltinESMExports();\n`,
+  );
+  const failed = await runCli(["lock", "restore", lock], { home: to.home, fakeBin: to.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /publication failed/u);
+  const retried = await mg(to, ["lock", "restore", lock]);
+  assert.equal(retried.code, 0, retried.stderr);
+  const loaded = await mg(to, ["load", "react-perf"]);
+  assert.equal(loaded.code, 0, loaded.stderr);
+});
+
+test("a verified pending lock repairs incomplete indexed rows", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(env, ["install", repo.url]);
+  const id = sourceId(installed);
+  const exported = await mg(env, ["lock", "export"]);
+  const lock = JSON.parse(exported.stdout) as { sources: unknown[] };
+  const record = catalogRecords(env.home)[0];
+  const pending = path.join(env.home, "restore-pending", `${id}.json`);
+  await mkdir(path.dirname(pending), { recursive: true });
+  await writeFile(pending, JSON.stringify({ source: lock.sources[0], record }));
+  const db = new DatabaseSync(path.join(env.home, "index.db"));
+  db.prepare("UPDATE skills SET hash = ? WHERE name = ?").run(`sha256:${"0".repeat(64)}`, "react-perf");
+  db.close();
+  const file = path.join(await tmp(), "lock.json");
+  await writeFile(file, exported.stdout);
+  const restored = await mg(env, ["lock", "restore", file]);
+  assert.equal(restored.code, 0, restored.stderr);
+  assert.equal((await mg(env, ["lock", "export"])).stdout, exported.stdout);
+  await assert.rejects(readFile(pending), { code: "ENOENT" });
+});
+
+test("the next writer repairs a stale managed alias after removal", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(env, ["install", repo.url]);
+  assert.equal(installed.code, 0, installed.stderr);
+  const id = sourceId(installed);
+  const alias = path.join(env.home, "sources", id);
+  const other = path.join(env.home, "sources", "unrelated");
+  await mkdir(other);
+  const preload = path.join(await tmp(), "fail-alias.mjs");
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const rm = fs.rm;
+fs.rm = function(file, ...args) { if (file === ${JSON.stringify(alias)}) return Promise.reject(new Error("alias cleanup failed")); return rm.call(this, file, ...args); };
+syncBuiltinESMExports();\n`,
+  );
+  const removed = await runCli(["remove", id], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(removed.code, 0, removed.stderr);
+  assert.match(removed.stderr, /alias cleanup failed/u);
+  assert.ok(await readlink(alias));
+  await chmod(env.home, 0o555);
+  try {
+    const view = await mg(env, ["list", "--json"]);
+    assert.equal(view.code, 0, view.stderr);
+    assert.deepEqual((JSON.parse(view.stdout) as { sources: unknown[] }).sources, []);
+  } finally {
+    await chmod(env.home, 0o755);
+  }
+  const repaired = await mg(env, ["reindex"]);
+  assert.equal(repaired.code, 0, repaired.stderr);
+  await assert.rejects(readlink(alias), { code: "ENOENT" });
+  assert.ok((await stat(other)).isDirectory());
+});
+
+test("a Git source can be reinstalled after its alias cleanup was interrupted", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(env, ["install", repo.url]);
+  const id = sourceId(installed);
+  const alias = path.join(env.home, "sources", id);
+  const preload = path.join(await tmp(), "fail-alias.mjs");
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const rm = fs.rm;
+fs.rm = function(file, ...args) { if (file === ${JSON.stringify(alias)}) return Promise.reject(new Error("alias cleanup failed")); return rm.call(this, file, ...args); };
+syncBuiltinESMExports();\n`,
+  );
+  const removed = await runCli(["remove", id], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(removed.code, 0, removed.stderr);
+  assert.ok(await readlink(alias));
+  const reinstalled = await mg(env, ["install", repo.url]);
+  assert.equal(reinstalled.code, 0, reinstalled.stderr);
+  assert.equal((await mg(env, ["load", "react-perf"])).code, 0);
+});
+
+test("an inaccessible Git alias stops installation without publishing", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(env, ["install", repo.url]);
+  const id = sourceId(installed);
+  assert.equal((await mg(env, ["remove", id])).code, 0);
+  const before = await readFile(path.join(env.home, "index.db"));
+  const alias = path.join(env.home, "sources", id);
+  const preload = path.join(await tmp(), "fail-alias-stat.mjs");
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const lstat = fs.lstat;
+fs.lstat = function(file, ...args) { if (file === ${JSON.stringify(alias)}) return Promise.reject(Object.assign(new Error("alias denied"), { code: "EACCES" })); return lstat.call(this, file, ...args); };
+syncBuiltinESMExports();\n`,
+  );
+  const failed = await runCli(["install", repo.url], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /alias denied/u);
+  assert.deepEqual(await readFile(path.join(env.home, "index.db")), before);
+});
+
+test("installation protects an unexpected Git alias", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(env, ["install", repo.url]);
+  const id = sourceId(installed);
+  assert.equal((await mg(env, ["remove", id])).code, 0);
+  const alias = path.join(env.home, "sources", id);
+  const outside = await tmp();
+  for (const kind of ["directory", "link"] as const) {
+    if (kind === "directory") await mkdir(alias);
+    else await link(outside, alias);
+    const failed = await mg(env, ["install", repo.url]);
+    assert.equal(failed.code, 1, kind);
+    assert.match(failed.stderr, /already installed/u);
+    if (kind === "directory") assert.ok((await stat(alias)).isDirectory());
+    else assert.equal(await readlink(alias), outside);
+    await rm(alias, { recursive: true });
+  }
+});
+
+test("failure to publish catalog evidence leaves the published catalog readable", async () => {
+  const env = await setup();
+  const dir = await tmp();
+  await writeSkill(dir, "alpha", "alpha skill");
+  const preload = path.join(await tmp(), "fail-marker.mjs");
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const rename = fs.rename;
+let markers = 0;
+fs.rename = function(from, to) { if (to === ${JSON.stringify(path.join(env.home, "catalog-published"))} && ++markers === 2) return Promise.reject(new Error("marker rename failed")); return rename.call(this, from, to); };
+syncBuiltinESMExports();\n`,
+  );
+  const failed = await runCli(["install", dir], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /marker rename failed/u);
+  assert.equal((await mg(env, ["load", "alpha"])).code, 0);
+  assert.equal((await mg(env, ["reindex"])).code, 0);
+});
+
+test("a non-Error alias failure is reported after publication", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const preload = path.join(await tmp(), "fail-alias-value.mjs");
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const symlink = fs.symlink;
+fs.symlink = function(target, file, ...args) { if (String(file).endsWith(".new")) return Promise.reject("alias unavailable"); return symlink.call(this, target, file, ...args); };
+syncBuiltinESMExports();\n`,
+  );
+  const installed = await runCli(["install", repo.url], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(installed.code, 0, installed.stderr);
+  assert.match(installed.stderr, /compatibility link could not be updated: alias unavailable/u);
+  assert.equal((await mg(env, ["load", "react-perf"])).code, 0);
+  assert.equal((await mg(env, ["reindex"])).code, 0);
+});
+
+test("temporary catalog cleanup failure releases the writer lock after publication", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const preload = path.join(await tmp(), "fail-cleanup.mjs");
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const rm = fs.rm;
+fs.rm = function(file, ...args) { if (String(file).includes('/.catalog-')) return Promise.reject(new Error("cleanup failed")); return rm.call(this, file, ...args); };
+syncBuiltinESMExports();\n`,
+  );
+  const failed = await runCli(["install", repo.url], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /cleanup failed/u);
+  await chmod(env.home, 0o555);
+  try {
+    const loaded = await mg(env, ["load", "react-perf"]);
+    assert.equal(loaded.code, 0, loaded.stderr);
+  } finally {
+    await chmod(env.home, 0o755);
+  }
+  const retried = await mg(env, ["reindex"]);
+  assert.equal(retried.code, 0, retried.stderr);
+});
+
+test("a directory sync failure after publication retains the published snapshot", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(env, ["install", repo.url]);
+  const id = sourceId(installed);
+  await writeSkill(path.join(repo.dir, "skills"), "react-perf", "sync failure update");
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-qm", "new skill");
+  const preload = path.join(await tmp(), "fail-sync.mjs");
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const open = fs.open; const rename = fs.rename; let published = false;
+fs.rename = async function(from, to) { await rename.call(this, from, to); if (to === ${JSON.stringify(path.join(env.home, "index.db"))}) published = true; };
+fs.open = async function(file, ...args) { const handle = await open.call(this, file, ...args); if (published && file === ${JSON.stringify(env.home)}) handle.sync = async () => { throw new Error("directory sync failed"); }; return handle; };
+syncBuiltinESMExports();\n`,
+  );
+  const failed = await runCli(["update", id], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /directory sync failed/u);
+  const loaded = await mg(env, ["load", "react-perf"]);
+  assert.equal(loaded.code, 0, loaded.stderr);
+  assert.match(loaded.stdout, /sync failure update/u);
+  const repaired = await mg(env, ["reindex"]);
+  assert.equal(repaired.code, 0, repaired.stderr);
+  assert.match(await readFile(path.join(env.home, "sources", id, "skills", "react-perf", "SKILL.md"), "utf8"), /sync failure update/u);
+});
+
+test("migration accepts a store reached through a directory symlink", async () => {
+  const root = await tmp();
+  const store = path.join(root, "store");
+  const alias = path.join(root, "store-link");
+  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), store, { recursive: true, verbatimSymlinks: true });
+  await link(store, alias);
+  const migrated = await runCli(["migrate"], { home: alias });
+  assert.equal(migrated.code, 0, migrated.stderr);
+  const loaded = await runCli(["load", "release-upgrade"], { home: alias });
+  assert.equal(loaded.code, 0, loaded.stderr);
+  assert.match(loaded.stdout, /The installed upgrade skill survived/u);
+});
+
+test("a reader held across publication keeps the old catalog", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(env, ["install", repo.url]);
+  assert.equal(installed.code, 0, installed.stderr);
+  const id = sourceId(installed);
+  const db = new DatabaseSync(path.join(env.home, "index.db"), { readOnly: true });
+  try {
+    db.exec("BEGIN");
+    const before = db.prepare("SELECT hash FROM skills WHERE id = ?").get(`${id}/react-perf`);
+    await writeSkill(path.join(repo.dir, "skills"), "react-perf", "Changed description");
+    await git(repo.dir, "add", "-A");
+    await git(repo.dir, "commit", "-qm", "change skill");
+    const updated = await mg(env, ["update", id]);
+    assert.equal(updated.code, 0, updated.stderr);
+    assert.deepEqual(db.prepare("SELECT hash FROM skills WHERE id = ?").get(`${id}/react-perf`), before);
+    const current = new DatabaseSync(path.join(env.home, "index.db"), { readOnly: true });
+    try {
+      assert.notDeepEqual(current.prepare("SELECT hash FROM skills WHERE id = ?").get(`${id}/react-perf`), before);
+    } finally {
+      current.close();
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test("a writer retries while the separate store lock is held", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const lock = new DatabaseSync(path.join(env.home, "writer-lock.db"));
+  lock.exec("BEGIN IMMEDIATE");
+  const scratch = await tmp();
+  const signal = path.join(scratch, "busy");
+  const preload = path.join(scratch, "observe-lock.mjs");
+  await writeFile(
+    preload,
+    `import { DatabaseSync } from "node:sqlite";
+import { writeFileSync } from "node:fs";
+const exec = DatabaseSync.prototype.exec;
+DatabaseSync.prototype.exec = function(sql) { try { return exec.call(this, sql); } catch (err) { if (sql === "BEGIN IMMEDIATE" && err.errcode === 5) writeFileSync(${JSON.stringify(signal)}, "busy"); throw err; } };\n`,
+  );
+  try {
+    const installing = runCli(["install", repo.url], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+    const deadline = Date.now() + 10_000;
+    while (
+      !(await stat(signal).then(
+        () => true,
+        () => false,
+      ))
+    ) {
+      assert.ok(Date.now() < deadline, "writer did not encounter the held lock");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    lock.exec("COMMIT");
+    const result = await installing;
+    assert.equal(result.code, 0, result.stderr);
+  } finally {
+    lock.close();
+  }
+});
+
+test("a writer cleans abandoned stages but preserves live and unrelated directories", async () => {
+  const env = await setup();
+  const staging = path.join(env.home, "staging");
+  await mkdir(staging);
+  const createStage = async (name: string): Promise<DatabaseSync> => {
+    const dir = path.join(staging, name);
+    await mkdir(dir);
+    const db = new DatabaseSync(path.join(dir, ".margrave-owner.db"));
+    db.exec("CREATE TABLE owner(name TEXT NOT NULL)");
+    db.prepare("INSERT INTO owner(name) VALUES (?)").run(name);
+    return db;
+  };
+  const abandoned = await createStage("s-Ab1234");
+  abandoned.close();
+  const live = await createStage("s-Cd5678");
+  live.exec("BEGIN IMMEDIATE");
+  await mkdir(path.join(staging, "unrelated"));
+  await mkdir(path.join(staging, "s-Ef9012"));
+  const mismatched = await createStage("s-Gh3456");
+  mismatched.exec("UPDATE owner SET name = 'different'");
+  mismatched.close();
+  await mkdir(path.join(staging, "s-Ij7890"));
+  await writeFile(path.join(staging, "s-Ij7890", ".margrave-owner.db"), "not a database");
+  await mkdir(path.join(staging, "s-Kl1234"));
+  const unrelatedDb = new DatabaseSync(path.join(staging, "s-Kl1234", ".margrave-owner.db"));
+  unrelatedDb.exec("CREATE TABLE unrelated(value TEXT)");
+  unrelatedDb.close();
+  try {
+    const result = await mg(env, ["reindex"]);
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual((await readdir(staging)).sort(), ["s-Cd5678", "s-Ef9012", "s-Gh3456", "s-Ij7890", "s-Kl1234", "unrelated"]);
+  } finally {
+    live.close();
+  }
+});
+
+test("a writer cleans owned catalog temporaries and preserves unrelated objects", async () => {
+  const env = await setup();
+  const dir = await tmp();
+  await writeSkill(dir, "alpha", "alpha skill");
+  await installLocalDir(env, dir);
+  const owned = path.join(env.home, `.catalog-123-${"a".repeat(24)}.tmp`);
+  const unowned = path.join(env.home, `.catalog-456-${"b".repeat(24)}.tmp`);
+  const protectedPath = path.join(env.home, `.catalog-789-${"c".repeat(24)}.tmp`);
+  const malformed = path.join(env.home, `.catalog-987-${"d".repeat(24)}.tmp`);
+  const outside = path.join(await tmp(), "outside");
+  await writeFile(owned, "temporary catalog");
+  await writeFile(`${owned}-journal`, "temporary journal");
+  await writeFile(`${owned}.owner`, "margrave-catalog-v1\n");
+  await writeFile(unowned, "unrelated bytes");
+  await writeFile(outside, "protected bytes");
+  await link(outside, protectedPath);
+  await writeFile(`${protectedPath}.owner`, "margrave-catalog-v1\n");
+  await writeFile(malformed, "unrelated catalog");
+  await writeFile(`${malformed}.owner`, "not a Margrave owner");
+  const result = await mg(env, ["reindex"]);
+  assert.equal(result.code, 0, result.stderr);
+  await assert.rejects(readFile(owned), { code: "ENOENT" });
+  await assert.rejects(readFile(`${owned}-journal`), { code: "ENOENT" });
+  await assert.rejects(readFile(`${owned}.owner`), { code: "ENOENT" });
+  assert.equal(await readFile(unowned, "utf8"), "unrelated bytes");
+  assert.equal(await readFile(outside, "utf8"), "protected bytes");
+  assert.equal(await readFile(malformed, "utf8"), "unrelated catalog");
+  assert.equal(await readlink(protectedPath), outside);
+  assert.equal((await mg(env, ["load", "alpha"])).code, 0);
+});
+
+test("a killed writer leaves an owned catalog copy that the next writer removes", async () => {
+  const env = await setup();
+  const dir = await tmp();
+  await writeSkill(dir, "alpha", "alpha skill");
+  await installLocalDir(env, dir);
+  await writeSkill(dir, "beta", "beta skill");
+  const preload = path.join(await tmp(), "kill-before-publish.mjs");
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const rename = fs.rename;
+fs.rename = function(from, to) { if (to === ${JSON.stringify(path.join(env.home, "index.db"))}) process.kill(process.pid, "SIGKILL"); return rename.call(this, from, to); };
+syncBuiltinESMExports();\n`,
+  );
+  const killed = await runCli(["reindex"], { home: env.home, nodeArgs: ["--import", preload] });
+  assert.equal(killed.code, 1);
+  assert.ok((await readdir(env.home)).some((name) => name.endsWith(".tmp.owner")));
+  await chmod(env.home, 0o555);
+  try {
+    const before = await mg(env, ["list", "--skills"]);
+    assert.equal(before.code, 0, before.stderr);
+    assert.match(before.stdout, /alpha/u);
+    assert.doesNotMatch(before.stdout, /beta/u);
+  } finally {
+    await chmod(env.home, 0o755);
+  }
+  const retry = await mg(env, ["reindex"]);
+  assert.equal(retry.code, 0, retry.stderr);
+  assert.ok(!(await readdir(env.home)).some((name) => name.startsWith(".catalog-")));
+  assert.match((await mg(env, ["list", "--skills"])).stdout, /beta/u);
+});
+
+test("a staging cleanup access failure keeps the catalog and releases the lock", async () => {
+  const env = await setup();
+  const dir = await tmp();
+  await writeSkill(dir, "alpha", "alpha skill");
+  await installLocalDir(env, dir);
+  const before = await readFile(path.join(env.home, "index.db"));
+  const preload = path.join(await tmp(), "fail-staging-read.mjs");
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const readdir = fs.readdir;
+fs.readdir = function(file, ...args) { if (file === ${JSON.stringify(path.join(env.home, "staging"))}) return Promise.reject(Object.assign(new Error("staging denied"), { code: "EACCES" })); return readdir.call(this, file, ...args); };
+syncBuiltinESMExports();\n`,
+  );
+  const failed = await runCli(["reindex"], { home: env.home, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /staging denied/u);
+  assert.deepEqual(await readFile(path.join(env.home, "index.db")), before);
+  const retried = await mg(env, ["reindex"]);
+  assert.equal(retried.code, 0, retried.stderr);
+});
+
+test("an unreadable stage ownership file stops cleanup without deleting it", async () => {
+  const env = await setup();
+  const dir = await tmp();
+  await writeSkill(dir, "alpha", "alpha skill");
+  await installLocalDir(env, dir);
+  const stage = path.join(env.home, "staging", "s-Ab1234");
+  await mkdir(stage);
+  const owner = path.join(stage, ".margrave-owner.db");
+  await writeFile(owner, "protected");
+  const preload = path.join(await tmp(), "fail-owner-stat.mjs");
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const lstat = fs.lstat;
+fs.lstat = function(file, ...args) { if (file === ${JSON.stringify(owner)}) return Promise.reject(Object.assign(new Error("owner denied"), { code: "EACCES" })); return lstat.call(this, file, ...args); };
+syncBuiltinESMExports();\n`,
+  );
+  const failed = await runCli(["reindex"], { home: env.home, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /owner denied/u);
+  assert.equal(await readFile(owner, "utf8"), "protected");
+});
+
+test("unexpected SQLite errors during stage cleanup stop publication", async () => {
+  const env = await setup();
+  const dir = await tmp();
+  await writeSkill(dir, "alpha", "alpha skill");
+  await installLocalDir(env, dir);
+  const stage = path.join(env.home, "staging", "s-Ab1234");
+  await mkdir(stage);
+  const owner = new DatabaseSync(path.join(stage, ".margrave-owner.db"));
+  owner.exec("CREATE TABLE owner(name TEXT NOT NULL)");
+  owner.prepare("INSERT INTO owner(name) VALUES (?)").run("s-Ab1234");
+  owner.close();
+  const preload = path.join(await tmp(), "fail-stage-db.mjs");
+  await writeFile(
+    preload,
+    `import { DatabaseSync } from "node:sqlite";
+const prepare = DatabaseSync.prototype.prepare;
+DatabaseSync.prototype.prepare = function(sql) { if (sql === "SELECT name FROM owner") throw Object.assign(new Error("stage database I/O error"), { errcode: 10 }); return prepare.call(this, sql); };\n`,
+  );
+  const before = await readFile(path.join(env.home, "index.db"));
+  const failed = await runCli(["reindex"], { home: env.home, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /stage database I\/O error/u);
+  assert.deepEqual(await readFile(path.join(env.home, "index.db")), before);
+  const retried = await mg(env, ["reindex"]);
+  assert.equal(retried.code, 0, retried.stderr);
+});
+
+test("migration rejects changed legacy skill bytes without publishing", async () => {
+  const home = path.join(await tmp(), "store");
+  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  const before = await readFile(path.join(home, "index.db"));
+  const source = "example.invalid__fixtures__margrave-upgrade";
+  await writeFile(path.join(home, "sources", source, "release-upgrade", "SKILL.md"), "changed bytes");
+  const result = await runCli(["migrate"], { home });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /cannot upgrade source "example\.invalid__fixtures__margrave-upgrade"/u);
+  assert.deepEqual(await readFile(path.join(home, "index.db")), before);
+});
+
+test("migration preserves a legacy local source with no indexed skills", async () => {
+  const home = path.join(await tmp(), "store");
+  const local = await tmp();
+  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  const record = {
+    id: "local__empty-123456",
+    kind: "local",
+    spec: local,
+    path: local,
+    subpath: "",
+    ref: null,
+    commit: null,
+    installedAt: "2026-01-01T00:00:00.000Z",
+  };
+  await writeFile(path.join(home, "sources.json"), JSON.stringify([record]));
+  const db = new DatabaseSync(path.join(home, "index.db"));
+  db.exec("DELETE FROM fts; DELETE FROM skills");
+  db.close();
+  const conflicting = path.join(await tmp(), "store");
+  await cp(home, conflicting, { recursive: true, verbatimSymlinks: true });
+  const migrated = await runCli(["migrate"], { home });
+  assert.equal(migrated.code, 0, migrated.stderr);
+  const list = await runCli(["list", "--json"], { home });
+  assert.equal(list.code, 0, list.stderr);
+  const result = JSON.parse(list.stdout) as { sources: { id: string; skillCount: number }[] };
+  assert.equal(result.sources[0]?.id, record.id);
+  assert.equal(result.sources[0]?.skillCount, 0);
+  await writeSkill(local, "new-skill", "unindexed skill");
+  const rejected = await runCli(["migrate"], { home: conflicting });
+  assert.equal(rejected.code, 1);
+  assert.match(rejected.stderr, /cannot upgrade source "local__empty-123456"/u);
+});
+
+test("migration preserves a Git skill at the snapshot root", async () => {
+  const home = path.join(await tmp(), "store");
+  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  const source = "example.invalid__fixtures__margrave-upgrade";
+  const records = JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { snapshot: string }[];
+  const snapshotDir = path.join(home, "snapshots", source, records[0]!.snapshot);
+  await rename(path.join(snapshotDir, "release-upgrade", "SKILL.md"), path.join(snapshotDir, "SKILL.md"));
+  await rm(path.join(snapshotDir, "release-upgrade"), { recursive: true });
+  const db = new DatabaseSync(path.join(home, "index.db"));
+  db.exec("UPDATE skills SET dir = substr(dir, 1, length(dir) - length('/release-upgrade'))");
+  db.close();
+  const migrated = await runCli(["migrate"], { home });
+  assert.equal(migrated.code, 0, migrated.stderr);
+  const loaded = await runCli(["load", "release-upgrade"], { home });
+  assert.equal(loaded.code, 0, loaded.stderr);
+  assert.match(loaded.stdout, /The installed upgrade skill survived/u);
+});
+
+test("migration refuses incomplete and conflicting legacy catalogs", async () => {
+  const source = "example.invalid__fixtures__margrave-upgrade";
+  const cases: { name: string; mutate: (home: string) => Promise<void> | void; expected: RegExp }[] = [
+    { name: "missing source file", mutate: async (home) => rm(path.join(home, "sources.json")), expected: /sources\.json is missing/u },
+    {
+      name: "malformed source file",
+      mutate: async (home) => writeFile(path.join(home, "sources.json"), "invalid json"),
+      expected: /cannot upgrade the v0\.2\.1 catalog/u,
+    },
+    {
+      name: "source identity mismatch",
+      mutate: async (home) => {
+        const file = path.join(home, "sources.json");
+        const records = JSON.parse(await readFile(file, "utf8")) as { spec: string }[];
+        records[0]!.spec = "other/repo";
+        await writeFile(file, JSON.stringify(records));
+      },
+      expected: new RegExp(`cannot upgrade source "${source}"`, "u"),
+    },
+    {
+      name: "duplicate source record",
+      mutate: async (home) => {
+        const file = path.join(home, "sources.json");
+        const records = JSON.parse(await readFile(file, "utf8")) as unknown[];
+        await writeFile(file, JSON.stringify([...records, records[0]]));
+      },
+      expected: new RegExp(`cannot upgrade source "${source}"`, "u"),
+    },
+    {
+      name: "unknown indexed source",
+      mutate: (home) => {
+        const db = new DatabaseSync(path.join(home, "index.db"));
+        db.exec(
+          "INSERT INTO skills(id, id_lc, name, name_lc, description, source, dir, hash, manifest, frontmatter) VALUES ('unknown/x', 'unknown/x', 'x', 'x', '', 'unknown', '/x', 'h', '[]', '')",
+        );
+        db.close();
+      },
+      expected: /index contains an unknown source/u,
+    },
+    {
+      name: "indexed path escape",
+      mutate: (home) => {
+        const db = new DatabaseSync(path.join(home, "index.db"));
+        db.exec("UPDATE skills SET dir = dir || '/../../escape'");
+        db.close();
+      },
+      expected: new RegExp(`cannot upgrade source "${source}"`, "u"),
+    },
+    {
+      name: "indexed path with a different skill directory",
+      mutate: (home) => {
+        const db = new DatabaseSync(path.join(home, "index.db"));
+        db.exec("UPDATE skills SET dir = replace(dir, '/release-upgrade', '/different')");
+        db.close();
+      },
+      expected: new RegExp(`cannot upgrade source "${source}"`, "u"),
+    },
+    {
+      name: "indexed path with an invalid snapshot suffix",
+      mutate: async (home) => {
+        const records = JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { snapshot: string }[];
+        const db = new DatabaseSync(path.join(home, "index.db"));
+        db.prepare("UPDATE skills SET dir = replace(dir, ?, ?)").run(records[0]!.snapshot, `${records[0]!.snapshot}-other`);
+        db.close();
+      },
+      expected: new RegExp(`cannot upgrade source "${source}"`, "u"),
+    },
+    {
+      name: "snapshot symlink escape",
+      mutate: async (home) => {
+        const records = JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { snapshot: string }[];
+        const snapshotDir = path.join(home, "snapshots", source, records[0]!.snapshot);
+        const outside = path.join(await tmp(), "outside");
+        await rename(snapshotDir, outside);
+        await link(outside, snapshotDir);
+      },
+      expected: new RegExp(`cannot upgrade source "${source}"`, "u"),
+    },
+    {
+      name: "interrupted legacy write",
+      mutate: async (home) => writeFile(path.join(home, "index.db-journal"), "unfinished"),
+      expected: /unfinished v0\.2\.1 write/u,
+    },
+  ];
+  for (const [column, value] of [
+    ["id", "different/id"],
+    ["hash", `sha256:${"0".repeat(64)}`],
+    ["manifest", "[]"],
+    ["name", "different-name"],
+    ["description", "different description"],
+    ["frontmatter", "different frontmatter"],
+    ["dir", "relative/path"],
+    ["dir", "/tmp/outside"],
+  ]) {
+    cases.push({
+      name: `changed ${column}`,
+      mutate: (home) => {
+        const db = new DatabaseSync(path.join(home, "index.db"));
+        db.prepare(`UPDATE skills SET ${column} = ?`).run(value!);
+        db.close();
+      },
+      expected: new RegExp(`cannot upgrade source "${source}"`, "u"),
+    });
+  }
+  for (const item of cases) {
+    const home = path.join(await tmp(), "store");
+    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await item.mutate(home);
+    const before = await readFile(path.join(home, "index.db"));
+    const result = await runCli(["migrate"], { home });
+    assert.equal(result.code, 1, item.name);
+    assert.match(result.stderr, item.expected, item.name);
+    assert.deepEqual(await readFile(path.join(home, "index.db")), before, item.name);
+  }
+  const empty = await tmp();
+  const current = await runCli(["migrate"], { home: empty });
+  assert.equal(current.code, 0, current.stderr);
+  assert.equal(current.stdout, "store is current\n");
+  await writeFile(path.join(empty, "sources.json"), "[]");
+  const missing = await runCli(["migrate"], { home: empty });
+  assert.equal(missing.code, 1);
+  assert.match(missing.stderr, /index\.db is missing/u);
+  await writeFile(path.join(empty, "index.db"), "");
+  const unsupported = await runCli(["migrate"], { home: empty });
+  assert.equal(unsupported.code, 1);
+  assert.match(unsupported.stderr, /not a supported margrave catalog/u);
+});
+
+test("migration retries after temporary catalog setup fails", async () => {
+  const home = path.join(await tmp(), "store");
+  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  const before = await readFile(path.join(home, "index.db"));
+  const preload = path.join(await tmp(), "fail-journal.mjs");
+  await writeFile(
+    preload,
+    `import { DatabaseSync } from "node:sqlite";
+const exec = DatabaseSync.prototype.exec;
+DatabaseSync.prototype.exec = function(sql) { if (sql === "PRAGMA journal_mode = DELETE") throw new Error("journal configuration failed"); return exec.call(this, sql); };\n`,
+  );
+  const failed = await runCli(["migrate"], { home, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /journal configuration failed/u);
+  assert.deepEqual(await readFile(path.join(home, "index.db")), before);
+  assert.ok(!(await readdir(home)).some((name) => name.startsWith(".catalog-")));
+  const retried = await runCli(["migrate"], { home });
+  assert.equal(retried.code, 0, retried.stderr);
+  assert.equal(retried.stdout, "store upgraded\n");
+});
+
+test("migration rolls back a failed temporary catalog transaction", async () => {
+  const home = path.join(await tmp(), "store");
+  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  const before = await readFile(path.join(home, "index.db"));
+  const preload = path.join(await tmp(), "fail-migration-commit.mjs");
+  await writeFile(
+    preload,
+    `import { DatabaseSync } from "node:sqlite";
+const exec = DatabaseSync.prototype.exec;
+DatabaseSync.prototype.exec = function(sql) { if (sql === "PRAGMA user_version = 3; COMMIT") throw new Error("migration commit failed"); return exec.call(this, sql); };\n`,
+  );
+  const failed = await runCli(["migrate"], { home, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /migration commit failed/u);
+  assert.deepEqual(await readFile(path.join(home, "index.db")), before);
+  assert.ok(!(await readdir(home)).some((name) => name.startsWith(".catalog-")));
+  assert.equal((await runCli(["migrate"], { home })).code, 0);
+});
+
+test("migration reports source metadata access failures without changing the store", async () => {
+  for (const legacyIndex of [false, true]) {
+    const home = path.join(await tmp(), "store");
+    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    const index = path.join(home, "index.db");
+    if (!legacyIndex) await rm(index);
+    const before = legacyIndex ? await readFile(index) : null;
+    const source = path.join(home, "sources.json");
+    const preload = path.join(await tmp(), "fail-source-stat.mjs");
+    await writeFile(
+      preload,
+      `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const lstat = fs.lstat;
+fs.lstat = function(file, ...args) { if (file === ${JSON.stringify(source)}) return Promise.reject(Object.assign(new Error("source metadata denied"), { code: "EACCES" })); return lstat.call(this, file, ...args); };
+syncBuiltinESMExports();\n`,
+    );
+    const failed = await runCli(["migrate"], { home, nodeArgs: ["--import", preload] });
+    assert.equal(failed.code, 1);
+    assert.match(failed.stderr, /source metadata denied/u);
+    if (before !== null) assert.deepEqual(await readFile(index), before);
+    else await assert.rejects(readFile(index), { code: "ENOENT" });
+  }
+});
+
+test("migration reports a non-Error metadata read failure", async () => {
+  const home = path.join(await tmp(), "store");
+  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  const before = await readFile(path.join(home, "index.db"));
+  const preload = path.join(await tmp(), "fail-source-read.mjs");
+  await writeFile(
+    preload,
+    `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const readFile = fs.readFile;
+fs.readFile = function(file, ...args) { if (file === ${JSON.stringify(path.join(home, "sources.json"))}) return Promise.reject("source read failed"); return readFile.call(this, file, ...args); };
+syncBuiltinESMExports();\n`,
+  );
+  const failed = await runCli(["migrate"], { home, nodeArgs: ["--import", preload] });
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /cannot upgrade the v0\.2\.1 catalog: source read failed/u);
+  assert.deepEqual(await readFile(path.join(home, "index.db")), before);
+});
+
+test("empty stores reject explicit source checks and export empty locks", async () => {
+  const env = await setup();
+  const check = await mg(env, ["check", "missing"]);
+  assert.equal(check.code, 1);
+  assert.match(check.stderr, /no source/u);
+  const selected = await mg(env, ["lock", "export", "--source", "missing"]);
+  assert.equal(selected.code, 1);
+  assert.match(selected.stderr, /installed Git source ID/u);
+  assert.equal((await mg(env, ["reindex"])).code, 0);
+  const exported = await mg(env, ["lock", "export"]);
+  assert.equal(exported.code, 0, exported.stderr);
+  assert.deepEqual(JSON.parse(exported.stdout), { version: 1, sources: [] });
+});
 
 test("git source via file://: install, duplicate, find, load, update, remove", async () => {
   const env = await setup();
@@ -210,7 +1232,7 @@ test("short tag install records its full ref and peeled commit", async () => {
   await git(repo.dir, "tag", "-a", "release", "-m", "release");
   const result = await mg(env, ["install", repo.url, "--ref", "release"]);
   assert.equal(result.code, 0, result.stderr);
-  const records = JSON.parse(await readFile(path.join(env.home, "sources.json"), "utf8")) as { ref: string; commit: string }[];
+  const records = catalogRecords(env.home);
   assert.equal(records[0]?.ref, "refs/tags/release");
   assert.equal(records[0]?.commit, commit);
 });
@@ -224,37 +1246,35 @@ test("check and explicit Git tracking refs", async () => {
   const sharedEnv = await setup();
   const shared = await mg(sharedEnv, ["install", repo.url, "--ref", "shared"]);
   assert.equal(shared.code, 0, shared.stderr);
-  const sharedRecords = JSON.parse(await readFile(path.join(sharedEnv.home, "sources.json"), "utf8")) as { ref: string }[];
+  const sharedRecords = catalogRecords(sharedEnv.home);
   assert.equal(sharedRecords[0]?.ref, "refs/heads/shared");
   const inst = await mg(env, ["install", repo.url, "--ref", "refs/topic"]);
   assert.equal(inst.code, 0, inst.stderr);
   const id = sourceId(inst);
-  const sourceFile = path.join(env.home, "sources.json");
   const indexFile = path.join(env.home, "index.db");
-  const record = async (): Promise<{ ref: string; commit: string }[]> =>
-    JSON.parse(await readFile(sourceFile, "utf8")) as { ref: string; commit: string }[];
-  assert.equal((await record())[0]?.ref, "refs/heads/refs/topic");
-  const taggedCommit = (await record())[0]?.commit;
+  const record = (): ReturnType<typeof catalogRecords> => catalogRecords(env.home);
+  assert.equal(record()[0]?.ref, "refs/heads/refs/topic");
+  const taggedCommit = record()[0]?.commit;
   const before = await storeFiles(env.home);
   const current = await mg(env, ["check", id, "--json"]);
   assert.equal(current.code, 0, current.stderr);
   assert.equal((JSON.parse(current.stdout) as { updateAvailable: boolean }[])[0]?.updateAvailable, false);
   assert.deepEqual(await storeFiles(env.home), before);
-  const originalSources = await readFile(sourceFile, "utf8");
-  const invalidRecords = JSON.parse(originalSources) as { ref: string }[];
+  const originalSources = catalogRecords(env.home);
+  const invalidRecords = structuredClone(originalSources);
   assert.ok(invalidRecords[0]);
   invalidRecords[0].ref = "refs/heads/bad..ref";
-  await writeFile(sourceFile, JSON.stringify(invalidRecords));
+  writeCatalogRecords(env.home, invalidRecords);
   assert.equal((await mg(env, ["check", id])).code, 1);
-  await writeFile(sourceFile, originalSources);
+  writeCatalogRecords(env.home, originalSources);
   await writeSkill(path.join(repo.dir, "skills"), "branch-only", "A branch skill");
   await git(repo.dir, "add", "-A");
   await git(repo.dir, "commit", "-qm", "branch commit");
   await git(repo.dir, "branch", "-f", "shared", "HEAD");
   const tag = await mg(env, ["update", id, "--ref", "refs/tags/shared"]);
   assert.equal(tag.code, 0, tag.stderr);
-  assert.equal((await record())[0]?.ref, "refs/tags/shared");
-  assert.equal((await record())[0]?.commit, taggedCommit);
+  assert.equal(record()[0]?.ref, "refs/tags/shared");
+  assert.equal(record()[0]?.commit, taggedCommit);
   assert.equal((await mg(env, ["check", id])).code, 0);
   await git(repo.dir, "tag", "-d", "shared");
   const missingBefore = await storeFiles(env.home);
@@ -265,10 +1285,10 @@ test("check and explicit Git tracking refs", async () => {
   assert.deepEqual(await storeFiles(env.home), missingBefore);
   const failed = await mg(env, ["update", id, "--ref", "refs/heads/missing"]);
   assert.equal(failed.code, 1);
-  assert.equal((await record())[0]?.ref, "refs/tags/shared");
+  assert.equal(record()[0]?.ref, "refs/tags/shared");
   const branch = await mg(env, ["update", id, "--ref", "refs/heads/shared"]);
   assert.equal(branch.code, 0, branch.stderr);
-  assert.equal((await record())[0]?.commit, await head(repo.dir));
+  assert.equal(record()[0]?.commit, await head(repo.dir));
   await writeSkill(path.join(repo.dir, "skills"), "later", "A later skill");
   await git(repo.dir, "add", "-A");
   await git(repo.dir, "commit", "-qm", "later commit");
@@ -280,12 +1300,12 @@ test("check and explicit Git tracking refs", async () => {
   assert.equal((await mg(env, ["update", id, "--ref", "main"])).code, 2);
   assert.equal((await mg(env, ["update", id, "--ref", "refs/heads/bad..ref"])).code, 2);
   await writeFile(path.join(env.home, "sources", id, "skills", "react-perf", "SKILL.md"), skillMd("react-perf", "changed"));
-  const driftBefore = [await readFile(sourceFile), await readFile(indexFile)];
+  const driftBefore = [JSON.stringify(catalogRecords(env.home)), await readFile(indexFile)];
   const drift = await mg(env, ["check", id, "--json"]);
   assert.equal(drift.code, 1, drift.stderr);
   assert.deepEqual((JSON.parse(drift.stdout) as { changed: string[] }[])[0]?.changed, [`${id}/react-perf`]);
   assert.equal((JSON.parse(drift.stdout) as { updateAvailable: boolean }[])[0]?.updateAvailable, true);
-  assert.deepEqual([await readFile(sourceFile), await readFile(indexFile)], driftBefore);
+  assert.deepEqual([JSON.stringify(catalogRecords(env.home)), await readFile(indexFile)], driftBefore);
 });
 
 test("check reports local additions, removals, and supporting file changes", async () => {
@@ -305,7 +1325,7 @@ test("check reports local additions, removals, and supporting file changes", asy
   await writeFile(path.join(root, "kept", "support.txt"), "new bytes");
   await rm(path.join(root, "old"), { recursive: true });
   await writeSkill(root, "new", "New skill");
-  const before = [await readFile(path.join(env.home, "sources.json")), await readFile(path.join(env.home, "index.db"))];
+  const before = [JSON.stringify(catalogRecords(env.home)), await readFile(path.join(env.home, "index.db"))];
   const checked = await mg(env, ["check", root, "--json"]);
   assert.equal(checked.code, 1, checked.stderr);
   const rows = JSON.parse(checked.stdout) as { added: string[]; changed: string[]; removed: string[] }[];
@@ -317,7 +1337,7 @@ test("check reports local additions, removals, and supporting file changes", asy
   assert.match(text.stdout, new RegExp(`added: ${id}/new`, "u"));
   assert.match(text.stdout, new RegExp(`changed: ${id}/kept`, "u"));
   assert.match(text.stdout, new RegExp(`removed: ${id}/old`, "u"));
-  assert.deepEqual([await readFile(path.join(env.home, "sources.json")), await readFile(path.join(env.home, "index.db"))], before);
+  assert.deepEqual([JSON.stringify(catalogRecords(env.home)), await readFile(path.join(env.home, "index.db"))], before);
   assert.equal((await mg(env, ["update", id, "--ref", "refs/heads/main"])).code, 2);
 });
 
@@ -328,11 +1348,10 @@ test("stored short refs are rejected while short install refs remain supported",
   const inst = await mg(env, ["install", repo.url, "--ref", "legacy"]);
   assert.equal(inst.code, 0, inst.stderr);
   const id = sourceId(inst);
-  const file = path.join(env.home, "sources.json");
-  const records = JSON.parse(await readFile(file, "utf8")) as { ref: string }[];
+  const records = catalogRecords(env.home);
   assert.equal(records[0]?.ref, "refs/heads/legacy");
   records[0].ref = "legacy";
-  await writeFile(file, JSON.stringify(records));
+  writeCatalogRecords(env.home, records);
   const before = await readFile(path.join(env.home, "index.db"));
   for (const args of [["check", id], ["update", id], ["reindex"], ["lock", "export"]]) {
     const result = await mg(env, args);
@@ -892,24 +1911,23 @@ test("version, --version, and -v print the version", async () => {
   }
 });
 
-test("a malformed index.db is an error that says to move it aside, and reindex then rebuilds it", async () => {
+test("a malformed or missing catalog requires restoration from a backup", async () => {
   const env = await setup();
   const dir = await tmp("mg-localsrc-");
   await writeSkill(dir, "alpha", "alpha skill");
   assert.equal((await mg(env, ["install", dir])).code, 0);
+  const backup = await readFile(path.join(env.home, "index.db"));
   await writeFile(path.join(env.home, "index.db"), "{ broken");
   const r = await mg(env, ["find", "alpha"]);
   assert.equal(r.code, 1);
-  assert.match(r.stderr, /index\.db is not a margrave index; move it aside, then run: margrave reindex/u);
+  assert.match(r.stderr, /index\.db is not a supported margrave catalog/u);
   assert.equal((await mg(env, ["reindex"])).code, 1, "reindex does not replace a file that is not ours");
   await rename(path.join(env.home, "index.db"), path.join(env.home, "index.db.aside"));
-  assert.equal((await mg(env, ["reindex"])).code, 0);
-  assert.equal((await mg(env, ["find", "alpha"])).code, 0);
-  await rm(path.join(env.home, "index.db"));
+  assert.equal((await mg(env, ["reindex"])).code, 1);
   const missing = await mg(env, ["find", "alpha"]);
   assert.equal(missing.code, 1);
-  assert.match(missing.stderr, /index\.db is missing; run: margrave reindex/u);
-  assert.equal((await mg(env, ["reindex"])).code, 0);
+  assert.match(missing.stderr, /index\.db is missing\. Restore the complete store backup/u);
+  await writeFile(path.join(env.home, "index.db"), backup);
   assert.equal((await mg(env, ["find", "alpha"])).code, 0);
 });
 
@@ -1023,7 +2041,7 @@ test("list errors when index.db is gone, instead of printing skills=0", async ()
     const r = await mg(env, args);
     assert.equal(r.code, 1, args.join(" "));
     assert.equal(r.stdout, "", args.join(" "));
-    assert.match(r.stderr, /index\.db is missing; run: margrave reindex/u, args.join(" "));
+    assert.match(r.stderr, /index\.db is missing\. Restore the complete store backup/u, args.join(" "));
   }
 });
 
@@ -1044,12 +2062,12 @@ test("a missing index.db stops install, update, and remove, and says to run rein
   ]) {
     const r = await mg(env, args);
     assert.equal(r.code, 1, args.join(" "));
-    assert.match(r.stderr, /index\.db is missing; run: margrave reindex/u, args.join(" "));
+    assert.match(r.stderr, /index\.db is missing\. Restore the complete store backup/u, args.join(" "));
   }
   const all = await mg(env, ["update"]);
   assert.equal(all.code, 1);
   // The guard fails once for the whole run, not once per source.
-  assert.equal(all.stderr.match(/index\.db is missing; run: margrave reindex/gu)?.length, 1, all.stderr);
+  assert.equal(all.stderr.match(/index\.db is missing\. Restore the complete store backup/gu)?.length, 1, all.stderr);
   assert.doesNotMatch(all.stderr, /failed:/u);
   assert.deepEqual(await snapshot(env.home), before);
 });
@@ -1160,9 +2178,11 @@ test("git source: update works when the stored copy is gone, or no longer holds 
   assert.equal((await stat(path.join(env.home, "sources", id, "skills", "react-perf", "SKILL.md"))).isFile(), true);
 
   // The source record names a subpath that the stored copy does not have (a GitHub spec can; a file:// URL cannot).
-  const file = path.join(env.home, "sources.json");
-  const records = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>[];
-  await writeFile(file, JSON.stringify(records.map((r) => ({ ...r, subpath: "skills" }))));
+  const records = catalogRecords(env.home);
+  writeCatalogRecords(
+    env.home,
+    records.map((r) => ({ ...r, subpath: "skills" })),
+  );
   await rm(path.join(env.home, "sources", id, "skills"), { recursive: true });
   const second = await mg(env, ["update", id]);
   assert.equal(second.code, 0, second.stderr);
@@ -1233,11 +2253,12 @@ test("a closed stdout pipe is not an error: `margrave load` piped into a reader 
 
 test("a rejection that is not an Error is still printed as text, with exit 1", async () => {
   const env = await setup();
-  const fail = preloadArgs(`import fsp from "node:fs/promises";
-import { syncBuiltinESMExports } from "node:module";
-const real = fsp.readFile;
-fsp.readFile = (p, ...rest) => (String(p).endsWith("sources.json") ? Promise.reject("boom, not an Error") : real(p, ...rest));
-syncBuiltinESMExports();`);
+  const dir = await tmp();
+  await writeSkill(dir, "alpha", "alpha skill");
+  await installLocalDir(env, dir);
+  const fail = preloadArgs(`import { DatabaseSync } from "node:sqlite";
+const real = DatabaseSync.prototype.prepare;
+DatabaseSync.prototype.prepare = function(sql) { if (sql.startsWith("SELECT id, record FROM sources")) throw "boom, not an Error"; return real.call(this, sql); };`);
   const r = await runCli(["list"], { home: env.home, nodeArgs: fail });
   assert.equal(r.code, 1);
   assert.equal(r.stderr, "margrave: boom, not an Error\n");
@@ -1246,12 +2267,13 @@ syncBuiltinESMExports();`);
 
 test("terminal control bytes in an error message never reach stderr", async () => {
   const env = await setup();
+  const dir = await tmp();
+  await writeSkill(dir, "alpha", "alpha skill");
+  await installLocalDir(env, dir);
   // The doubled backslashes make the preload source hold JS escapes, which the preload turns into the real bytes.
-  const fail = preloadArgs(`import fsp from "node:fs/promises";
-import { syncBuiltinESMExports } from "node:module";
-const real = fsp.readFile;
-fsp.readFile = (p, ...rest) => (String(p).endsWith("sources.json") ? Promise.reject(new Error("bad \\u001b[31mred\\u001b[0m\\u0007 name\\nsecond line")) : real(p, ...rest));
-syncBuiltinESMExports();`);
+  const fail = preloadArgs(`import { DatabaseSync } from "node:sqlite";
+const real = DatabaseSync.prototype.prepare;
+DatabaseSync.prototype.prepare = function(sql) { if (sql.startsWith("SELECT id, record FROM sources")) throw new Error("bad \\u001b[31mred\\u001b[0m\\u0007 name\\nsecond line"); return real.call(this, sql); };`);
   const r = await runCli(["list"], { home: env.home, nodeArgs: fail });
   assert.equal(r.code, 1);
   assert.equal(r.stderr, "margrave: bad red name\nsecond line\n");
@@ -1260,23 +2282,27 @@ syncBuiltinESMExports();`);
 
 test("a sources.json record with no url, no path, or an unknown kind stops every command that reads it", async () => {
   const env = await setup();
+  const dir = await tmp();
+  await writeSkill(dir, "alpha", "alpha skill");
+  await installLocalDir(env, dir);
   const base = { spec: "x", subpath: "", ref: null, commit: null, installedAt: "now" };
   const records: Record<string, unknown> = {
     "a git record without url": { ...base, id: "bad__git", kind: "git" },
     "a local record without path": { ...base, id: "bad__local", kind: "local" },
     "a record of an unknown kind": { ...base, id: "bad__kind", kind: "svn", url: "u", path: "/p" },
   };
-  const file = path.join(env.home, "sources.json");
   for (const [why, record] of Object.entries(records)) {
-    const text = JSON.stringify([record]);
-    await writeFile(file, text);
+    const db = new DatabaseSync(path.join(env.home, "index.db"));
+    db.prepare("UPDATE sources SET record = ?").run(JSON.stringify(record));
+    db.close();
+    const before = await readFile(path.join(env.home, "index.db"));
     const id = (record as { id: string }).id;
     for (const args of [["update"], ["update", id], ["remove", id], ["reindex"], ["list"]]) {
       const r = await mg(env, args);
       assert.equal(r.code, 1, `${why}: ${args.join(" ")}`);
-      assert.match(r.stderr, /sources\.json is malformed/u, `${why}: ${args.join(" ")}`);
+      assert.match(r.stderr, /malformed source records/u, `${why}: ${args.join(" ")}`);
     }
-    assert.equal(await readFile(file, "utf8"), text, `${why}: sources.json is unchanged`);
+    assert.deepEqual(await readFile(path.join(env.home, "index.db")), before, `${why}: catalog is unchanged`);
   }
 });
 
@@ -1352,7 +2378,7 @@ test("reference-only updates change revision and pinned reads detect drift", asy
   assert.equal((await mg(env, ["load", id, "--file", "references/tips.md", "--revision", refreshed])).stdout, "drift\n");
 });
 
-test("concurrent Git updates retain only the active snapshot", async () => {
+test("concurrent Git updates retain the active and retired snapshots", async () => {
   const env = await setup();
   const repo = await makeRepo();
   const id = sourceId(await mg(env, ["install", repo.url]));
@@ -1364,8 +2390,10 @@ test("concurrent Git updates retain only the active snapshot", async () => {
   for (const result of results) {
     if (result.code !== 0) assert.match(result.stderr, /source changed during update; run margrave update again/u);
   }
-  const records = JSON.parse(await readFile(path.join(env.home, "sources.json"), "utf8")) as { snapshot: string }[];
-  assert.deepEqual(await names(path.join(env.home, "snapshots", id)), [records[0]!.snapshot]);
+  const records = catalogRecords(env.home);
+  const snapshots = await names(path.join(env.home, "snapshots", id));
+  assert.ok(snapshots.includes(records[0]!.snapshot!));
+  assert.ok(snapshots.length >= 2);
   assert.match(await readFile(path.join(env.home, "sources", id, "skills", "react-perf", "SKILL.md"), "utf8"), /concurrent update/u);
 });
 
@@ -1413,9 +2441,9 @@ test("lock export and restore pins an annotated tag and verifies installed bytes
   assert.equal(restored.code, 0, restored.stderr);
   assert.equal(restored.stdout, `restored ${id}\n`);
   assert.equal(await readFile(path.join(to.home, "sources", id, "skills", "react-perf", "guide.txt"), "utf8"), "original");
-  const inode = (await stat(path.join(to.home, "sources.json"))).ino;
+  const inode = (await stat(path.join(to.home, "index.db"))).ino;
   assert.equal((await mg(to, ["lock", "restore", file])).stdout, `already restored ${id}\n`);
-  assert.equal((await stat(path.join(to.home, "sources.json"))).ino, inode);
+  assert.equal((await stat(path.join(to.home, "index.db"))).ino, inode);
   await writeFile(path.join(to.home, "sources", id, "skills", "react-perf", "guide.txt"), "changed");
   const conflict = await mg(to, ["lock", "restore", file]);
   assert.equal(conflict.code, 1);
@@ -1446,9 +2474,9 @@ for (const aliasState of ["missing", "incorrect"] as const) {
       assert.equal(await readlink(alias), target);
       assert.equal(await readFile(path.join(alias, "skills", "react-perf", "SKILL.md"), "utf8"), expected);
     } else {
-      assert.equal(restored.code, 1);
-      assert.match(restored.stderr, /installed source differs from the lock/u);
-      assert.equal(restored.stdout, "");
+      assert.equal(restored.code, 0);
+      assert.match(restored.stderr, /compatibility link could not be updated/u);
+      assert.match(restored.stdout, /already restored/u);
       assert.equal(await readlink(alias), repo.dir);
       assert.equal(await readFile(path.join(repo.dir, "skills", "react-perf", "SKILL.md"), "utf8"), expected);
     }
@@ -1460,10 +2488,9 @@ test("lock export rejects a Git record without a snapshot", async () => {
   const repo = await makeRepo();
   const installed = await mg(env, ["install", repo.url]);
   assert.equal(installed.code, 0, installed.stderr);
-  const recordsFile = path.join(env.home, "sources.json");
-  const records = JSON.parse(await readFile(recordsFile, "utf8")) as { snapshot?: string }[];
+  const records = catalogRecords(env.home);
   delete records[0]!.snapshot;
-  await writeFile(recordsFile, JSON.stringify(records));
+  writeCatalogRecords(env.home, records);
   const before = await readFile(path.join(env.home, "index.db"));
   for (const args of [["reindex"], ["lock", "export"]]) {
     const result = await mg(env, args);
@@ -1528,7 +2555,6 @@ test("lock restore resumes after interruption before SQLite commit", async () =>
   const interrupted = await runCli(["lock", "restore", file], { home: to.home, fakeBin: to.fakeBin, nodeArgs: ["--import", preload] });
   assert.equal(interrupted.code, 1);
   assert.ok(await stat(path.join(to.home, "restore-pending", `${id}.json`)));
-  await leaveHotJournal(path.join(to.home, "index.db"));
   const retry = await mg(to, ["lock", "restore", file]);
   assert.equal(retry.code, 0, retry.stderr);
   assert.equal(retry.stdout, `restored ${id}\n`);

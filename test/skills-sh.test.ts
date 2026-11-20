@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { searchSkills } from "../src/search.ts";
 import { handleHostedMcp } from "../src/hosted.ts";
-import { CLI, newEntry, runCli, seedIndex, tmp } from "./helpers.ts";
+import { CLI, newEntry, runCli, seedIndex, tmp, writeCatalogRecords } from "./helpers.ts";
 
 test("catalog fallback uses visible sources and validates responses", async (t) => {
   const home = await tmp("mg-catalog-");
@@ -68,25 +69,21 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
     },
   ]);
   assert.deepEqual(await readdir(home), []);
-  await writeFile(
-    path.join(home, "sources.json"),
-    JSON.stringify([
-      {
-        id: "visible",
-        kind: "git",
-        spec: "owner/repo",
-        url: "https://github.com/OWNER/REPO.git",
-        subpath: "",
-        ref: "refs/heads/main",
-        commit: "a".repeat(40),
-        snapshot: `${"a".repeat(40)}-${"b".repeat(16)}`,
-        installedAt: "now",
-      },
-    ]),
-  );
-  await seedIndex([newEntry("visible", "local", "unrelated subject", "docker")]);
+  const sources = [
+    {
+      id: "visible",
+      kind: "git",
+      spec: "owner/repo",
+      url: "https://github.com/OWNER/REPO.git",
+      subpath: "",
+      ref: "refs/heads/main",
+      commit: "a".repeat(40),
+      snapshot: `${"a".repeat(40)}-${"b".repeat(16)}`,
+      installedAt: "now",
+    },
+  ] as const;
+  await seedIndex([newEntry("visible", "local", "unrelated subject", "docker")], [...sources]);
   const before = await readdir(home);
-  const sourceBytes = await readFile(path.join(home, "sources.json"));
   const indexBytes = await readFile(path.join(home, "index.db"));
   const scoped = await searchSkills("unmatched & task", 2, false, true, new Set());
   assert.equal(scoped.suggestions[0]?.id, "Owner/Repo/one");
@@ -94,7 +91,6 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
   assert.equal(visible.suggestions[0]?.id, "other/project/two");
   assert.deepEqual(limits, ["2", "2", "25"]);
   assert.deepEqual(await readdir(home), before);
-  assert.deepEqual(await readFile(path.join(home, "sources.json")), sourceBytes);
   assert.deepEqual(await readFile(path.join(home, "index.db")), indexBytes);
   const requestedLimits: number[] = [];
   globalThis.fetch = (input) => {
@@ -153,25 +149,24 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
     ["https://github.com/owner/repo.git", "https://github.com/owner/repo.git", "skills/one", false],
     ["https://example.com/owner/repo.git", "https://example.com/owner/repo.git", "", false],
   ] as const) {
-    await writeFile(
-      path.join(home, "sources.json"),
-      JSON.stringify([
-        {
-          id: "visible",
-          kind: "git",
-          spec,
-          url,
-          subpath,
-          ref: "refs/heads/main",
-          commit: "a".repeat(40),
-          snapshot: `${"a".repeat(40)}-${"b".repeat(16)}`,
-          installedAt: "now",
-        },
-      ]),
-    );
+    writeCatalogRecords(home, [
+      {
+        id: "visible",
+        kind: "git",
+        spec,
+        url,
+        subpath,
+        ref: "refs/heads/main",
+        commit: "a".repeat(40),
+        snapshot: `${"a".repeat(40)}-${"b".repeat(16)}`,
+        installedAt: "now",
+      },
+    ]);
     assert.equal((await searchSkills("nothing", 2, false, true)).suggestions.length, suppressed ? 0 : 1);
   }
-  await writeFile(path.join(home, "sources.json"), "invalid json");
+  const db = new DatabaseSync(path.join(home, "index.db"));
+  db.prepare("UPDATE sources SET record = ?").run("invalid json");
+  db.close();
   globalThis.fetch = () => {
     unexpectedCalls++;
     return Promise.reject(new Error("must not fetch"));

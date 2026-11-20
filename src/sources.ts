@@ -1,10 +1,10 @@
 // Source specs, git (execFile, no shell), staging, swap, local registration, reindex.
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readlink, realpath, rename, rm, stat, symlink } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rm, stat, symlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import { isInside, scanSource } from "./scan.ts";
 import type { ScannedSkill } from "./scan.ts";
 import { esc, scanWithRipwire } from "./safety.ts";
@@ -17,12 +17,22 @@ import {
   insertSkills,
   home,
   openIndexRead,
-  openIndexWrite,
+  openCatalogReadOptional,
+  catalogSources,
+  cleanupCatalogTemps,
+  copyLegacyCatalog,
+  indexDbFile,
+  openLegacyCatalog,
+  putCatalogSources,
+  publishCatalog,
+  temporaryCatalog,
+  writerLock,
   readSources,
+  readLegacySources,
   skillHashes,
   sourcesRoot,
+  sourcesFile,
   stagingRoot,
-  writeSources,
 } from "./store.ts";
 import type { NewEntry, SourceRecord } from "./store.ts";
 
@@ -154,51 +164,6 @@ function gitDir(rec: SourceRecord): string {
   return path.join(home(), "snapshots", rec.id, rec.snapshot as string);
 }
 
-async function switchAlias(
-  id: string,
-  previous: SourceRecord | null,
-  next: string | null,
-): Promise<{ rollback: () => Promise<void>; retired: string | null }> {
-  const alias = sourceDir(id);
-  const suffix = randomBytes(8).toString("hex");
-  const aside = `${alias}.${suffix}.old`;
-  const temp = `${alias}.${suffix}.new`;
-  const existing = await lstat(alias).catch((err: NodeJS.ErrnoException) => {
-    if (err.code === "ENOENT") return null;
-    throw err;
-  });
-  if (previous === null) {
-    if (existing !== null) throw duplicate(id);
-  } else if (
-    existing !== null &&
-    (!existing.isSymbolicLink() || (await readlink(alias)) !== path.relative(path.dirname(alias), gitDir(previous)))
-  ) {
-    throw duplicate(id);
-  }
-  if (next !== null) await symlink(path.relative(path.dirname(alias), next), temp);
-  let moved = false;
-  try {
-    if (existing !== null) {
-      if (existing.isSymbolicLink() && next !== null) await symlink(await readlink(alias), aside);
-      else await rename(alias, aside);
-      moved = true;
-    }
-    if (next !== null) await rename(temp, alias);
-  } catch (err) {
-    if (moved) await rename(aside, alias);
-    await rm(temp, { force: true });
-    throw err;
-  }
-  return {
-    rollback: async () => {
-      if (moved) {
-        await rename(aside, alias);
-      } else if (next !== null) await rm(alias, { force: true });
-    },
-    retired: moved ? aside : null,
-  };
-}
-
 /** Find a source by id, or by its original spec. */
 export function findSource(sources: readonly SourceRecord[], arg: string): SourceRecord {
   const byId = sources.find((s) => s.id === arg);
@@ -312,12 +277,81 @@ async function trackingRef(rec: SourceRecord): Promise<string> {
 }
 
 async function withStaging<T>(fn: (stage: string) => Promise<T>): Promise<T> {
-  await ensureDirs();
-  const stage = await mkdtemp(path.join(stagingRoot(), "s-"));
+  const stage = await ownedStage("s-");
   try {
-    return await fn(stage);
+    return await fn(stage.dir);
   } finally {
-    await rm(stage, { recursive: true, force: true });
+    await stage.close();
+  }
+}
+
+async function ownedStage(prefix: "s-" | "restore-"): Promise<{ dir: string; close: () => Promise<void> }> {
+  await ensureDirs();
+  const lock = await writerLock();
+  let dir: string | undefined;
+  let owner: DatabaseSync | undefined;
+  let result: { dir: string; close: () => Promise<void> };
+  try {
+    dir = await mkdtemp(path.join(stagingRoot(), prefix));
+    owner = new DatabaseSync(path.join(dir, ".margrave-owner.db"), { timeout: 0 });
+    owner.exec("CREATE TABLE owner(name TEXT NOT NULL)");
+    owner.prepare("INSERT INTO owner(name) VALUES (?)").run(path.basename(dir));
+    owner.exec("BEGIN IMMEDIATE");
+    const held = owner;
+    const stage = dir;
+    result = {
+      dir: stage,
+      close: async () => {
+        held.close();
+        await rm(stage, { recursive: true, force: true });
+      },
+    };
+  } catch (err) {
+    owner?.close();
+    if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+    throw err;
+  } finally {
+    lock.close();
+  }
+  return result;
+}
+
+async function cleanupStages(): Promise<void> {
+  const entries = await readdir(stagingRoot(), { withFileTypes: true }).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^(?:s-|restore-)[A-Za-z0-9]{6}$/u.test(entry.name)) continue;
+    const dir = path.join(stagingRoot(), entry.name);
+    const file = path.join(dir, ".margrave-owner.db");
+    const st = await lstat(file).catch((err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT") return null;
+      throw err;
+    });
+    if (st === null || !st.isFile()) continue;
+    let owner: DatabaseSync | undefined;
+    let abandoned = false;
+    try {
+      owner = new DatabaseSync(file, { timeout: 0 });
+      const marker = owner.prepare("SELECT name FROM owner").get();
+      if (marker?.["name"] !== entry.name) continue;
+      owner.exec("BEGIN IMMEDIATE");
+      abandoned = true;
+    } catch (err) {
+      const code = (err as { errcode?: number }).errcode;
+      const missingOwner = code === 1 && err instanceof Error && /no such table: owner/u.test(err.message);
+      if (code !== 5 && code !== 26 && !missingOwner) throw err;
+      // A live owner, or an unrecognized SQLite file, is not ours to remove.
+    } finally {
+      if (abandoned) {
+        try {
+          await rm(dir, { recursive: true, force: true });
+        } finally {
+          owner?.close();
+        }
+      } else owner?.close();
+    }
   }
 }
 
@@ -369,42 +403,128 @@ async function prepareSnapshot(
 }> {
   const snapshot = `${sha}-${randomBytes(8).toString("hex")}`;
   const destination = path.join(home(), "snapshots", id, snapshot);
-  const entries = toEntries(id, skills, (d) => path.join(destination, path.relative(realClone, d)));
+  const entries = toEntries(id, skills, (d) => path.relative(realClone, d));
   await mkdir(path.dirname(destination), { recursive: true });
   await rename(clone, destination);
+  await syncSnapshot(destination);
   return { snapshot, destination, entries };
+}
+
+async function syncTree(dir: string): Promise<void> {
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const file = path.join(dir, entry.name);
+    if (entry.isDirectory()) await syncTree(file);
+    else if (entry.isFile()) {
+      const handle = await open(file, "r");
+      try {
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+    }
+  }
+  const handle = await open(dir, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function syncSnapshot(destination: string): Promise<void> {
+  await syncTree(destination);
+  for (const dir of [path.dirname(destination), path.dirname(path.dirname(destination)), home()]) {
+    const handle = await open(dir, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+}
+
+async function repairAliases(before: readonly SourceRecord[], after: readonly SourceRecord[]): Promise<void> {
+  const ids = new Set([...before, ...after].filter((s) => s.kind === "git").map((s) => s.id));
+  await mkdir(sourcesRoot(), { recursive: true });
+  for (const entry of await readdir(sourcesRoot(), { withFileTypes: true })) {
+    if (entry.isSymbolicLink() && /^[A-Za-z0-9._-]+$/u.test(entry.name)) {
+      const target = await readlink(path.join(sourcesRoot(), entry.name));
+      const root = path.join(home(), "snapshots", entry.name);
+      const rel = path.relative(root, path.resolve(sourcesRoot(), target));
+      if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})-[0-9a-f]{16}$/u.test(rel)) ids.add(entry.name);
+    }
+  }
+  for (const id of ids) {
+    const alias = sourceDir(id);
+    const desired = after.find((s) => s.id === id && s.kind === "git");
+    try {
+      const existing = await lstat(alias).catch((err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return null;
+        throw err;
+      });
+      const target = desired === undefined ? null : path.relative(path.dirname(alias), gitDir(desired));
+      if (existing !== null) {
+        if (!existing.isSymbolicLink()) throw new Error("unexpected path");
+        const old = await readlink(alias);
+        if (old === target) continue;
+        const root = path.join(home(), "snapshots", id);
+        const relative = path.relative(root, path.resolve(path.dirname(alias), old));
+        if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})-[0-9a-f]{16}$/u.test(relative)) throw new Error("unexpected link");
+      }
+      if (target === null) {
+        if (existing !== null) await rm(alias);
+      } else {
+        const temp = `${alias}.${randomBytes(8).toString("hex")}.new`;
+        try {
+          await symlink(target, temp);
+          await rename(temp, alias);
+        } finally {
+          await rm(temp, { force: true });
+        }
+      }
+    } catch (err) {
+      console.error(
+        `warning: source "${id}" was published, but its compatibility link could not be updated: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 }
 
 /** The index must be usable before the slow work (clone, scan) starts. A store with no sources has no index to check. */
 async function checkIndex(sources: readonly SourceRecord[]): Promise<void> {
-  if (sources.length > 0) (await openIndexWrite("existing")).close();
+  if (sources.length > 0) (await openIndexRead()).close();
 }
 
-/**
- * The one write path. Takes the write lock, re-reads sources.json, lets `change` edit the rows and return the next
- * source list, writes sources.json, then commits. Any failure leaves the index as it was.
- * `mode` is "create" for a store with no sources or a reindex: a missing index, or one with user_version 0, is initialized.
- */
+/** Build and publish the next catalog while holding the separate writer lock. */
 async function commit(
-  mode: "existing" | "create",
   change: (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[] | undefined | Promise<SourceRecord[] | undefined>,
   rollback?: () => Promise<void>,
 ): Promise<void> {
-  const db = await openIndexWrite(mode);
+  const lock = await writerLock();
+  let db: DatabaseSync | undefined;
+  let file: string | undefined;
   try {
+    await cleanupCatalogTemps();
+    await cleanupStages();
+    const temporary = await temporaryCatalog();
+    db = temporary.db;
+    file = temporary.file;
     db.exec("BEGIN IMMEDIATE");
-    const fresh = await readSources();
+    const fresh = catalogSources(db);
+    await repairAliases(fresh, fresh);
     const next = await change(fresh, db);
-    if (next !== undefined) await writeSources(next);
-    try {
-      db.exec("COMMIT");
-    } catch (err) {
-      if (next !== undefined) await writeSources(fresh).catch(() => undefined);
-      throw err;
+    if (next === undefined) {
+      db.exec("ROLLBACK");
+      return;
     }
+    putCatalogSources(db, next);
+    db.exec("COMMIT");
+    db.close();
+    await publishCatalog(file);
+    await repairAliases(fresh, next);
   } catch (err) {
     if (rollback !== undefined) await rollback();
-    if (db.isTransaction) {
+    if (db?.isOpen === true && db.isTransaction) {
       try {
         db.exec("ROLLBACK");
       } catch {
@@ -413,13 +533,15 @@ async function commit(
     }
     throw err;
   } finally {
-    db.close();
+    try {
+      if (db?.isOpen === true) db.close();
+      if (file !== undefined) {
+        await cleanupCatalogTemps();
+      }
+    } finally {
+      lock.close();
+    }
   }
-}
-
-/** The write mode for an install: a store with no sources has no index to keep. */
-async function installMode(): Promise<"existing" | "create"> {
-  return (await readSources()).length === 0 ? "create" : "existing";
 }
 
 function logWarnings(ctx: Ctx, warnings: readonly string[]): void {
@@ -478,7 +600,7 @@ async function installLocal(spec: string, dir: string, ctx: Ctx): Promise<Instal
     commit: null,
     installedAt: new Date().toISOString(),
   };
-  await commit(await installMode(), addSource(record, entries));
+  await commit(addSource(record, entries));
   return { id, skills: entries.map((e) => e.id) };
 }
 
@@ -501,7 +623,17 @@ async function installGit(
   const final = sourceDir(id);
   await ensureDirs();
   const sources = await readSources();
-  if (sources.some((s) => s.id === id) || (await lstat(final).catch(() => null)) !== null) throw duplicate(id);
+  if (sources.some((s) => s.id === id)) throw duplicate(id);
+  const existing = await lstat(final).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  });
+  if (existing !== null) {
+    if (!existing.isSymbolicLink()) throw duplicate(id);
+    const target = path.resolve(path.dirname(final), await readlink(final));
+    const rel = path.relative(path.join(home(), "snapshots", id), target);
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})-[0-9a-f]{16}$/u.test(rel)) throw duplicate(id);
+  }
   await checkIndex(sources);
 
   return withStaging(async (stage) => {
@@ -520,7 +652,7 @@ async function installGit(
       throw new MargraveError(`no valid skills (SKILL.md with name and description) found in ${spec}`);
     }
     await scanWithRipwire(scanRoot, { ...ctx, sourceId: id, skills: scan.skills });
-    const { snapshot, destination, entries } = await prepareSnapshot(id, sha, clone, realClone, scan.skills);
+    const { snapshot, entries } = await prepareSnapshot(id, sha, clone, realClone, scan.skills);
     const record: SourceRecord = {
       id,
       kind: "git",
@@ -533,23 +665,7 @@ async function installGit(
       installedAt: new Date().toISOString(),
     };
 
-    let alias: Awaited<ReturnType<typeof switchAlias>> | undefined;
-    try {
-      await commit(
-        await installMode(),
-        async (fresh, db) => {
-          if (fresh.some((s) => s.id === id)) throw duplicate(id);
-          alias = await switchAlias(id, null, destination);
-          return addSource(record, entries)(fresh, db);
-        },
-        async () => {
-          await alias?.rollback();
-        },
-      );
-    } catch (err) {
-      await rm(destination, { recursive: true, force: true });
-      throw err;
-    }
+    await commit(addSource(record, entries));
     return { id, skills: entries.map((e) => e.id) };
   });
 }
@@ -631,7 +747,7 @@ async function updateOne(id: string, ctx: Ctx, ref: string | null): Promise<Upda
 
   if (rec.kind === "local") {
     const entries = await scanLocal(rec, ctx);
-    await commit("existing", replaceSource(id, entries, diff));
+    await commit(replaceSource(id, entries, diff));
     return { id, kind: "local", oldCommit: null, newCommit: null, ...(diff.value as ReturnType<typeof diffEntries>) };
   }
   // readSources() only returns a git record with a url.
@@ -652,34 +768,19 @@ async function updateOne(id: string, ctx: Ctx, ref: string | null): Promise<Upda
     // The baseline: the installed copy, scanned before the swap. It is what the user accepted.
     const baselineDir = await installedScanRoot(gitDir(rec), rec.subpath);
     await scanWithRipwire(scanRoot, { ...ctx, sourceId: id, skills: scan.skills, baselineDir });
-    const { snapshot, destination, entries } = await prepareSnapshot(id, sha, clone, realClone, scan.skills);
-    let alias: Awaited<ReturnType<typeof switchAlias>> | undefined;
-    try {
-      await commit(
-        "existing",
-        async (fresh, db) => {
-          const current = fresh.find((s) => s.id === id);
-          if (current === undefined) throw new MargraveError(`no source "${id}"`);
-          if (JSON.stringify(current) !== JSON.stringify(rec)) {
-            throw new MargraveError("source changed during update; run margrave update again");
-          }
-          alias = await switchAlias(id, current, destination);
-          const before = skillHashes(db, id);
-          deleteSourceSkills(db, id);
-          insertSkills(db, entries);
-          diff.value = diffEntries(before, entries);
-          return fresh.map((s) => (s.id === id ? { ...s, commit: sha, snapshot, ref: selected } : s));
-        },
-        async () => {
-          await alias?.rollback();
-        },
-      );
-    } catch (err) {
-      await rm(destination, { recursive: true, force: true });
-      throw err;
-    }
-    if (alias?.retired !== null && alias?.retired !== undefined) await rm(alias.retired, { recursive: true, force: true });
-    await rm(gitDir(rec), { recursive: true, force: true });
+    const { snapshot, entries } = await prepareSnapshot(id, sha, clone, realClone, scan.skills);
+    await commit((fresh, db) => {
+      const current = fresh.find((s) => s.id === id);
+      if (current === undefined) throw new MargraveError(`no source "${id}"`);
+      if (JSON.stringify(current) !== JSON.stringify(rec)) {
+        throw new MargraveError("source changed during update; run margrave update again");
+      }
+      const before = skillHashes(db, id);
+      deleteSourceSkills(db, id);
+      insertSkills(db, entries);
+      diff.value = diffEntries(before, entries);
+      return fresh.map((s) => (s.id === id ? { ...s, commit: sha, snapshot, ref: selected } : s));
+    });
     return { id, kind: "git" as const, oldCommit: rec.commit, newCommit: sha, ...(diff.value as ReturnType<typeof diffEntries>) };
   });
 }
@@ -717,11 +818,14 @@ export interface CheckResult {
 }
 
 export async function checkSources(arg: string | null): Promise<CheckResult[]> {
-  const sources = await readSources();
-  const targets = arg === null ? sources : [findSource(sources, arg)];
-  if (targets.length === 0) return [];
-  const db = await openIndexRead();
+  const db = await openCatalogReadOptional();
+  if (db === null) {
+    if (arg !== null) findSource([], arg);
+    return [];
+  }
   try {
+    const sources = catalogSources(db);
+    const targets = arg === null ? sources : [findSource(sources, arg)];
     const results: CheckResult[] = [];
     for (const rec of targets) {
       const result: CheckResult = {
@@ -768,22 +872,12 @@ export async function removeSource(arg: string): Promise<SourceRecord> {
   await checkIndex(sources);
 
   let removed: SourceRecord | undefined;
-  let alias: Awaited<ReturnType<typeof switchAlias>> | undefined;
-  await commit(
-    "existing",
-    async (fresh, db) => {
-      removed = fresh.find((s) => s.id === rec.id);
-      if (removed === undefined) throw new MargraveError(`no source "${rec.id}"; run: margrave list`);
-      if (removed.kind === "git") alias = await switchAlias(rec.id, removed, null);
-      deleteSourceSkills(db, rec.id);
-      return fresh.filter((s) => s.id !== rec.id);
-    },
-    async () => {
-      await alias?.rollback();
-    },
-  );
-  if (alias?.retired !== null && alias?.retired !== undefined) await rm(alias.retired, { recursive: true, force: true });
-  if (removed?.kind === "git") await rm(gitDir(removed), { recursive: true, force: true });
+  await commit((fresh, db) => {
+    removed = fresh.find((s) => s.id === rec.id);
+    if (removed === undefined) throw new MargraveError(`no source "${rec.id}"; run: margrave list`);
+    deleteSourceSkills(db, rec.id);
+    return fresh.filter((s) => s.id !== rec.id);
+  });
 
   return removed as SourceRecord;
 }
@@ -801,7 +895,7 @@ async function scanInstalledSource(rec: SourceRecord, ctx: Ctx): Promise<NewEntr
   const root = await resolveScanRoot(dir, rec.subpath);
   const scan = await scanSource(root, { followSymlinks: false, boundary: dir, strict: true });
   logWarnings(ctx, scan.warnings);
-  return toEntries(rec.id, scan.skills, (d) => d);
+  return toEntries(rec.id, scan.skills, (d) => path.relative(dir, d));
 }
 
 async function scanInstalledSources(sources: readonly SourceRecord[], ctx: Ctx): Promise<ReindexScan> {
@@ -831,8 +925,135 @@ function applyReindex(sources: readonly SourceRecord[], scan: ReindexScan, fresh
 export async function reindexAll(ctx: Ctx): Promise<{ skills: number; sources: number }> {
   const sources = await readSources();
   const scan = await scanInstalledSources(sources, ctx);
-  await commit("create", (fresh, db) => applyReindex(sources, scan, fresh, db));
+  await commit((fresh, db) => applyReindex(sources, scan, fresh, db));
   return { skills: scan.entries.length, sources: sources.length };
+}
+
+export async function migrateStore(): Promise<boolean> {
+  const current = await openLegacyCatalog();
+  if (current !== null) {
+    current.db.close();
+    if (current.version === 3) return false;
+  }
+  const lock = await writerLock();
+  let temp: { db: DatabaseSync; file: string } | undefined;
+  try {
+    await cleanupCatalogTemps();
+    const legacy = await openLegacyCatalog();
+    if (legacy === null) {
+      if (
+        (await lstat(sourcesFile()).catch((err: NodeJS.ErrnoException) => {
+          if (err.code === "ENOENT") return null;
+          throw err;
+        })) !== null
+      )
+        throw new MargraveError(`cannot upgrade the store because ${indexDbFile()} is missing. Restore the complete v0.2.1 backup`);
+      await readSources();
+      return false;
+    }
+    let rows: {
+      id: string;
+      name: string;
+      description: string;
+      source: string;
+      dir: string;
+      revision: string;
+      manifest: string;
+      frontmatter: string;
+    }[];
+    try {
+      if (legacy.version === 3) return false;
+      if (legacy.version !== 2) throw new MargraveError(`${indexDbFile()} is not a supported margrave catalog`);
+      rows = legacy.db
+        .prepare("SELECT id, name, description, source, dir, hash AS revision, manifest, frontmatter FROM skills ORDER BY id")
+        .all() as typeof rows;
+    } finally {
+      legacy.db.close();
+    }
+    if (
+      (await lstat(sourcesFile()).catch((err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return null;
+        throw err;
+      })) === null
+    )
+      throw new MargraveError(`cannot upgrade the store because ${sourcesFile()} is missing. Restore the complete v0.2.1 backup`);
+    let sources: SourceRecord[];
+    try {
+      sources = await readLegacySources();
+    } catch (err) {
+      throw new MargraveError(`cannot upgrade the v0.2.1 catalog: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const ids = new Set<string>();
+    const paths = new Map<string, string>();
+    for (const rec of sources) {
+      const conflict = (): MargraveError =>
+        new MargraveError(
+          `cannot upgrade source "${rec.id}" because its source record, index, or files disagree. Restore a known-good backup or recover the source from a verified lock`,
+        );
+      try {
+        if (ids.has(rec.id)) throw conflict();
+        ids.add(rec.id);
+        if (rec.kind === "git") {
+          const parsed = parseSpec(rec.spec);
+          if (parsed.kind !== "git" || parsed.id !== rec.id || parsed.url !== rec.url || parsed.subpath !== rec.subpath) throw conflict();
+          const snapshot = gitDir(rec);
+          const st = await lstat(snapshot);
+          const expected = path.join(await realpath(home()), "snapshots", rec.id, rec.snapshot as string);
+          if (!st.isDirectory() || st.isSymbolicLink() || (await realpath(snapshot)) !== expected) throw conflict();
+        }
+        const scanned = await scanInstalledSource(rec, { log: () => {}, allowUnsafe: false });
+        const indexed = rows.filter((row) => row.source === rec.id);
+        if (indexed.length !== scanned.length) throw conflict();
+        for (const entry of scanned) {
+          const row = indexed.find((item) => item.id === entry.id);
+          if (
+            row === undefined ||
+            row.revision !== entry.revision ||
+            row.manifest !== entry.manifest ||
+            row.name !== entry.name ||
+            row.description !== entry.description ||
+            row.frontmatter !== entry.frontmatter
+          )
+            throw conflict();
+          let indexedDir = row.dir;
+          if (rec.kind === "git") {
+            const marker = `${path.sep}snapshots${path.sep}${rec.id}${path.sep}${rec.snapshot}`;
+            const at = row.dir.lastIndexOf(marker);
+            if (!path.isAbsolute(row.dir) || at < 0) throw conflict();
+            const suffix = row.dir.slice(at + marker.length);
+            if (suffix !== "" && !suffix.startsWith(path.sep)) throw conflict();
+            indexedDir = suffix.slice(1);
+            if (path.normalize(indexedDir) !== (indexedDir || ".")) throw conflict();
+          }
+          if (indexedDir !== entry.dir) throw conflict();
+          paths.set(row.id, indexedDir);
+        }
+      } catch {
+        throw conflict();
+      }
+    }
+    if (rows.some((row) => !ids.has(row.source)) || paths.size !== rows.length)
+      throw new MargraveError("cannot upgrade the v0.2.1 catalog: index contains an unknown source");
+    temp = await copyLegacyCatalog();
+    temp.db.exec("BEGIN IMMEDIATE; CREATE TABLE sources(id TEXT PRIMARY KEY, record TEXT NOT NULL, position INTEGER NOT NULL)");
+    putCatalogSources(temp.db, sources);
+    const update = temp.db.prepare("UPDATE skills SET dir = ? WHERE id = ?");
+    for (const [id, dir] of paths) update.run(dir, id);
+    temp.db.exec("PRAGMA user_version = 3; COMMIT");
+    temp.db.close();
+    await publishCatalog(temp.file);
+    await repairAliases(sources, sources);
+    return true;
+  } finally {
+    try {
+      if (temp?.db.isOpen === true) temp.db.close();
+      if (temp !== undefined) {
+        await cleanupCatalogTemps();
+      }
+    } finally {
+      lock.close();
+    }
+  }
 }
 
 // ---- list ----
@@ -847,10 +1068,10 @@ export interface ListedSkill {
 export async function listSources(
   withSkills: boolean,
 ): Promise<{ sources: (SourceRecord & { skillCount: number })[]; skills: ListedSkill[] }> {
-  const sources = await readSources();
-  if (sources.length === 0) return { sources: [], skills: [] };
-  const db = await openIndexRead();
+  const db = await openCatalogReadOptional();
+  if (db === null) return { sources: [], skills: [] };
   try {
+    const sources = catalogSources(db);
     const counts = new Map<string, number>();
     for (const r of db.prepare("SELECT source, count(*) AS n FROM skills GROUP BY source").all() as { source: string; n: number }[]) {
       counts.set(r.source, r.n);
@@ -864,4 +1085,4 @@ export async function listSources(
   }
 }
 
-export { commit, git, gitDir, installMode, logWarnings, scanInstalledSource, switchAlias, toEntries };
+export { commit, git, gitDir, logWarnings, ownedStage, scanInstalledSource, syncSnapshot, toEntries };

@@ -7,7 +7,18 @@ import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { checkLockUrl, exportLock, parseLock, restoreLock } from "../src/lock.ts";
 import { installSource, parseSpec } from "../src/sources.ts";
-import { changeAtLock, fakeRipwire, indexRows, makeRepo, realExec, tmp, writeIndexRows } from "./helpers.ts";
+import {
+  catalogRecords,
+  changeAtLock,
+  fakeRipwire,
+  indexRows,
+  makeRepo,
+  realExec,
+  seedIndex,
+  tmp,
+  writeCatalogRecords,
+  writeIndexRows,
+} from "./helpers.ts";
 
 test("an empty store exports and restores an empty lock", async (t) => {
   const previous = process.env["MARGRAVE_HOME"];
@@ -85,10 +96,10 @@ test("restore resumes a pending snapshot and rejects missing or non-directory de
   const ctx = { log: (): void => {}, allowUnsafe: false };
   const { id } = await installSource(repo.url, null, ctx);
   const lock = await exportLock([]);
-  const records = JSON.parse(await readFile(path.join(process.env["MARGRAVE_HOME"], "sources.json"), "utf8")) as { snapshot: string }[];
+  const records = catalogRecords(process.env["MARGRAVE_HOME"]);
   const record = records[0];
   assert.ok(record);
-  const originalSnapshot = path.join(process.env["MARGRAVE_HOME"], "snapshots", id, record.snapshot);
+  const originalSnapshot = path.join(process.env["MARGRAVE_HOME"], "snapshots", id, record.snapshot!);
   const markerContents = JSON.stringify({ source: lock.sources[0], record });
   const invalid = path.join(originalSnapshot, "skills", "invalid");
   await mkdir(invalid);
@@ -107,15 +118,17 @@ test("restore resumes a pending snapshot and rejects missing or non-directory de
       ? Promise.reject(Object.assign(new Error("alias stat denied"), { code: "EACCES" }))
       : (realLstat as (...a: unknown[]) => Promise<unknown>)(file, ...args)) as typeof fsp.lstat);
   syncBuiltinESMExports();
-  await assert.rejects(
-    restoreLock(lock, ctx, () => {}),
-    /alias stat denied/u,
-  );
+  const warnings: string[] = [];
+  mock.method(console, "error", (message: unknown) => {
+    warnings.push(String(message));
+  });
+  await restoreLock(lock, ctx, () => {});
+  assert.ok(warnings.some((message) => message.includes("alias stat denied")));
   mock.restoreAll();
   syncBuiltinESMExports();
   const existingMarker = path.join(process.env["MARGRAVE_HOME"], "restore-pending", `${id}.json`);
   await mkdir(path.dirname(existingMarker), { recursive: true });
-  const mismatchedRecord = { ...record, snapshot: `${record.snapshot.slice(0, -16)}0000000000000000` };
+  const mismatchedRecord = { ...record, snapshot: `${record.snapshot!.slice(0, -16)}0000000000000000` };
   await writeFile(existingMarker, JSON.stringify({ source: lock.sources[0], record: mismatchedRecord }));
   await assert.rejects(
     restoreLock(lock, ctx, () => {}),
@@ -129,11 +142,11 @@ test("restore resumes a pending snapshot and rejects missing or non-directory de
   const home = await tmp("mg-home-");
   process.env["MARGRAVE_HOME"] = home;
   const marker = path.join(home, "restore-pending", `${id}.json`);
-  const destination = path.join(home, "snapshots", id, record.snapshot);
+  const destination = path.join(home, "snapshots", id, record.snapshot!);
   await mkdir(path.dirname(marker), { recursive: true });
   await writeFile(marker, markerContents);
   await restoreLock(lock, ctx, () => {});
-  const restored = JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { snapshot: string }[];
+  const restored = catalogRecords(home);
   assert.equal(restored[0]?.snapshot, record.snapshot);
   await rm(destination, { recursive: true });
   await writeFile(marker, markerContents);
@@ -146,7 +159,7 @@ test("restore resumes a pending snapshot and rejects missing or non-directory de
   const other = await tmp("mg-home-");
   process.env["MARGRAVE_HOME"] = other;
   const otherMarker = path.join(other, "restore-pending", `${id}.json`);
-  const otherDestination = path.join(other, "snapshots", id, record.snapshot);
+  const otherDestination = path.join(other, "snapshots", id, record.snapshot!);
   await mkdir(path.dirname(otherMarker), { recursive: true });
   await mkdir(path.dirname(otherDestination), { recursive: true });
   await writeFile(otherMarker, markerContents);
@@ -181,15 +194,12 @@ test("restore resumes a pending snapshot and rejects missing or non-directory de
   await rm(otherDestination, { recursive: true });
   await cp(originalSnapshot, otherDestination, { recursive: true });
   await restoreLock(lock, ctx, () => {});
-  assert.equal(
-    (JSON.parse(await readFile(path.join(other, "sources.json"), "utf8")) as { snapshot: string }[])[0]?.snapshot,
-    record.snapshot,
-  );
+  assert.equal(catalogRecords(other)[0]?.snapshot, record.snapshot);
 
   const racing = await tmp("mg-home-");
   process.env["MARGRAVE_HOME"] = racing;
   const racingMarker = path.join(racing, "restore-pending", `${id}.json`);
-  const racingDestination = path.join(racing, "snapshots", id, record.snapshot);
+  const racingDestination = path.join(racing, "snapshots", id, record.snapshot!);
   await mkdir(path.dirname(racingMarker), { recursive: true });
   await writeFile(racingMarker, markerContents);
   const hook = changeAtLock(t, 3, () => {
@@ -222,15 +232,16 @@ test("restore resumes a pending snapshot and rejects missing or non-directory de
 
   const competingHome = await tmp("mg-home-");
   process.env["MARGRAVE_HOME"] = competingHome;
-  const competingSources = path.join(competingHome, "sources.json");
-  const competingContents = JSON.stringify([record]);
-  const competingHook = changeAtLock(t, 2, () => writeFileSync(competingSources, competingContents));
+  await installSource(repo.url, null, ctx);
+  const competingRecords = catalogRecords(competingHome);
+  competingRecords[0]!.installedAt = "competing writer";
+  const competingHook = changeAtLock(t, 3, () => writeCatalogRecords(competingHome, competingRecords));
   await assert.rejects(
     restoreLock(lock, ctx, () => {}),
     /installed source differs from the lock/u,
   );
   assert.equal(competingHook.fired(), true);
-  assert.equal(await readFile(competingSources, "utf8"), competingContents);
+  assert.deepEqual(catalogRecords(competingHome), competingRecords);
 });
 
 test("restore keeps a competing source record changed before publication", async (t) => {
@@ -249,18 +260,46 @@ test("restore keeps a competing source record changed before publication", async
   const ctx = { log: (): void => {}, allowUnsafe: false };
   await installSource(repo.url, null, ctx);
   const lock = await exportLock([]);
-  const file = path.join(home, "sources.json");
-  const records = JSON.parse(readFileSync(file, "utf8")) as { installedAt: string }[];
+  const records = catalogRecords(home);
   assert.ok(records[0]);
   records[0].installedAt = "competing writer";
   const competing = JSON.stringify(records);
-  const hook = changeAtLock(t, 1, () => writeFileSync(file, competing));
+  const hook = changeAtLock(t, 3, () => writeCatalogRecords(home, records));
   await assert.rejects(
     restoreLock(lock, ctx, () => {}),
     /installed source differs from the lock/u,
   );
   assert.equal(hook.fired(), true);
-  assert.equal(readFileSync(file, "utf8"), competing);
+  assert.equal(JSON.stringify(catalogRecords(home)), competing);
+});
+
+test("restore refuses a source installed after preflight", async (t) => {
+  const previousHome = process.env["MARGRAVE_HOME"];
+  const previousPath = process.env["PATH"];
+  const from = await tmp("mg-home-");
+  process.env["MARGRAVE_HOME"] = from;
+  process.env["PATH"] = `${await fakeRipwire()}:${previousPath ?? ""}`;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previousHome;
+    if (previousPath === undefined) delete process.env["PATH"];
+    else process.env["PATH"] = previousPath;
+  });
+  const repo = await makeRepo();
+  const ctx = { log: (): void => {}, allowUnsafe: false };
+  await installSource(repo.url, null, ctx);
+  const lock = await exportLock([]);
+  const competing = catalogRecords(from);
+  const destination = await tmp("mg-home-");
+  process.env["MARGRAVE_HOME"] = destination;
+  await seedIndex([]);
+  const hook = changeAtLock(t, 3, () => writeCatalogRecords(destination, competing));
+  await assert.rejects(
+    restoreLock(lock, ctx, () => {}),
+    /installed source differs from the lock/u,
+  );
+  assert.equal(hook.fired(), true);
+  assert.deepEqual(catalogRecords(destination), competing);
 });
 
 test("restore retains competing index changes before publication", async (t) => {
@@ -330,7 +369,7 @@ test("restore recreates the pending marker when cleanup commit fails", async (t)
   const marker = path.join(home, "restore-pending", `${id}.json`);
   let published = false;
   mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
-    if (sql === "COMMIT") {
+    if (sql === "ROLLBACK" || sql === "COMMIT") {
       if (published && !existsSync(marker)) throw new Error("cleanup commit failed");
       if (existsSync(marker)) published = true;
     }
@@ -342,7 +381,7 @@ test("restore recreates the pending marker when cleanup commit fails", async (t)
   );
   assert.equal(published, true);
   assert.equal((JSON.parse(await readFile(marker, "utf8")) as { source: { id: string } }).source.id, id);
-  assert.equal((JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { id: string }[])[0]?.id, id);
+  assert.equal(catalogRecords(home)[0]?.id, id);
   mock.restoreAll();
   const realRm = fsp.rm;
   mock.method(fsp, "rm", ((file: string, ...args: unknown[]) =>
@@ -389,7 +428,7 @@ test("restore keeps a competing marker written before cleanup", async (t) => {
   );
   assert.notEqual(competing, "");
   assert.equal(await readFile(marker, "utf8"), competing);
-  assert.equal((JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { id: string }[])[0]?.id, id);
+  assert.equal(catalogRecords(home)[0]?.id, id);
   const other = await tmp("mg-home-");
   process.env["MARGRAVE_HOME"] = other;
   const otherMarker = path.join(other, "restore-pending", `${id}.json`);

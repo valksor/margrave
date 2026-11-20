@@ -4,12 +4,13 @@ import fs from "node:fs";
 import fsp, { mkdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { FIND_DESCRIPTION, LOAD_DESCRIPTION, READ_DESCRIPTION, SERVER_INSTRUCTIONS, createServer } from "../src/mcp.ts";
-import { CLI, fakeRipwire, runCli, tmp, writeSkill } from "./helpers.ts";
+import { CLI, fakeRipwire, newEntry, runCli, seedIndex, tmp, writeSkill } from "./helpers.ts";
 
 interface ToolText {
   isError: boolean;
@@ -121,7 +122,7 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   await writeFile(path.join(home, "index.db"), "garbage that is not a database");
   const corrupt = await call(client, "find_skills", { task: "terraform" });
   assert.equal(corrupt.isError, true);
-  assert.match(corrupt.text, /is not a margrave index; move it aside, then run: margrave reindex/u);
+  assert.match(corrupt.text, /is not a supported margrave catalog/u);
 
   // the server is read-only: only the three tools exist
   assert.equal(tools.length, 3);
@@ -171,9 +172,16 @@ test("a tool whose work rejects with a non-Error value returns that value as tex
     else process.env["MARGRAVE_HOME"] = prev;
   });
   const client = await connectInMemory(t);
-
-  mock.method(fsp, "readFile", () => Promise.reject("boom, not an Error"));
-  syncBuiltinESMExports();
+  await seedIndex([newEntry("source", "skill")]);
+  const { prepare } = DatabaseSync.prototype as unknown as {
+    prepare: (this: DatabaseSync, sql: string) => ReturnType<DatabaseSync["prepare"]>;
+  };
+  mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    // This verifies that the MCP surface handles rejections that are not Error objects.
+    // oxlint-disable-next-line typescript/only-throw-error
+    if (sql === "SELECT id, record FROM sources ORDER BY position") throw "boom, not an Error";
+    return prepare.call(this, sql);
+  });
   const r = await call(client, "find_skills", { task: "anything" });
   assert.deepEqual(r, { isError: true, text: "boom, not an Error" });
 });
@@ -220,7 +228,7 @@ test("MCP in-process: load_skill and read_skill_file work, and every tool turns 
   ] as const) {
     const r = await call(client, tool, args);
     assert.equal(r.isError, true, tool);
-    assert.match(r.text, /is not a margrave index; move it aside, then run: margrave reindex/u, tool);
+    assert.match(r.text, /is not a supported margrave catalog/u, tool);
   }
 });
 

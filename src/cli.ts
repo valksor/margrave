@@ -15,7 +15,7 @@ import {
   resolveSkill,
   validateRevision,
 } from "./skills.ts";
-import { checkSources, installSource, listSources, reindexAll, removeSource, updateSources } from "./sources.ts";
+import { checkSources, installSource, listSources, migrateStore, reindexAll, removeSource, updateSources } from "./sources.ts";
 import type { Ctx } from "./sources.ts";
 import { MargraveError, RequestError, UsageError } from "./store.ts";
 import { wrap } from "./wrap.ts";
@@ -34,6 +34,7 @@ const USAGE = `usage: margrave <command>
   load <id> [--json] [--revision <hash>]      print one skill
   load <id> --file <path> [--revision <hash>] print one file inside a skill directory
   reindex                                     rescan all sources
+  migrate                                    upgrade a v0.2.1 store
   mcp                                         run the stdio MCP server
   wrap <claude|codex|bb|generic>              print setup text for an agent
   version                                     print the version
@@ -251,6 +252,11 @@ async function run(argv: string[]): Promise<void> {
       positionals(parse(rest, {}), 0, 0, "reindex");
       const r = await reindexAll(ctx(false));
       out(`reindexed ${r.skills} skills from ${r.sources} sources`);
+      return;
+    }
+    case "migrate": {
+      positionals(parse(rest, {}), 0, 0, "migrate");
+      out((await migrateStore()) ? "store upgraded" : "store is current");
       return;
     }
     case "mcp": {

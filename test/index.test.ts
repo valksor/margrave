@@ -1,17 +1,17 @@
 // index.db: ranking, the upgrade and validity guard, locking, and concurrent writes.
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
-import fsp, { chmod, mkdir, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import fsp, { chmod, cp, mkdir, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { MAX_QUERY_TERMS } from "../src/bm25.ts";
-import { findSkills, formatFind, readSelectedFile, resolveSkill } from "../src/skills.ts";
-import { installSource, localId, reindexAll, removeSource, updateSources } from "../src/sources.ts";
-import { deleteSourceSkills, home as storeHome, insertSkills, openIndexRead, openIndexWrite } from "../src/store.ts";
+import { findSkills, formatFind, loadContext, readSelectedFile, resolveSkill } from "../src/skills.ts";
+import { installSource, localId, migrateStore, reindexAll, removeSource, updateSources } from "../src/sources.ts";
+import { deleteSourceSkills, home as storeHome, insertSkills, openIndexRead, temporaryCatalog, writerLock } from "../src/store.ts";
 import type { NewEntry, SourceRecord } from "../src/store.ts";
 import {
+  catalogRecords,
   changeAtLock,
   fakeRipwire,
   holdWriteLock,
@@ -22,10 +22,12 @@ import {
   newEntry,
   realClose,
   realExec,
+  ROOT,
   runCli,
   seedIndex,
   sleep,
   tmp,
+  writeCatalogRecords,
   writeIndexRows,
   writeSkill,
 } from "./helpers.ts";
@@ -257,16 +259,84 @@ test("resolveSkill answers from SQL: id, bare name, ambiguity, unknown", async (
   }
 });
 
+test("a malformed catalog record closes the reader connection", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  await seedIndex([newEntry("s", "a")]);
+  const db = new DatabaseSync(path.join(home, "index.db"));
+  db.exec("UPDATE sources SET record = 'invalid json'");
+  db.close();
+  let closed = 0;
+  mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    closed++;
+    return realClose.call(this);
+  });
+  t.after(() => mock.restoreAll());
+  await assert.rejects(loadContext());
+  assert.equal(closed, 1);
+});
+
+test("a catalog that appears during an empty-store read is opened", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  await seedIndex([newEntry("s", "a")]);
+  const file = path.join(home, "index.db");
+  const lstat = fsp.lstat;
+  let hidden = 0;
+  mock.method(fsp, "lstat", ((name: string, ...args: unknown[]) => {
+    if (name === file && hidden++ < 2) return Promise.reject(Object.assign(new Error("missing"), { code: "ENOENT" }));
+    return (lstat as (...values: unknown[]) => unknown)(name, ...args);
+  }) as typeof fsp.lstat);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  const context = await loadContext();
+  assert.ok(context);
+  assert.equal(context.sources[0]?.id, "s");
+  context.db.close();
+});
+
+test("a concurrent migration is recognized after acquiring the writer lock", async (t) => {
+  const home = path.join(await tmp("mg-home-"), "store");
+  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  useHome(t, home);
+  const records = JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as SourceRecord[];
+  const hook = changeAtLock(t, 1, () => {
+    const db = new DatabaseSync(path.join(home, "index.db"));
+    db.exec(
+      "CREATE TABLE sources(id TEXT PRIMARY KEY, record TEXT NOT NULL, position INTEGER NOT NULL); UPDATE skills SET dir = 'release-upgrade'; PRAGMA user_version = 3",
+    );
+    db.prepare("INSERT INTO sources(id, record, position) VALUES (?, ?, 0)").run(records[0]!.id, JSON.stringify(records[0]));
+    db.close();
+  });
+  assert.equal(await migrateStore(), false);
+  assert.equal(hook.fired(), true);
+  assert.equal(catalogRecords(home)[0]?.id, records[0]?.id);
+});
+
+test("opening a missing catalog and a catalog without its source table fails closed", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  await assert.rejects(openIndexRead(), /Restore the complete store backup/u);
+  await seedIndex([newEntry("s", "a")]);
+  const db = new DatabaseSync(path.join(home, "index.db"));
+  db.exec("DROP TABLE sources");
+  db.close();
+  await assert.rejects(openIndexRead(), /not a supported margrave catalog/u);
+});
+
 // ---- the writer connection ----
 
-test("the index uses the DELETE journal, user_version 2, and leaves no side files after a read", async (t) => {
+test("the catalog uses the DELETE journal, user_version 3, and leaves no side files after a read", async (t) => {
   const home = await tmp("mg-home-");
   useHome(t, home);
   await seedIndex([newEntry("s", "a")]);
   const db = await openIndexRead();
   try {
     assert.equal((db.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode, "delete");
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 2);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 3);
   } finally {
     db.close();
   }
@@ -277,7 +347,7 @@ test("the writer reads integers as BigInt, and a contentless FTS delete does not
   const home = await tmp("mg-home-");
   useHome(t, home);
   await seedIndex([newEntry("s", "a"), newEntry("s", "b")]);
-  const db = await openIndexWrite("existing");
+  const db = new DatabaseSync(path.join(home, "index.db"), { readBigInts: true });
   try {
     assert.equal(typeof (db.prepare("SELECT 1 AS n").get() as { n: unknown }).n, "bigint");
     db.exec("BEGIN IMMEDIATE");
@@ -288,6 +358,25 @@ test("the writer reads integers as BigInt, and a contentless FTS delete does not
     db.close();
   }
   assert.deepEqual(indexIds(home), ["s/c"]);
+});
+
+test("writer lock timeout and unexpected SQLite errors release the connection", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  let failure: unknown = Object.assign(new Error("busy"), { errcode: 5 });
+  mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE") throw failure;
+    return realExec.call(this, sql);
+  });
+  let now = 0;
+  mock.method(Date, "now", () => (now++ === 0 ? 0 : 30_001));
+  t.after(() => mock.restoreAll());
+  await assert.rejects(writerLock(), /another Margrave writer holds the store lock/u);
+  failure = new Error("lock failed");
+  await assert.rejects(writerLock(), /lock failed/u);
+  mock.restoreAll();
+  const lock = await writerLock();
+  lock.close();
 });
 
 // ---- the guard: missing, legacy, invalid, locked ----
@@ -312,7 +401,7 @@ async function setup(): Promise<{ home: string; fakeBin: string; dir: string; id
   return { home, fakeBin, dir, id: /^installed (\S+)/mu.exec(inst.stdout)?.[1] ?? "", mg };
 }
 
-const INVALID = /index\.db is not a valid margrave index; run: margrave reindex/u;
+const INVALID = /index\.db is not a supported margrave catalog/u;
 
 test("a loose index.json is ignored and remains untouched", async () => {
   const s = await setup();
@@ -323,8 +412,8 @@ test("a loose index.json is ignored and remains untouched", async () => {
   assert.equal(await readFile(json, "utf8"), "legacy bytes");
 });
 
-const FOREIGN = /index\.db is not a margrave index; move it aside, then run: margrave reindex/u;
-const CORRUPT = /cannot open .*index\.db: .*; if the file is damaged, move it aside, then run: margrave reindex/u;
+const FOREIGN = /index\.db is not a supported margrave catalog/u;
+const CORRUPT = /cannot open .*index\.db: /u;
 
 interface BadDb {
   why: string;
@@ -436,11 +525,11 @@ test("a foreign index.db is refused by every command, reindex included, and marg
     assert.deepEqual(after.data, before.data, `${bad.why}: the file is unchanged`);
     assert.equal(after.ino, before.ino, bad.why);
     assert.deepEqual((await readdir(s.home)).filter((n) => n.startsWith("index")).sort(), ["index.db"], `${bad.why}: no side file`);
-    // The user moves it aside, then reindex builds a new one.
+    // A lost canonical catalog cannot be rebuilt from stale metadata.
     await rename(s.file, `${s.file}.aside`);
     const re = await s.mg(["reindex"]);
-    assert.equal(re.code, 0, `${bad.why}: ${re.stderr}`);
-    assert.deepEqual(indexIds(s.home), [`${s.id}/alpha`], bad.why);
+    assert.equal(re.code, 1, `${bad.why}: ${re.stderr}`);
+    assert.match(re.stderr, /Restore the complete store backup/u);
   }
 });
 
@@ -458,7 +547,7 @@ test("the schema probe sees a concurrent initial commit as one snapshot", async 
       committed = true;
       const writer = new DatabaseSync(file);
       writer.exec(
-        "BEGIN IMMEDIATE; CREATE TABLE skills(rowid INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, id_lc TEXT NOT NULL, name TEXT NOT NULL, name_lc TEXT NOT NULL, description TEXT NOT NULL, source TEXT NOT NULL, dir TEXT NOT NULL, hash TEXT NOT NULL, manifest TEXT NOT NULL, frontmatter TEXT NOT NULL); CREATE INDEX skills_name_lc ON skills(name_lc); CREATE INDEX skills_id_lc ON skills(id_lc); CREATE INDEX skills_source ON skills(source); CREATE VIRTUAL TABLE fts USING fts5(name, description, headings, body, content='', contentless_delete=1, tokenize='unicode61'); PRAGMA user_version = 2; COMMIT",
+        "BEGIN IMMEDIATE; CREATE TABLE skills(rowid INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, id_lc TEXT NOT NULL, name TEXT NOT NULL, name_lc TEXT NOT NULL, description TEXT NOT NULL, source TEXT NOT NULL, dir TEXT NOT NULL, hash TEXT NOT NULL, manifest TEXT NOT NULL, frontmatter TEXT NOT NULL); CREATE INDEX skills_name_lc ON skills(name_lc); CREATE INDEX skills_id_lc ON skills(id_lc); CREATE INDEX skills_source ON skills(source); CREATE TABLE sources(id TEXT PRIMARY KEY, record TEXT NOT NULL, position INTEGER NOT NULL); CREATE VIRTUAL TABLE fts USING fts5(name, description, headings, body, content='', contentless_delete=1, tokenize='unicode61'); PRAGMA user_version = 3; COMMIT",
       );
       writer.close();
     }
@@ -476,38 +565,25 @@ test("a version 2 index with incomplete FTS columns is rejected", async (t) => {
   const db = new DatabaseSync(path.join(s.home, "index.db"));
   db.exec("DROP TABLE fts; CREATE VIRTUAL TABLE fts USING fts5(name)");
   db.close();
-  await assert.rejects(openIndexRead(), /not a margrave index/u);
-  await assert.rejects(openIndexWrite("create"), /not a margrave index/u);
+  await assert.rejects(openIndexRead(), /not a supported margrave catalog/u);
+  await assert.rejects(temporaryCatalog(), /not a supported margrave catalog/u);
   const missingIndex = new DatabaseSync(path.join(s.home, "index.db"));
   missingIndex.exec("DROP TABLE fts; CREATE VIRTUAL TABLE fts USING fts5(name, description, headings, body); DROP INDEX skills_source");
   missingIndex.close();
-  await assert.rejects(openIndexRead(), /not a margrave index/u);
+  await assert.rejects(openIndexRead(), /not a supported margrave catalog/u);
 });
 
-test("a version 1 schema committed before the create lock is rejected", async (t) => {
+test("a version 1 schema is rejected before creating a temporary catalog", async (t) => {
   const home = await tmp("mg-home-");
   useHome(t, home);
   const file = path.join(home, "index.db");
-  new DatabaseSync(file).close();
-  let fired = false;
-  mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
-    if (sql === "BEGIN IMMEDIATE" && !fired) {
-      fired = true;
-      const writer = new DatabaseSync(file);
-      realExec.call(
-        writer,
-        "CREATE TABLE skills(rowid INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, id_lc TEXT NOT NULL, name TEXT NOT NULL, name_lc TEXT NOT NULL, description TEXT NOT NULL, source TEXT NOT NULL, dir TEXT NOT NULL, hash TEXT NOT NULL); CREATE INDEX skills_name_lc ON skills(name_lc); CREATE INDEX skills_id_lc ON skills(id_lc); CREATE INDEX skills_source ON skills(source); CREATE VIRTUAL TABLE fts USING fts5(name, description, headings, body, content='', contentless_delete=1, tokenize='unicode61'); PRAGMA user_version = 1",
-      );
-      writer.close();
-    }
-    return realExec.call(this, sql);
-  });
-  t.after(() => mock.restoreAll());
-  await assert.rejects(openIndexWrite("create"), /not a margrave index/u);
-  assert.equal(fired, true);
+  const db = new DatabaseSync(file);
+  db.exec("CREATE TABLE unrelated(id TEXT); PRAGMA user_version = 1");
+  db.close();
+  await assert.rejects(temporaryCatalog(), /not a supported margrave catalog/u);
 });
 
-test("a schema-less index.db is an error for reads; reindex initializes it in place", async () => {
+test("a schema-less catalog is refused and left unchanged", async () => {
   for (const bad of SCHEMALESS_DBS) {
     const s = await withBadDb(bad);
     const inode = (await stat(s.file)).ino;
@@ -517,10 +593,9 @@ test("a schema-less index.db is an error for reads; reindex initializes it in pl
       assert.match(r.stderr, INVALID, `${bad.why}: ${args.join(" ")}`);
     }
     const re = await s.mg(["reindex"]);
-    assert.equal(re.code, 0, `${bad.why}: ${re.stderr}`);
-    assert.deepEqual(indexIds(s.home), [`${s.id}/alpha`], bad.why);
-    assert.equal((await stat(s.file)).ino, inode, `${bad.why}: opened in place, not unlinked`);
-    assert.equal((await s.mg(["find", "alpha"])).code, 0, bad.why);
+    assert.equal(re.code, 1, `${bad.why}: ${re.stderr}`);
+    assert.match(re.stderr, FOREIGN);
+    assert.equal((await stat(s.file)).ino, inode, `${bad.why}: file remains in place`);
   }
 });
 
@@ -539,7 +614,7 @@ test("user_version 1 with a table missing gives the move-it-aside message for ev
 
 test("an install into a store with no sources: a schema-less index.db is initialized in place; a foreign or partial one is refused and unchanged", async () => {
   const cases = [
-    ...SCHEMALESS_DBS.map((bad) => ({ bad, ok: true, message: INVALID })),
+    ...SCHEMALESS_DBS.map((bad) => ({ bad, ok: false, message: INVALID })),
     ...FOREIGN_DBS.map((bad) => ({ bad, ok: false, message: FOREIGN })),
     ...PARTIAL_DBS.map((bad) => ({ bad, ok: false, message: FOREIGN })),
   ];
@@ -580,7 +655,7 @@ test("a damaged index.db (SQLITE_CORRUPT) keeps the open error and adds how to r
     const r = await s.mg(args);
     assert.equal(r.code, 1, args.join(" "));
     assert.match(r.stderr, CORRUPT, args.join(" "));
-    assert.doesNotMatch(r.stderr, /not a valid margrave index|not a margrave index/u, args.join(" "));
+    assert.doesNotMatch(r.stderr, /not a valid margrave index|not a supported margrave catalog/u, args.join(" "));
   }
   assert.deepEqual((await snapshot(file)).data, before.data);
 });
@@ -601,28 +676,23 @@ test("an extended SQLITE_CORRUPT code (SQLITE_CORRUPT_INDEX, 779) gets the recov
   );
 });
 
-test("a foreign index.db that appears between the lstat and the open in create mode is a foreign index, and is not changed", async (t) => {
+test("a foreign temporary copy is rejected and the active catalog stays intact", async (t) => {
   const home = await tmp("mg-home-");
   useHome(t, home);
   const file = path.join(home, "index.db");
-  await writeFile(file, "this is not a database, but it is longer than a header would need to be ".repeat(4));
+  await seedIndex([newEntry("s", "a")]);
   const before = await readFile(file);
-  const real = fsp.lstat;
-  // The lstat sees no index.db, as if the file arrived right after it.
-  let hidden = 0;
-  mock.method(fsp, "lstat", (p: string, ...rest: never[]) => {
-    if (p !== file) return real(p, ...rest);
-    hidden += 1;
-    return Promise.reject(Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" }));
+  const real = fsp.copyFile;
+  mock.method(fsp, "copyFile", async (from: Parameters<typeof fsp.copyFile>[0], to: Parameters<typeof fsp.copyFile>[1], flags?: number) => {
+    await real(from, to, flags);
+    await writeFile(to, "foreign database");
   });
   syncBuiltinESMExports();
   t.after(() => {
     mock.restoreAll();
     syncBuiltinESMExports();
   });
-  await assert.rejects(openIndexWrite("create"), FOREIGN);
-  // The create path saw no file, so the error came from the open, not from the probe of an existing file.
-  assert.ok(hidden >= 1, "the lstat of index.db was hidden");
+  await assert.rejects(temporaryCatalog(), /not a supported margrave catalog/u);
   assert.deepEqual(await readFile(file), before);
 });
 
@@ -635,7 +705,7 @@ test(
     await leaveHotJournal(file);
     assert.equal((await readdir(s.home)).includes("index.db-journal"), true, "the killed writer left a hot journal");
 
-    const message = /index\.db has an unfinished write from a stopped margrave process; run: margrave reindex/u;
+    const message = /index\.db has an unfinished v0.2.1 write. Restore a complete backup before migrating/u;
     for (const args of [["find", "alpha"], ["list"], ["load", `${s.id}/alpha`]]) {
       const r = await s.mg(args);
       assert.equal(r.code, 1, args.join(" "));
@@ -645,9 +715,9 @@ test(
     assert.equal((await readdir(s.home)).includes("index.db-journal"), true, "a reader never deletes the journal");
 
     const re = await s.mg(["reindex"]);
-    assert.equal(re.code, 0, re.stderr);
-    assert.deepEqual(indexIds(s.home), [`${s.id}/alpha`], "the killed write was rolled back");
-    assert.equal((await s.mg(["find", "alpha"])).code, 0);
+    assert.equal(re.code, 1, re.stderr);
+    assert.match(re.stderr, message);
+    assert.equal((await readdir(s.home)).includes("index.db-journal"), true);
   },
 );
 
@@ -666,7 +736,7 @@ test("update with no argument prints a guard error once, not once per source", a
   await writeFile(path.join(s.home, "index.json"), "{}");
   const r = await s.mg(["update"]);
   assert.equal(r.code, 1);
-  assert.equal(r.stderr.match(/index\.db is missing; run: margrave reindex/gu)?.length, 1, r.stderr);
+  assert.equal(r.stderr.match(/index\.db is missing\. Restore the complete store backup/gu)?.length, 1, r.stderr);
 });
 
 test("two first-time installs of different sources into an empty store both survive", { timeout: 60_000 }, async () => {
@@ -677,7 +747,7 @@ test("two first-time installs of different sources into an empty store both surv
     assert.deepEqual(await readdir(home), [], "no sources.json and no index.db yet");
     const runs = await Promise.all([runCli(["install", one.dir], { home, fakeBin }), runCli(["install", two.dir], { home, fakeBin })]);
     for (const r of runs) assert.equal(r.code, 0, r.stderr);
-    const sources = JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { id: string }[];
+    const sources = catalogRecords(home);
     assert.deepEqual(sources.map((x) => x.id).sort(), runs.map(installedId).sort(), `round ${round}`);
     assert.deepEqual(indexIds(home), [`${installedId(runs[0])}/beta`, `${installedId(runs[1])}/gamma`].sort(), `round ${round}`);
   }
@@ -713,12 +783,12 @@ test("a symlinked or non-regular index.db is refused, and reindex does not follo
   for (const args of [["find", "alpha"], ["reindex"], ["install", other.dir]]) {
     const r = await s.mg(args);
     assert.equal(r.code, 1, args.join(" "));
-    assert.match(r.stderr, /index\.db is not a regular file/u, args.join(" "));
+    assert.match(r.stderr, /index\.db is not a regular catalog file/u, args.join(" "));
   }
   assert.equal((await stat(real)).isFile(), true, "the target is untouched");
   await rm(file);
   await mkdir(file);
-  assert.match((await s.mg(["find", "alpha"])).stderr, /index\.db is not a regular file/u);
+  assert.match((await s.mg(["find", "alpha"])).stderr, /index\.db is not a regular catalog file/u);
 });
 
 test("an index.db that cannot be opened for a reason other than NOTADB is an error that names index.db, and nothing is deleted", async (t) => {
@@ -751,7 +821,7 @@ test("a missing index.db with sources says to run reindex", async () => {
   await rm(path.join(s.home, "index.db"));
   const r = await s.mg(["find", "alpha"]);
   assert.equal(r.code, 1);
-  assert.match(r.stderr, /index\.db is missing; run: margrave reindex/u);
+  assert.match(r.stderr, /index\.db is missing\. Restore the complete store backup/u);
 });
 
 test("a source whose skills are gone lists with skills=0 after a reindex", async () => {
@@ -776,8 +846,24 @@ test("a schema that cannot be created is an error that names index.db, and the h
     return realClose.call(this);
   });
   t.after(() => mock.restoreAll());
-  await assert.rejects(openIndexWrite("create"), /cannot create .*index\.db: mock: no schema/u);
+  await assert.rejects(temporaryCatalog(), /mock: no schema/u);
   assert.equal(closed, 1);
+});
+
+test("a temporary catalog configuration failure closes and removes the copy", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "PRAGMA journal_mode = DELETE") throw new Error("journal configuration failed");
+    return realExec.call(this, sql);
+  });
+  t.after(() => mock.restoreAll());
+  await assert.rejects(temporaryCatalog(), /journal configuration failed/u);
+  assert.deepEqual(await readdir(home), []);
+  mock.restoreAll();
+  const temp = await temporaryCatalog();
+  temp.db.close();
+  await rm(temp.file);
 });
 
 test("an index.db that cannot be created in a read-only store is an error that names index.db", async (t) => {
@@ -787,7 +873,7 @@ test("an index.db that cannot be created in a read-only store is an error that n
   await chmod(home, 0o555);
   const r = await runCli(["reindex"], { home });
   assert.equal(r.code, 1);
-  assert.match(r.stderr, /cannot create .*index\.db: /u);
+  assert.match(r.stderr, /cannot complete the store operation: /u);
 });
 
 // ---- read-only store ----
@@ -819,7 +905,13 @@ const installedId = (r: Run): string => /^installed (\S+)/mu.exec(r.stdout)?.[1]
 test("two installs of different sources that wait for the same lock both survive", { timeout: 60_000 }, async () => {
   const s = await setup();
   const [one, two] = [await localSource("beta"), await localSource("gamma")];
-  const lock = holdWriteLock(s.home);
+  const lockDb = new DatabaseSync(path.join(s.home, "writer-lock.db"));
+  lockDb.exec("BEGIN IMMEDIATE");
+  const lock = {
+    release: () => {
+      if (lockDb.isTransaction) lockDb.exec("COMMIT");
+    },
+  };
   let runs: Run[];
   try {
     const pending = [s.mg(["install", one.dir]), s.mg(["install", two.dir])];
@@ -828,10 +920,11 @@ test("two installs of different sources that wait for the same lock both survive
     runs = await Promise.all(pending);
   } finally {
     lock.release();
+    lockDb.close();
   }
   for (const r of runs) assert.equal(r.code, 0, r.stderr);
-  const sources = JSON.parse(await readFile(path.join(s.home, "sources.json"), "utf8")) as { id: string }[];
-  assert.equal(sources.length, 3, "all three source records are in sources.json");
+  const sources = catalogRecords(s.home);
+  assert.equal(sources.length, 3, "all three source records are in the catalog");
   assert.deepEqual(
     indexIds(s.home),
     [`${s.id}/alpha`, `${installedId(runs[0] as Run)}/beta`, `${installedId(runs[1] as Run)}/gamma`].sort(),
@@ -854,8 +947,7 @@ async function useFakeRipwire(t: { after: (fn: () => void) => void }): Promise<v
   });
 }
 
-const sourcesFilePath = (home: string): string => path.join(home, "sources.json");
-const readSourceRecords = (home: string): SourceRecord[] => JSON.parse(readFileSync(sourcesFilePath(home), "utf8")) as SourceRecord[];
+const readSourceRecords = (home: string): SourceRecord[] => catalogRecords(home);
 
 test("a reindex whose sources change after its scan reports it under the lock, and loses nothing", async (t) => {
   const s = await setup();
@@ -864,10 +956,10 @@ test("a reindex whose sources change after its scan reports it under the lock, a
   const record = extra.record("local__extra-abc123");
   const existing = readSourceRecords(s.home);
   // BEGIN IMMEDIATE number 1 is the schema check when the connection opens; number 2 is the reindex's own lock.
-  const lock = changeAtLock(t, 2, () => {
+  const lock = changeAtLock(t, 1, () => {
     // The change acts as an install that won the lock: a new source record and new rows.
     writeIndexRows(s.home, (db) => insertSkills(db, [newEntry(record.id, "beta")]));
-    writeFileSync(sourcesFilePath(s.home), JSON.stringify([...existing, record], null, 2));
+    writeCatalogRecords(s.home, [...existing, record]);
   });
   await assert.rejects(reindexAll(quiet), /sources changed during reindex; run: margrave reindex/u);
   assert.equal(lock.fired(), true, "the error came after the reindex's lock was taken");
@@ -888,7 +980,7 @@ test("a reindex whose sources change after its scan reports it under the lock, a
 function removedByAnother(t: { after: (fn: () => void) => void }, home: string, id: string): ReturnType<typeof changeAtLock> {
   return changeAtLock(t, 1, () => {
     writeIndexRows(home, (db) => deleteSourceSkills(db, id));
-    writeFileSync(sourcesFilePath(home), "[]\n");
+    writeCatalogRecords(home, []);
   });
 }
 
@@ -899,8 +991,8 @@ test("an update whose source another write removed fails under the lock and chan
   await assert.rejects(updateSources(s.id, quiet), new RegExp(`no source "${s.id}"$`, "u"));
   // The message is the same before the lock, so the counter tells the two apart.
   assert.equal(lock.fired(), true, "the error came after the update's lock was taken");
-  assert.equal(lock.begins(), 1);
-  assert.equal(readFileSync(sourcesFilePath(s.home), "utf8"), "[]\n");
+  assert.equal(lock.begins(), 2);
+  assert.deepEqual(readSourceRecords(s.home), []);
   assert.deepEqual(indexIds(s.home), []);
 });
 
@@ -910,8 +1002,8 @@ test("a remove whose source another write removed fails under the lock and chang
   const lock = removedByAnother(t, s.home, s.id);
   await assert.rejects(removeSource(s.id), new RegExp(`no source "${s.id}"; run: margrave list`, "u"));
   assert.equal(lock.fired(), true, "the error came after the remove's lock was taken");
-  assert.equal(lock.begins(), 1);
-  assert.equal(readFileSync(sourcesFilePath(s.home), "utf8"), "[]\n");
+  assert.equal(lock.begins(), 2);
+  assert.deepEqual(readSourceRecords(s.home), []);
   assert.deepEqual(indexIds(s.home), []);
 });
 
@@ -924,11 +1016,11 @@ test("an install of a source that another install added first fails under the lo
   const existing = readSourceRecords(s.home);
   const lock = changeAtLock(t, 1, () => {
     writeIndexRows(s.home, (db) => insertSkills(db, [newEntry(newId, "gamma")]));
-    writeFileSync(sourcesFilePath(s.home), JSON.stringify([...existing, third.record(newId)], null, 2));
+    writeCatalogRecords(s.home, [...existing, third.record(newId)]);
   });
   await assert.rejects(installSource(third.dir, null, quiet), /is already installed; run: margrave update/u);
   assert.equal(lock.fired(), true, "the error came after the install's lock was taken");
-  assert.equal(lock.begins(), 1);
+  assert.equal(lock.begins(), 2);
   assert.deepEqual(
     readSourceRecords(s.home)
       .map((x) => x.id)
@@ -964,9 +1056,9 @@ test("schema 1 is rejected without changing the database", async (t) => {
   db.exec("ALTER TABLE skills DROP COLUMN manifest; ALTER TABLE skills DROP COLUMN frontmatter; PRAGMA user_version = 1");
   db.close();
   const before = await readFile(file);
-  await assert.rejects(openIndexRead(), /not a margrave index/u);
-  await assert.rejects(openIndexWrite("existing"), /not a margrave index/u);
-  await assert.rejects(reindexAll(quiet), /not a margrave index/u);
+  await assert.rejects(openIndexRead(), /not a supported margrave catalog/u);
+  await assert.rejects(temporaryCatalog(), /not a supported margrave catalog/u);
+  await assert.rejects(reindexAll(quiet), /not a supported margrave catalog/u);
   assert.deepEqual(await readFile(file), before);
 });
 
@@ -992,7 +1084,7 @@ test("a selected revision reports an operational read error and an index change"
   const writer = new DatabaseSync(path.join(s.home, "index.db"));
   writer.prepare("UPDATE skills SET hash = ? WHERE id = ?").run(`sha256:${"b".repeat(64)}`, entry.id);
   writer.close();
-  await assert.rejects(readSelectedFile(entry, "SKILL.md", entry.revision), /skill revision changed; search again/u);
+  assert.match(await readSelectedFile(entry, "SKILL.md", entry.revision), /Body of alpha/u);
 });
 
 test("a pinned Git read reports file drift when its source record disappears", async (t) => {
@@ -1006,12 +1098,11 @@ test("a pinned Git read reports file drift when its source record disappears", a
   const entry = resolveSkill(db, "react-perf");
   db.close();
   await writeFile(path.join(entry.dir, "SKILL.md"), "changed bytes\n");
-  const sourceFile = path.join(home, "sources.json");
-  const records = JSON.parse(await readFile(sourceFile, "utf8")) as { snapshot: string }[];
+  const records = catalogRecords(home);
   assert.ok(records[0]);
-  records[0].snapshot = `${records[0].snapshot.slice(0, -16)}0000000000000000`;
-  await writeFile(sourceFile, JSON.stringify(records));
-  await assert.rejects(readSelectedFile(entry, "SKILL.md", entry.revision), /skill revision changed; search again/u);
-  await writeFile(path.join(home, "sources.json"), "[]\n");
+  records[0].snapshot = `${records[0].snapshot!.slice(0, -16)}0000000000000000`;
+  writeCatalogRecords(home, records);
+  await assert.rejects(readSelectedFile(entry, "SKILL.md", entry.revision), /skill files changed since indexing/u);
+  writeCatalogRecords(home, []);
   await assert.rejects(readSelectedFile(entry, "SKILL.md", entry.revision), /skill files changed since indexing/u);
 });

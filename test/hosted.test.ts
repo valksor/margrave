@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
-import { chmod, cp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
@@ -15,7 +14,7 @@ import {
   HOSTED_SERVER_ERROR,
   createServer,
 } from "../src/mcp.ts";
-import { CLI, ROOT, fakeRipwire, git, leaveHotJournal, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
+import { CLI, ROOT, fakeRipwire, git, leaveHotJournal, makeRepo, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
 
 interface ToolText {
   isError: boolean;
@@ -79,16 +78,26 @@ test("released v0.2.1 store remains usable after upgrade", async (t) => {
   const source = "example.invalid__fixtures__margrave-upgrade";
   const id = `${source}/release-upgrade`;
   const body = "The installed upgrade skill survived.";
-  // Relocate the release index path through the copied source link.
-  const skillDir = await realpath(path.join(home, "sources", source, "release-upgrade"));
-  const db = new DatabaseSync(path.join(home, "index.db"));
-  try {
-    const result = db.prepare("UPDATE skills SET dir = ? WHERE id = ?").run(skillDir, id);
-    assert.equal(result.changes, 1);
-  } finally {
-    db.close();
-  }
   const sources = await readFile(path.join(home, "sources.json"), "utf8");
+  const beforeMigration = await runCli(["find", "release upgrade"], { home });
+  assert.equal(beforeMigration.code, 1);
+  assert.match(beforeMigration.stderr, /store upgrade required/u);
+  const migration = await runCli(["migrate"], { home });
+  assert.equal(migration.code, 0, migration.stderr);
+  assert.equal(migration.stdout, "store upgraded\n");
+  const filesBeforeRepeat = (await readdir(home)).sort();
+  const repeated = await runCli(["migrate"], { home });
+  assert.equal(repeated.code, 0, repeated.stderr);
+  assert.equal(repeated.stdout, "store is current\n");
+  assert.deepEqual((await readdir(home)).sort(), filesBeforeRepeat);
+  await chmod(home, 0o555);
+  try {
+    const readOnlyRepeat = await runCli(["migrate"], { home });
+    assert.equal(readOnlyRepeat.code, 0, readOnlyRepeat.stderr);
+    assert.equal(readOnlyRepeat.stdout, "store is current\n");
+  } finally {
+    await chmod(home, 0o755);
+  }
   const found = await runCli(["find", "release upgrade"], { home });
   assert.equal(found.code, 0, found.stderr);
   assert.ok(found.stdout.includes(id), found.stdout);
@@ -121,6 +130,49 @@ test("released v0.2.1 store remains usable after upgrade", async (t) => {
   const after = await runCli(["load", id], { home });
   assert.equal(after.code, 0, after.stderr);
   assert.ok(after.stdout.includes(body), after.stdout);
+});
+
+test("a moved Git store loads from its new path through CLI and MCP", async (t) => {
+  const original = await useHome(t);
+  const repo = await makeRepo();
+  const installed = await runCli(["install", repo.url], { home: original, fakeBin: await fakeRipwire() });
+  assert.equal(installed.code, 0, installed.stderr);
+  const id = /^installed (\S+)/mu.exec(installed.stdout)?.[1];
+  assert.ok(id);
+  const moved = path.join(await tmp(), "moved");
+  await rename(original, moved);
+  await cp(moved, original, { recursive: true, verbatimSymlinks: true });
+  await writeFile(
+    path.join(original, "sources", id, "skills", "react-perf", "SKILL.md"),
+    skillMd("react-perf", "old copy", "old copy bytes"),
+  );
+  process.env["MARGRAVE_HOME"] = moved;
+  const found = await runCli(["find", "react-perf"], { home: moved });
+  assert.equal(found.code, 0, found.stderr);
+  assert.match(found.stdout, /react-perf/u);
+  const loaded = await runCli(["load", "react-perf"], { home: moved });
+  assert.equal(loaded.code, 0, loaded.stderr);
+  assert.match(loaded.stdout, /Body of react-perf/u);
+  assert.doesNotMatch(loaded.stdout, /old copy bytes/u);
+  const client = new Client({ name: "margrave-test", version: "0.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  t.after(() => client.close());
+  await client.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: [CLI, "mcp"],
+      env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: moved },
+    }),
+  );
+  const hosted = await connectHosted(t);
+  for (const mcp of [client, hosted]) {
+    const foundSkill = await call(mcp, "find_skills", { task: "react-perf" });
+    assert.equal(foundSkill.isError, false, foundSkill.text);
+    assert.match(foundSkill.text, /react-perf/u);
+    const result = await call(mcp, "load_skill", { id: `${id}/react-perf` });
+    assert.equal(result.isError, false, result.text);
+    assert.match(result.text, /Body of react-perf/u);
+    assert.doesNotMatch(result.text, /old copy bytes/u);
+  }
 });
 
 test("hosted tools have the same names, input schemas, and instructions as the stdio server; only the two descriptions differ", async (t) => {
@@ -336,7 +388,7 @@ test("hosted: a store failure returns a generic error and logs the cause", async
     assert.equal(log.mock.callCount(), 1, tool);
     const logged: unknown = log.mock.calls[0]?.arguments[0];
     assert.ok(logged instanceof Error, tool);
-    assert.match(logged.message, /is not a margrave index; move it aside, then run: margrave reindex/u, tool);
+    assert.match(logged.message, /is not a supported margrave catalog/u, tool);
   }
 });
 
@@ -355,7 +407,7 @@ test("hosted: a hot journal returns the generic error and logs the unfinished-wr
   assert.equal(log.mock.callCount(), 1);
   const logged: unknown = log.mock.calls[0]?.arguments[0];
   assert.ok(logged instanceof Error);
-  assert.match(logged.message, /index\.db has an unfinished write from a stopped margrave process; run: margrave reindex/u);
+  assert.match(logged.message, /index\.db has an unfinished v0.2.1 write. Restore a complete backup before migrating/u);
 });
 
 test("hosted: only POST is served", async () => {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
 import { constants } from "node:fs";
-import { chmod, mkdir, mkdtemp, open, realpath, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,8 +11,8 @@ import { mock } from "node:test";
 import { promisify } from "node:util";
 import { buildFieldTokens } from "../src/bm25.ts";
 import { PINNED_RIPWIRE } from "../src/safety.ts";
-import { insertSkills, openIndexWrite } from "../src/store.ts";
-import type { NewEntry } from "../src/store.ts";
+import { catalogSources, indexDbFile, insertSkills, putCatalogSources, temporaryCatalog } from "../src/store.ts";
+import type { NewEntry, SourceRecord } from "../src/store.ts";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const CLI = path.join(ROOT, "src", "cli.ts");
@@ -207,6 +207,24 @@ export function indexRows(home: string): { id: string; name: string; source: str
 
 export const indexIds = (home: string): string[] => indexRows(home).map((r) => r.id);
 
+export function catalogRecords(home: string): SourceRecord[] {
+  const db = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+  try {
+    return catalogSources(db);
+  } finally {
+    db.close();
+  }
+}
+
+export function writeCatalogRecords(home: string, records: SourceRecord[]): void {
+  const db = new DatabaseSync(path.join(home, "index.db"));
+  try {
+    putCatalogSources(db, records);
+  } finally {
+    db.close();
+  }
+}
+
 export function newEntry(source: string, name: string, description = `desc ${name}`, body = ""): NewEntry {
   return {
     id: `${source}/${name}`,
@@ -222,13 +240,29 @@ export function newEntry(source: string, name: string, description = `desc ${nam
 }
 
 /** Create index.db under the current MARGRAVE_HOME with these entries. Writes no sources.json. */
-export async function seedIndex(entries: NewEntry[]): Promise<void> {
-  const db = await openIndexWrite("create");
+export async function seedIndex(entries: NewEntry[], sources?: SourceRecord[]): Promise<void> {
+  const { db, file } = await temporaryCatalog();
   try {
     insertSkills(db, entries);
+    putCatalogSources(
+      db,
+      sources ??
+        [...new Set(entries.map((entry) => entry.source))].map((id) => ({
+          id,
+          kind: "local",
+          spec: `/x/${id}`,
+          path: `/x/${id}`,
+          subpath: "",
+          ref: null,
+          commit: null,
+          installedAt: "2026-01-01T00:00:00.000Z",
+        })),
+    );
   } finally {
     db.close();
   }
+  await rename(file, indexDbFile());
+  await rm(`${file}.owner`);
 }
 
 /** A second connection that holds the write lock of `home`'s index.db until `release()`. In-process: the caller must not touch the lock holder's database synchronously. */

@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { scanSource } from "./scan.ts";
@@ -8,28 +8,25 @@ import {
   commit,
   git,
   gitDir,
-  installMode,
   logWarnings,
+  ownedStage,
   parseSpec,
   resolveScanRoot,
   scanInstalledSource,
-  sourceDir,
-  switchAlias,
+  syncSnapshot,
   toEntries,
 } from "./sources.ts";
 import type { Ctx } from "./sources.ts";
 import {
   MargraveError,
   atomicWrite,
+  catalogSources,
   deleteSourceSkills,
   ensureDirs,
   home,
   insertSkills,
   isRecord,
-  openIndexRead,
-  openIndexWrite,
-  readSources,
-  stagingRoot,
+  openCatalogReadOptional,
 } from "./store.ts";
 import type { NewEntry, SourceRecord } from "./store.ts";
 
@@ -200,24 +197,26 @@ async function verifyInstalled(rec: SourceRecord, locked: LockedSource, db: Data
 }
 
 export async function exportLock(selected: string[]): Promise<LockFile> {
-  const sources = await readSources();
-  if (selected.length === 0 && sources.some((s) => s.kind !== "git"))
-    throw new MargraveError("select Git sources with --source when the store contains local directories");
-  const targets =
-    selected.length === 0
-      ? sources
-      : selected.map((id) => {
-          const source = sources.find((s) => s.id === id && s.kind === "git");
-          if (source === undefined) throw new MargraveError("--source must be an installed Git source ID");
-          return source;
-        });
-  for (const rec of targets) {
-    checkLockUrl(rec.spec);
-    checkLockUrl(rec.url as string);
-  }
-  if (targets.length === 0) return { version: 1, sources: [] };
-  const db = await openIndexRead();
+  const db = await openCatalogReadOptional();
+  if (db === null && selected.length === 0) return { version: 1, sources: [] };
+  if (db === null) throw new MargraveError("--source must be an installed Git source ID");
   try {
+    const sources = catalogSources(db);
+    if (selected.length === 0 && sources.some((s) => s.kind !== "git"))
+      throw new MargraveError("select Git sources with --source when the store contains local directories");
+    const targets =
+      selected.length === 0
+        ? sources
+        : selected.map((id) => {
+            const source = sources.find((s) => s.id === id && s.kind === "git");
+            if (source === undefined) throw new MargraveError("--source must be an installed Git source ID");
+            return source;
+          });
+    for (const rec of targets) {
+      checkLockUrl(rec.spec);
+      checkLockUrl(rec.url as string);
+    }
+    if (targets.length === 0) return { version: 1, sources: [] };
     const locked: LockedSource[] = [];
     for (const rec of targets) {
       locked.push({
@@ -283,20 +282,6 @@ async function scanLockedDirectory(dir: string, source: LockedSource, ctx: Ctx):
   const entries = toEntries(source.id, scan.skills, (d) => d);
   if (!sameInventory(entries, source)) throw new MargraveError(`staged skills differ from the lock: ${source.id}`);
   return entries;
-}
-
-async function ensureRestoreAlias(rec: SourceRecord, destination: string): Promise<void> {
-  const alias = sourceDir(rec.id);
-  const existing = await lstat(alias).catch((err: NodeJS.ErrnoException) => {
-    if (err.code === "ENOENT") return null;
-    throw err;
-  });
-  if (existing === null) {
-    await switchAlias(rec.id, null, destination);
-    return;
-  }
-  if (!existing.isSymbolicLink() || (await readlink(alias)) !== path.relative(path.dirname(alias), destination))
-    throw new MargraveError(`installed source differs from the lock: ${rec.id}`);
 }
 
 interface RestorePlan {
@@ -382,7 +367,7 @@ async function preflightSource(
 
 async function publishSource(source: LockedSource, plan: RestorePlan): Promise<void> {
   const destination = gitDir(plan.record);
-  await commit(await installMode(), async (fresh, writer) => {
+  await commit(async (fresh, writer) => {
     const currentMarker = await readPending(source);
     if (JSON.stringify(currentMarker) !== JSON.stringify(plan.marker))
       throw new MargraveError(`restore is pending for a different lock source: ${source.id}`);
@@ -394,7 +379,6 @@ async function publishSource(source: LockedSource, plan: RestorePlan): Promise<v
         JSON.stringify(indexedEntries(writer, source.id)) !== plan.indexed
       )
         throw new MargraveError(`installed source differs from the lock: ${source.id}`);
-      await ensureRestoreAlias(current, destination);
       return undefined;
     }
     if (current !== undefined && (plan.marker === undefined || !matchesLock(current, source) || current.snapshot !== plan.record.snapshot))
@@ -411,9 +395,9 @@ async function publishSource(source: LockedSource, plan: RestorePlan): Promise<v
       )
         throw new MargraveError(`pending restore record is malformed: ${source.id}`);
       await rename(plan.dir as string, destination);
+      await syncSnapshot(destination);
     }
-    const entries = plan.entries.map((entry) => ({ ...entry, dir: path.join(destination, path.relative(plan.dir as string, entry.dir)) }));
-    await ensureRestoreAlias(plan.record, destination);
+    const entries = plan.entries.map((entry) => ({ ...entry, dir: path.relative(plan.dir as string, entry.dir) }));
     deleteSourceSkills(writer, source.id);
     insertSkills(writer, entries);
     return [...fresh.filter((s) => s.id !== source.id), plan.record];
@@ -423,7 +407,6 @@ async function publishSource(source: LockedSource, plan: RestorePlan): Promise<v
 async function clearMarker(source: LockedSource, expected: PendingRestore): Promise<void> {
   let removed = false;
   await commit(
-    await installMode(),
     async () => {
       const marker = await readPending(source);
       if (JSON.stringify(marker) !== JSON.stringify(expected))
@@ -442,15 +425,14 @@ export async function restoreLock(lock: LockFile, ctx: Ctx, report: (line: strin
   const pending = new Map<string, PendingRestore | undefined>();
   for (const source of lock.sources) pending.set(source.id, await readPending(source));
   if (lock.sources.length === 0) return;
-  const initial = await readSources();
-  if ([...pending.values()].some((marker) => marker !== undefined)) (await openIndexWrite(await installMode())).close();
   await ensureDirs();
-  const stage = await mkdtemp(path.join(stagingRoot(), "restore-"));
+  const stage = await ownedStage("restore-");
   let completed = 0;
   try {
     const plans = new Map<string, RestorePlan>();
-    const db = initial.length > 0 ? await openIndexRead() : null;
+    const db = await openCatalogReadOptional();
     try {
+      const initial = db === null ? [] : catalogSources(db);
       for (const source of lock.sources) {
         plans.set(
           source.id,
@@ -459,7 +441,7 @@ export async function restoreLock(lock: LockFile, ctx: Ctx, report: (line: strin
             pending.get(source.id),
             initial.find((s) => s.id === source.id),
             db,
-            stage,
+            stage.dir,
             ctx,
           ),
         );
@@ -478,6 +460,6 @@ export async function restoreLock(lock: LockFile, ctx: Ctx, report: (line: strin
     if (completed > 0) throw new MargraveError(`restore partially completed: ${err instanceof Error ? err.message : String(err)}`);
     throw err;
   } finally {
-    await rm(stage, { recursive: true, force: true });
+    await stage.close();
   }
 }

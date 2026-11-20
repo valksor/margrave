@@ -1,6 +1,6 @@
 # Margrave v0.2.1 store fixture
 
-The v0.2.1 CLI created this store from one synthetic Git source. The SQLite index includes the schema and indexed skill that the release wrote. The test copies the store, then changes only the indexed absolute skill path to match the temporary location.
+The v0.2.1 CLI created this store from one synthetic Git source. The SQLite index includes the schema and absolute skill path that the release wrote. The test copies the store to a new path, runs the migration, and verifies access to the installed skill without editing the fixture database.
 
 To reproduce the fixture, use the source at tag `v0.2.1` and the Node version in its `.nvmrc`.
 
