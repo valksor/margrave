@@ -311,7 +311,7 @@ margrave does no auth, TLS, CORS, Host/Origin checks, or rate limiting. The host
 
 Example (Node, `node:http`):
 
-The quick-start listener accepts connections on loopback. The [production integration example](examples/hosted-mcp.mjs) is designed for a private listener behind TLS termination. It authenticates each caller, selects the caller's allowed sources, and limits request sizes, rates, and concurrency before it calls MCP. Configure the proxy and the example with the exact public Host and allowed browser origins. Hosted skill reads accept files up to 1 MiB.
+The quick-start listener accepts connections on loopback. The [production integration example](examples/hosted-mcp.mjs) is designed for a private listener behind TLS termination. It authenticates each caller, selects the caller's allowed sources, and limits request sizes, rates, and concurrency before it calls MCP. Configure the proxy and the example with the exact public Host and allowed browser origins. Hosted skill reads accept files up to 1 MiB. The handler allows 10 seconds for an admitted request body. Configure header and response timeouts at the proxy.
 
 Pass `handleHostedMcp` as the example's `handle` option. Supply bearer tokens from the host secret store and map each token to its allowed source IDs.
 
@@ -377,7 +377,9 @@ To reclaim space, stop all Margrave readers and writers. Use `margrave list --js
 3. Install the new CLI and update any host package. Run `margrave migrate` with the original `MARGRAVE_HOME`.
 4. Run `margrave find` and `margrave load` on an existing skill. Restart servers after both commands succeed.
 
-Migration checks that source records, index entries, and snapshot files agree. It rebuilds the search index from the verified files. If migration reports a conflict, keep the backup and restore a known-good copy or recover the affected source from a verified lock.
+Migration checks that source records, index entries, and snapshot files agree. It rebuilds the search index from the verified files. If migration reports a conflict, keep the original store offline and preserve the complete backup. If you have a known-good backup, restore it at the original path and retry migration.
+
+To recover from verified locks, set `MARGRAVE_HOME` to a new empty directory. Run `margrave lock restore <lockfile>` for the locked Git sources. Recover each required Git source from a verified lock and re-register local sources from their original directories. Compare the source IDs and Git revisions with your backup inventory. Run `margrave find` and `margrave load` before pointing servers at the new store. Keep the old store and its backup until you verify every source you need.
 
 To roll back, stop Margrave processes. Move the upgraded store aside and restore the complete backup at its original path. Start the previous CLI and restart the previous MCP servers.
 

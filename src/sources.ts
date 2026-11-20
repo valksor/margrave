@@ -1066,7 +1066,7 @@ export async function migrateStore(): Promise<boolean> {
           const record: unknown = JSON.parse(row.record);
           if (typeof record === "object" && record !== null && Object.hasOwn(record, "selection"))
             throw new MargraveError(
-              `cannot upgrade source "${row.id}" because its source record, index, or files disagree. Restore a known-good backup or recover the source from a verified lock`,
+              `cannot upgrade source "${row.id}" because its source record, index, or files disagree. Restore a known-good backup or restore a verified lock into a new MARGRAVE_HOME. See Upgrading in the README.`,
             );
         }
         sources = catalogSources(legacy.db);
@@ -1098,7 +1098,7 @@ export async function migrateStore(): Promise<boolean> {
     for (const rec of sources) {
       const conflict = (): MargraveError =>
         new MargraveError(
-          `cannot upgrade source "${rec.id}" because its source record, index, or files disagree. Restore a known-good backup or recover the source from a verified lock`,
+          `cannot upgrade source "${rec.id}" because its source record, index, or files disagree. Restore a known-good backup or restore a verified lock into a new MARGRAVE_HOME. See Upgrading in the README.`,
         );
       try {
         if (ids.has(rec.id)) throw conflict();
