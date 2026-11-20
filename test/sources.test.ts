@@ -559,6 +559,57 @@ test("Git update preserves a source record changed by another writer", async (t)
   });
 });
 
+test("local selections expand and reject competing source changes", async (t) => {
+  await inStore(t, async (home) => {
+    const dir = await tmp();
+    await writeSkill(dir, "alpha", "Alpha skill");
+    await writeSkill(dir, "beta", "Beta skill");
+    const { id } = await installSource(dir, null, quiet, ["alpha"]);
+    await updateSources(id, quiet, null, ["beta"]);
+    assert.deepEqual(indexIds(home), [`${id}/alpha`, `${id}/beta`]);
+    assert.deepEqual(catalogRecords(home)[0]?.selection, ["alpha", "beta"]);
+    await reindexAll(quiet);
+    assert.equal((await checkSources(id))[0]?.error, null);
+    const records = catalogRecords(home);
+    records[0]!.installedAt = "competing writer";
+    const hook = changeAtLock(t, 1, () => writeCatalogRecords(home, records));
+    await assert.rejects(updateSources(id, quiet), /source changed during update/u);
+    assert.equal(hook.fired(), true);
+  });
+});
+
+test("whole sources reject expansion and malformed stored selections", async (t) => {
+  await inStore(t, async (home) => {
+    const dir = await tmp();
+    await writeSkill(dir, "alpha", "Alpha skill");
+    const { id } = await installSource(dir, null, quiet);
+    await assert.rejects(updateSources(id, quiet, null, ["alpha"]), /already installs all skills/u);
+    const records = catalogRecords(home);
+    records[0]!.selection = [];
+    writeCatalogRecords(home, records);
+    await assert.rejects(readSources(), /malformed source records/u);
+  });
+});
+
+test("selection expansion rejects a source replaced between reads", async (t) => {
+  await inStore(t, async (home) => {
+    const dir = await tmp();
+    await writeSkill(dir, "alpha", "Alpha skill");
+    const { id } = await installSource(dir, null, quiet, ["alpha"]);
+    const records = catalogRecords(home);
+    delete records[0]!.selection;
+    const realLstat = fsp.lstat;
+    let reads = 0;
+    mock.method(fsp, "lstat", (async (file: string, ...args: unknown[]) => {
+      if (file === path.join(home, "index.db") && ++reads === 3) writeCatalogRecords(home, records);
+      return (realLstat as (...a: unknown[]) => Promise<unknown>)(file, ...args);
+    }) as typeof fsp.lstat);
+    syncBuiltinESMExports();
+    await assert.rejects(updateSources(id, quiet, null, ["alpha"]), /already installs all skills/u);
+    assert.ok(reads >= 3);
+  });
+});
+
 test("Git update preserves another writer's removal", async (t) => {
   await inStore(t, async (home) => {
     const repo = await makeRepo();

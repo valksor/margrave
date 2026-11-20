@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import fsp, { chmod, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import fsp, { chmod, cp, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -28,10 +28,48 @@ test("an empty store exports and restores an empty lock", async (t) => {
     else process.env["MARGRAVE_HOME"] = previous;
   });
   const lock = await exportLock([]);
-  assert.deepEqual(lock, { version: 1, sources: [] });
+  assert.deepEqual(lock, { version: 2, sources: [] });
   const output: string[] = [];
   await restoreLock(lock, { log: () => {}, allowUnsafe: false }, (line) => output.push(line));
   assert.deepEqual(output, []);
+});
+
+test("version 2 restores selected skills and version 1 restores the whole source", async (t) => {
+  const previousHome = process.env["MARGRAVE_HOME"];
+  const previousPath = process.env["PATH"];
+  process.env["MARGRAVE_HOME"] = await tmp("mg-home-");
+  process.env["PATH"] = `${await fakeRipwire()}:${previousPath ?? ""}`;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previousHome;
+    if (previousPath === undefined) delete process.env["PATH"];
+    else process.env["PATH"] = previousPath;
+  });
+  const repo = await makeRepo();
+  const ctx = { log: (): void => {}, allowUnsafe: false };
+  await installSource(repo.url, null, ctx, ["react-perf"]);
+  const selected = await exportLock([]);
+  assert.equal(selected.version, 2);
+  assert.deepEqual(selected.sources[0]?.selection, ["react-perf"]);
+  process.env["MARGRAVE_HOME"] = await tmp("mg-home-");
+  await restoreLock(selected, ctx, () => {});
+  assert.deepEqual((await exportLock([])).sources[0]?.selection, ["react-perf"]);
+  assert.equal(indexRows(process.env["MARGRAVE_HOME"]).length, 1);
+  await rename(repo.dir, `${repo.dir}-offline`);
+  try {
+    await restoreLock(selected, ctx, () => {});
+  } finally {
+    await rename(`${repo.dir}-offline`, repo.dir);
+  }
+
+  process.env["MARGRAVE_HOME"] = await tmp("mg-home-");
+  await installSource(repo.url, null, ctx);
+  const whole = await exportLock([]);
+  const legacy = parseLock({ version: 1, sources: whole.sources.map(({ selection: _selection, ...source }) => source) });
+  process.env["MARGRAVE_HOME"] = await tmp("mg-home-");
+  await restoreLock(legacy, ctx, () => {});
+  assert.equal(indexRows(process.env["MARGRAVE_HOME"]).length, 3);
+  assert.equal((await exportLock([])).sources[0]?.selection, null);
 });
 
 test("restore retains a malformed pending marker without publishing", async (t) => {
@@ -145,6 +183,10 @@ test("restore resumes a pending snapshot and rejects missing or non-directory de
   const report: string[] = [];
   await restoreLock(lock, ctx, (line) => report.push(line));
   assert.deepEqual(report, [`already restored ${id}`]);
+  await assert.rejects(readFile(existingMarker), { code: "ENOENT" });
+  const legacy = parseLock({ version: 1, sources: lock.sources.map(({ selection: _selection, ...source }) => source) });
+  await writeFile(existingMarker, JSON.stringify({ source: legacy.sources[0], record }));
+  await restoreLock(legacy, ctx, () => {});
   await assert.rejects(readFile(existingMarker), { code: "ENOENT" });
   const home = await tmp("mg-home-");
   process.env["MARGRAVE_HOME"] = home;
@@ -570,7 +612,10 @@ test("lock validation rejects malformed source and skill fields", () => {
     commit: "a".repeat(40),
     skills: [skill],
   };
-  for (const value of [null, {}, { version: 2, sources: [] }, { version: 1, sources: "bad" }, { version: 1, sources: [], extra: 1 }]) {
+  for (const selection of [[], ["skill", "skill"], ["z", "a"], ["other"], "skill"]) {
+    assert.throws(() => parseLock({ version: 2, sources: [{ ...source, selection }] }), /lock file is malformed/u);
+  }
+  for (const value of [null, {}, { version: 3, sources: [] }, { version: 1, sources: "bad" }, { version: 1, sources: [], extra: 1 }]) {
     assert.throws(() => parseLock(value), /lock file is malformed/u);
   }
   for (const change of [

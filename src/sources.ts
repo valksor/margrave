@@ -557,22 +557,49 @@ export interface InstallResult {
   skills: string[];
 }
 
-export async function installSource(spec: string, refArg: string | null, ctx: Ctx): Promise<InstallResult> {
+export async function installSource(spec: string, refArg: string | null, ctx: Ctx, selection?: string[]): Promise<InstallResult> {
   const parsed = parseSpec(spec);
   const ref = refArg === null ? null : checkRef(refArg);
   if (parsed.kind === "local") {
     if (ref !== null) throw new UsageError("--ref is not allowed with a local source");
-    return installLocal(spec, parsed.path, ctx);
+    return installLocal(spec, parsed.path, ctx, selection);
   }
   if (ref !== null && qualifiedRef(ref)) await validateGitRef(ref);
-  return installGit(spec, parsed, ref, ctx);
+  return installGit(spec, parsed, ref, ctx, selection);
+}
+
+export function selectSkills(
+  id: string,
+  scan: Awaited<ReturnType<typeof scanSource>>,
+  selection?: readonly string[],
+  updating = false,
+): ScannedSkill[] {
+  if (selection === undefined) return scan.skills;
+  for (const name of selection) {
+    if (scan.duplicates.includes(name)) throw new MargraveError(`skill "${name}" is ambiguous in source "${id}"`);
+    if (!scan.skills.some((skill) => skill.name === name)) {
+      if (updating) throw new MargraveError(`selected skill "${name}" is missing from the new revision. The installed source is unchanged`);
+      throw new MargraveError(`skill "${name}" does not exist in source "${id}"`);
+    }
+  }
+  return scan.skills.filter((skill) => selection.includes(skill.name));
+}
+
+async function verifyStagedScan(id: string, root: string, clone: string, scan: Awaited<ReturnType<typeof scanSource>>): Promise<void> {
+  const checked = await scanSource(root, { followSymlinks: false, boundary: clone, strict: true });
+  if (
+    JSON.stringify(toEntries(id, checked.skills, (d) => path.relative(clone, d))) !==
+      JSON.stringify(toEntries(id, scan.skills, (d) => path.relative(clone, d))) ||
+    JSON.stringify(checked.duplicates) !== JSON.stringify(scan.duplicates)
+  )
+    throw new MargraveError("staged skills changed during scan");
 }
 
 function duplicate(id: string): MargraveError {
   return new MargraveError(`source ${id} is already installed; run: margrave update ${id} (or margrave remove ${id})`);
 }
 
-async function installLocal(spec: string, dir: string, ctx: Ctx): Promise<InstallResult> {
+async function installLocal(spec: string, dir: string, ctx: Ctx, selection?: string[]): Promise<InstallResult> {
   let real: string;
   try {
     real = await realpath(dir);
@@ -588,10 +615,11 @@ async function installLocal(spec: string, dir: string, ctx: Ctx): Promise<Instal
 
   const scan = await scanSource(real, { followSymlinks: true, strict: true });
   logWarnings(ctx, scan.warnings);
+  const skills = selectSkills(id, scan, selection);
   if (scan.skills.length === 0) throw new MargraveError(`no valid skills (SKILL.md with name and description) found in ${real}`);
   await scanWithRipwire(real, { ...ctx, sourceId: id, skills: scan.skills });
 
-  const entries = toEntries(id, scan.skills, (d) => d);
+  const entries = toEntries(id, skills, (d) => d);
   const record: SourceRecord = {
     id,
     kind: "local",
@@ -601,6 +629,7 @@ async function installLocal(spec: string, dir: string, ctx: Ctx): Promise<Instal
     ref: null,
     commit: null,
     installedAt: new Date().toISOString(),
+    ...(selection === undefined ? {} : { selection }),
   };
   await commit(addSource(record, entries));
   return { id, skills: entries.map((e) => e.id) };
@@ -620,6 +649,7 @@ async function installGit(
   parsed: Extract<ParsedSpec, { kind: "git" }>,
   ref: string | null,
   ctx: Ctx,
+  selection?: string[],
 ): Promise<InstallResult> {
   const id = parsed.id;
   const final = sourceDir(id);
@@ -650,17 +680,13 @@ async function installGit(
     const scanRoot = await realpath(await resolveScanRoot(realClone, parsed.subpath));
     const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone, strict: true });
     logWarnings(ctx, scan.warnings);
+    const skills = selectSkills(id, scan, selection);
     if (scan.skills.length === 0) {
       throw new MargraveError(`no valid skills (SKILL.md with name and description) found in ${spec}`);
     }
     const acceptedScan = await scanWithRipwire(scanRoot, { ...ctx, sourceId: id, skills: scan.skills, verifyContent: true });
-    const checked = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone, strict: true });
-    if (
-      JSON.stringify(toEntries(id, checked.skills, (d) => path.relative(realClone, d))) !==
-      JSON.stringify(toEntries(id, scan.skills, (d) => path.relative(realClone, d)))
-    )
-      throw new MargraveError("staged skills changed during scan");
-    const { snapshot, entries } = await prepareSnapshot(id, sha, clone, realClone, scan.skills);
+    await verifyStagedScan(id, scanRoot, realClone, scan);
+    const { snapshot, entries } = await prepareSnapshot(id, sha, clone, realClone, skills);
     const record: SourceRecord = {
       id,
       kind: "git",
@@ -672,6 +698,7 @@ async function installGit(
       snapshot,
       scan: acceptedScan,
       installedAt: new Date().toISOString(),
+      ...(selection === undefined ? {} : { selection }),
     };
 
     await commit(addSource(record, entries));
@@ -705,24 +732,34 @@ export async function updateSources(
   arg: string | null,
   ctx: Ctx,
   ref: string | null = null,
+  expansion?: string[],
 ): Promise<{ results: UpdateResult[]; errors: { id: string; message: string }[] }> {
   if (ref !== null && arg === null) throw new UsageError("update --ref requires one Git source");
   const sources = await readSources();
   // A missing or invalid index fails once here, not once per source.
   if (arg === null) await checkIndex(sources);
-  const targets = arg === null ? sources : [findSource(sources, arg)];
+  const targets = updateTargets(sources, arg, expansion);
   await validateUpdateRef(ref, targets[0]);
   const results: UpdateResult[] = [];
   const errors: { id: string; message: string }[] = [];
   for (const t of targets) {
     try {
-      results.push(await updateOne(t.id, ctx, ref));
+      results.push(await updateOne(t.id, ctx, ref, expansion));
     } catch (err) {
       if (arg !== null) throw err;
       errors.push({ id: t.id, message: err instanceof Error ? err.message : String(err) });
     }
   }
   return { results, errors };
+}
+
+function updateTargets(sources: SourceRecord[], arg: string | null, expansion?: string[]): SourceRecord[] {
+  if (expansion !== undefined && (arg === null || !sources.some((s) => s.id === arg)))
+    throw new UsageError("skill selection requires an explicit source ID");
+  const targets = arg === null ? sources : [findSource(sources, arg)];
+  if (expansion !== undefined && targets[0]?.selection === undefined)
+    throw new MargraveError(`source "${arg}" already installs all skills`);
+  return targets;
 }
 
 /**
@@ -735,8 +772,6 @@ function replaceSource(
   diff: { value?: ReturnType<typeof diffEntries> },
 ): (fresh: SourceRecord[], db: DatabaseSync) => SourceRecord[] {
   return (fresh, db) => {
-    // A `remove` that ran while this update waited for the lock makes this fire.
-    if (!fresh.some((s) => s.id === id)) throw new MargraveError(`no source "${id}"`);
     const before = skillHashes(db, id);
     deleteSourceSkills(db, id);
     insertSkills(db, entries);
@@ -745,20 +780,35 @@ function replaceSource(
   };
 }
 
-async function updateOne(id: string, ctx: Ctx, ref: string | null): Promise<UpdateResult> {
+async function updateOne(id: string, ctx: Ctx, ref: string | null, expansion?: string[]): Promise<UpdateResult> {
   // Re-read state so that several updates in a row see each other's writes.
   const sources = await readSources();
   const rec = sources.find((s) => s.id === id);
   // A `remove` that runs between updateSources() reading the list and this read makes this fire.
   if (rec === undefined) throw new MargraveError(`no source "${id}"`);
+  if (expansion !== undefined && rec.selection === undefined) throw new MargraveError(`source "${id}" already installs all skills`);
+  const selection = rec.selection === undefined ? undefined : [...new Set([...rec.selection, ...(expansion ?? [])])].sort();
   await checkIndex(sources);
-  const diff: { value?: ReturnType<typeof diffEntries> } = {};
+  if (rec.kind === "local") return updateLocal(rec, ctx, selection);
+  return updateGit(rec, ctx, ref, selection);
+}
 
-  if (rec.kind === "local") {
-    const entries = await scanLocal(rec, ctx);
-    await commit(replaceSource(id, entries, diff));
-    return { id, kind: "local", oldCommit: null, newCommit: null, ...(diff.value as ReturnType<typeof diffEntries>) };
-  }
+async function updateLocal(rec: SourceRecord, ctx: Ctx, selection?: string[]): Promise<UpdateResult> {
+  const id = rec.id;
+  const diff: { value?: ReturnType<typeof diffEntries> } = {};
+  const entries = await scanLocal({ ...rec, ...(selection === undefined ? {} : { selection }) }, ctx);
+  await commit((fresh, db) => {
+    const current = fresh.find((s) => s.id === id);
+    if (current === undefined) throw new MargraveError(`no source "${id}"`);
+    if (JSON.stringify(current) !== JSON.stringify(rec)) throw new MargraveError("source changed during update; run margrave update again");
+    return replaceSource(id, entries, diff)(fresh, db).map((s) => (s.id === id && selection !== undefined ? { ...s, selection } : s));
+  });
+  return { id, kind: "local", oldCommit: null, newCommit: null, ...(diff.value as ReturnType<typeof diffEntries>) };
+}
+
+async function updateGit(rec: SourceRecord, ctx: Ctx, ref: string | null, selection?: string[]): Promise<UpdateResult> {
+  const id = rec.id;
+  const diff: { value?: ReturnType<typeof diffEntries> } = {};
   // readSources() only returns a git record with a url.
   const url = rec.url as string;
 
@@ -773,6 +823,7 @@ async function updateOne(id: string, ctx: Ctx, ref: string | null): Promise<Upda
     const scanRoot = await realpath(await resolveScanRoot(realClone, rec.subpath));
     const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone, strict: true });
     logWarnings(ctx, scan.warnings);
+    const skills = selectSkills(id, scan, selection, true);
     if (scan.skills.length === 0) throw new MargraveError(`no valid skills found in the new revision of ${id}; kept the old copy`);
     // Compare against the accepted scan stored with the current snapshot.
     const acceptedScan = await scanWithRipwire(scanRoot, {
@@ -782,13 +833,8 @@ async function updateOne(id: string, ctx: Ctx, ref: string | null): Promise<Upda
       baseline: rec.scan ?? null,
       verifyContent: true,
     });
-    const checked = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone, strict: true });
-    if (
-      JSON.stringify(toEntries(id, checked.skills, (d) => path.relative(realClone, d))) !==
-      JSON.stringify(toEntries(id, scan.skills, (d) => path.relative(realClone, d)))
-    )
-      throw new MargraveError("staged skills changed during scan");
-    const { snapshot, entries } = await prepareSnapshot(id, sha, clone, realClone, scan.skills);
+    await verifyStagedScan(id, scanRoot, realClone, scan);
+    const { snapshot, entries } = await prepareSnapshot(id, sha, clone, realClone, skills);
     await commit((fresh, db) => {
       const current = fresh.find((s) => s.id === id);
       if (current === undefined) throw new MargraveError(`no source "${id}"`);
@@ -799,7 +845,11 @@ async function updateOne(id: string, ctx: Ctx, ref: string | null): Promise<Upda
       deleteSourceSkills(db, id);
       insertSkills(db, entries);
       diff.value = diffEntries(before, entries);
-      return fresh.map((s) => (s.id === id ? { ...s, commit: sha, snapshot, ref: selected, scan: acceptedScan } : s));
+      return fresh.map((s) =>
+        s.id === id
+          ? { ...s, commit: sha, snapshot, ref: selected, scan: acceptedScan, ...(selection === undefined ? {} : { selection }) }
+          : s,
+      );
     });
     return { id, kind: "git" as const, oldCommit: rec.commit, newCommit: sha, ...(diff.value as ReturnType<typeof diffEntries>) };
   });
@@ -813,7 +863,7 @@ async function scanLocal(rec: SourceRecord, ctx: Ctx): Promise<NewEntry[]> {
   });
   const scan = await scanSource(root, { followSymlinks: true, strict: true });
   logWarnings(ctx, scan.warnings);
-  return toEntries(rec.id, scan.skills, (d) => d);
+  return toEntries(rec.id, selectSkills(rec.id, scan, rec.selection, true), (d) => d);
 }
 
 export interface CheckResult {
@@ -905,7 +955,7 @@ async function scanInstalledSource(rec: SourceRecord, ctx: Ctx): Promise<NewEntr
   const root = await resolveScanRoot(dir, rec.subpath);
   const scan = await scanSource(root, { followSymlinks: false, boundary: dir, strict: true });
   logWarnings(ctx, scan.warnings);
-  return toEntries(rec.id, scan.skills, (d) => path.relative(dir, d));
+  return toEntries(rec.id, selectSkills(rec.id, scan, rec.selection, true), (d) => path.relative(dir, d));
 }
 
 async function scanInstalledSources(sources: readonly SourceRecord[], ctx: Ctx): Promise<ReindexScan> {
@@ -1010,7 +1060,17 @@ export async function migrateStore(): Promise<boolean> {
       if (legacy.version === SCHEMA_VERSION) return false;
       if (legacy.version !== 2 && legacy.version !== 3) throw new MargraveError(`${indexDbFile()} is not a supported margrave catalog`);
       version = legacy.version;
-      if (version === 3) sources = catalogSources(legacy.db);
+      if (version === 3) {
+        const records = legacy.db.prepare("SELECT id, record FROM sources").all() as { id: string; record: string }[];
+        for (const row of records) {
+          const record: unknown = JSON.parse(row.record);
+          if (typeof record === "object" && record !== null && Object.hasOwn(record, "selection"))
+            throw new MargraveError(
+              `cannot upgrade source "${row.id}" because its source record, index, or files disagree. Restore a known-good backup or recover the source from a verified lock`,
+            );
+        }
+        sources = catalogSources(legacy.db);
+      }
       rows = legacy.db
         .prepare("SELECT id, name, description, source, dir, hash AS revision, manifest, frontmatter FROM skills ORDER BY id")
         .all() as typeof rows;

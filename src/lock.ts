@@ -14,6 +14,7 @@ import {
   parseSpec,
   resolveScanRoot,
   scanInstalledSource,
+  selectSkills,
   syncSnapshot,
   toEntries,
 } from "./sources.ts";
@@ -28,6 +29,7 @@ import {
   insertSkills,
   isRecord,
   validScan,
+  validSelection,
   openCatalogReadOptional,
 } from "./store.ts";
 import type { NewEntry, SourceRecord } from "./store.ts";
@@ -44,9 +46,10 @@ export interface LockedSource {
   ref: string;
   commit: string;
   skills: LockedSkill[];
+  selection?: string[] | null;
 }
 export interface LockFile {
-  version: 1;
+  version: 1 | 2;
   sources: LockedSource[];
 }
 
@@ -83,8 +86,14 @@ export function checkLockUrl(value: string): void {
 }
 
 export function parseLock(value: unknown): LockFile {
-  if (!isRecord(value) || !keys(value, ["version", "sources"]) || value["version"] !== 1 || !Array.isArray(value["sources"]))
+  if (
+    !isRecord(value) ||
+    !keys(value, ["version", "sources"]) ||
+    (value["version"] !== 1 && value["version"] !== 2) ||
+    !Array.isArray(value["sources"])
+  )
     return malformed();
+  const version = value["version"];
   // Check every URL first so no identity error can expose credentials.
   for (const source of value["sources"])
     if (isRecord(source)) {
@@ -93,54 +102,9 @@ export function parseLock(value: unknown): LockFile {
     }
   const sources: LockedSource[] = [];
   const ids = new Set<string>();
-  for (const source of value["sources"]) {
-    if (!isRecord(source) || !keys(source, ["spec", "id", "url", "subpath", "ref", "commit", "skills"])) return malformed();
-    const { spec, id, url, subpath, ref, commit: lockedCommit, skills } = source;
-    if (
-      typeof spec !== "string" ||
-      typeof id !== "string" ||
-      typeof url !== "string" ||
-      typeof subpath !== "string" ||
-      typeof ref !== "string" ||
-      typeof lockedCommit !== "string" ||
-      !Array.isArray(skills) ||
-      !refValid(ref) ||
-      !commitHash(lockedCommit) ||
-      ids.has(id)
-    )
-      return malformed();
-    let parsed;
-    try {
-      parsed = parseSpec(spec);
-    } catch {
-      throw new MargraveError("lock source does not match its install spec");
-    }
-    if (parsed.kind !== "git" || parsed.id !== id || parsed.url !== url || parsed.subpath !== subpath)
-      throw new MargraveError("lock source does not match its install spec");
-    ids.add(id);
-    const entries: LockedSkill[] = [];
-    const skillIds = new Set<string>();
-    for (const skill of skills) {
-      if (
-        !isRecord(skill) ||
-        !keys(skill, ["id", "revision"]) ||
-        typeof skill["id"] !== "string" ||
-        !skill["id"].startsWith(`${id}/`) ||
-        skill["id"].slice(id.length + 1).includes("/") ||
-        skill["id"].length === id.length + 1 ||
-        typeof skill["revision"] !== "string" ||
-        !digest(skill["revision"]) ||
-        skillIds.has(skill["id"])
-      )
-        return malformed();
-      skillIds.add(skill["id"]);
-      entries.push({ id: skill["id"], revision: skill["revision"] });
-    }
-    entries.sort((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)));
-    sources.push({ spec, id, url, subpath, ref, commit: lockedCommit, skills: entries });
-  }
+  for (const source of value["sources"]) sources.push(parseLockedSource(source, version, ids));
   sources.sort((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)));
-  return { version: 1, sources };
+  return { version, sources };
 }
 
 export async function readLock(file: string): Promise<LockFile> {
@@ -155,6 +119,73 @@ export async function readLock(file: string): Promise<LockFile> {
 }
 
 // ---- lock export and restore ----
+
+function parseLockedSource(source: unknown, version: 1 | 2, ids: Set<string>): LockedSource {
+  if (
+    !isRecord(source) ||
+    !keys(source, ["spec", "id", "url", "subpath", "ref", "commit", "skills", ...(version === 2 ? ["selection"] : [])])
+  )
+    return malformed();
+  if (version === 2 && source["selection"] !== null && !validSelection(source["selection"])) return malformed();
+  const { spec, id, url, subpath, ref, commit: lockedCommit, skills } = source;
+  if (
+    typeof spec !== "string" ||
+    typeof id !== "string" ||
+    typeof url !== "string" ||
+    typeof subpath !== "string" ||
+    typeof ref !== "string" ||
+    typeof lockedCommit !== "string" ||
+    !Array.isArray(skills) ||
+    !refValid(ref) ||
+    !commitHash(lockedCommit) ||
+    ids.has(id)
+  )
+    return malformed();
+  let parsed;
+  try {
+    parsed = parseSpec(spec);
+  } catch {
+    throw new MargraveError("lock source does not match its install spec");
+  }
+  if (parsed.kind !== "git" || parsed.id !== id || parsed.url !== url || parsed.subpath !== subpath)
+    throw new MargraveError("lock source does not match its install spec");
+  ids.add(id);
+  const entries: LockedSkill[] = [];
+  const skillIds = new Set<string>();
+  for (const skill of skills) {
+    if (
+      !isRecord(skill) ||
+      !keys(skill, ["id", "revision"]) ||
+      typeof skill["id"] !== "string" ||
+      !skill["id"].startsWith(`${id}/`) ||
+      (version === 1 && skill["id"].slice(id.length + 1).includes("/")) ||
+      skill["id"].length === id.length + 1 ||
+      typeof skill["revision"] !== "string" ||
+      !digest(skill["revision"]) ||
+      skillIds.has(skill["id"])
+    )
+      return malformed();
+    skillIds.add(skill["id"]);
+    entries.push({ id: skill["id"], revision: skill["revision"] });
+  }
+  entries.sort((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)));
+  const selection = source["selection"] as string[] | null | undefined;
+  if (
+    Array.isArray(selection) &&
+    JSON.stringify(selection.map((name) => `${id}/${name}`).sort()) !== JSON.stringify(entries.map((entry) => entry.id))
+  )
+    return malformed();
+  return {
+    spec,
+    id,
+    url,
+    subpath,
+    ref,
+    commit: lockedCommit,
+    skills: entries,
+    ...(version === 2 ? { selection } : {}),
+  };
+}
 
 function lockInventory(entries: readonly { id: string; revision: string }[]): { id: string; revision: string }[] {
   return entries.map(({ id, revision }) => ({ id, revision })).sort((a, b) => Number(a.id > b.id) - Number(a.id < b.id));
@@ -172,7 +203,8 @@ function matchesLock(rec: SourceRecord, locked: LockedSource): boolean {
     rec.url === locked.url &&
     rec.subpath === locked.subpath &&
     rec.ref === locked.ref &&
-    rec.commit === locked.commit
+    rec.commit === locked.commit &&
+    JSON.stringify(rec.selection ?? null) === JSON.stringify(locked.selection ?? null)
   );
 }
 
@@ -199,7 +231,7 @@ async function verifyInstalled(rec: SourceRecord, locked: LockedSource, db: Data
 
 export async function exportLock(selected: string[]): Promise<LockFile> {
   const db = await openCatalogReadOptional();
-  if (db === null && selected.length === 0) return { version: 1, sources: [] };
+  if (db === null && selected.length === 0) return { version: 2, sources: [] };
   if (db === null) throw new MargraveError("--source must be an installed Git source ID");
   try {
     const sources = catalogSources(db);
@@ -217,7 +249,7 @@ export async function exportLock(selected: string[]): Promise<LockFile> {
       checkLockUrl(rec.spec);
       checkLockUrl(rec.url as string);
     }
-    if (targets.length === 0) return { version: 1, sources: [] };
+    if (targets.length === 0) return { version: 2, sources: [] };
     const locked: LockedSource[] = [];
     for (const rec of targets) {
       locked.push({
@@ -228,9 +260,10 @@ export async function exportLock(selected: string[]): Promise<LockFile> {
         ref: rec.ref as string,
         commit: rec.commit as string,
         skills: lockInventory(indexedEntries(db, rec.id)),
+        selection: rec.selection ?? null,
       });
     }
-    return parseLock({ version: 1, sources: locked });
+    return parseLock({ version: 2, sources: locked });
   } finally {
     db.close();
   }
@@ -254,34 +287,43 @@ async function readPending(source: LockedSource): Promise<PendingRestore | undef
   let pending: PendingRestore;
   try {
     const raw: unknown = JSON.parse(data);
-    if (!isRecord(raw) || !["record,source", "original,record,source"].includes(Object.keys(raw).sort().join(","))) throw new Error();
-    if (raw["original"] !== undefined && (typeof raw["original"] !== "string" || !/^[0-9a-f]{64}$/u.test(raw["original"])))
-      throw new Error();
-    const locked = parseLock({ version: 1, sources: [raw["source"]] }).sources[0];
-    const record = raw["record"] as SourceRecord;
-    if (
-      locked === undefined ||
-      locked.id !== source.id ||
-      typeof record !== "object" ||
-      record === null ||
-      ![
-        "commit,id,installedAt,kind,ref,snapshot,spec,subpath,url",
-        "commit,id,installedAt,kind,ref,scan,snapshot,spec,subpath,url",
-      ].includes(Object.keys(record).sort().join(",")) ||
-      (record.scan !== undefined && !validScan(record.scan)) ||
-      typeof record.installedAt !== "string" ||
-      typeof record.snapshot !== "string" ||
-      !new RegExp(`^${locked.commit}-[0-9a-f]{16}$`, "u").test(record.snapshot) ||
-      !matchesLock(record, locked)
-    )
-      throw new Error();
-    pending = { source: locked, record, ...(typeof raw["original"] === "string" ? { original: raw["original"] } : {}) };
+    pending = validatePending(raw, source);
   } catch {
     throw new MargraveError(`pending restore record is malformed: ${source.id}`);
   }
   if (JSON.stringify(source) !== JSON.stringify(pending.source))
     throw new MargraveError(`restore is pending for a different lock source: ${source.id}`);
   return pending;
+}
+
+function validatePending(raw: unknown, source: LockedSource): PendingRestore {
+  if (!isRecord(raw) || !["record,source", "original,record,source"].includes(Object.keys(raw).sort().join(","))) throw new Error();
+  if (raw["original"] !== undefined && (typeof raw["original"] !== "string" || !/^[0-9a-f]{64}$/u.test(raw["original"]))) throw new Error();
+  const locked = parseLock({
+    version: isRecord(raw["source"]) && Object.hasOwn(raw["source"], "selection") ? 2 : 1,
+    sources: [raw["source"]],
+  }).sources[0];
+  const record = raw["record"] as SourceRecord;
+  if (
+    locked === undefined ||
+    locked.id !== source.id ||
+    typeof record !== "object" ||
+    record === null ||
+    ![
+      "commit,id,installedAt,kind,ref,snapshot,spec,subpath,url",
+      "commit,id,installedAt,kind,ref,scan,snapshot,spec,subpath,url",
+      "commit,id,installedAt,kind,ref,scan,selection,snapshot,spec,subpath,url",
+      "commit,id,installedAt,kind,ref,selection,snapshot,spec,subpath,url",
+    ].includes(Object.keys(record).sort().join(",")) ||
+    (record.selection !== undefined && !validSelection(record.selection)) ||
+    (record.scan !== undefined && !validScan(record.scan)) ||
+    typeof record.installedAt !== "string" ||
+    typeof record.snapshot !== "string" ||
+    !new RegExp(`^${locked.commit}-[0-9a-f]{16}$`, "u").test(record.snapshot) ||
+    !matchesLock(record, locked)
+  )
+    throw new Error();
+  return { source: locked, record, ...(typeof raw["original"] === "string" ? { original: raw["original"] } : {}) };
 }
 
 async function scanLockedDirectory(
@@ -301,10 +343,13 @@ async function scanLockedDirectory(
     accepted = prior;
   } else accepted = await scanWithRipwire(root, { ...ctx, sourceId: source.id, skills: scan.skills, verifyContent: true });
   const checked = await scanSource(root, { followSymlinks: false, boundary: await realpath(dir), strict: true });
-  const entries = toEntries(source.id, scan.skills, (d) => d);
+  const entries = toEntries(source.id, selectSkills(source.id, scan, source.selection ?? undefined), (d) => d);
   if (accepted.tree !== null && (await scanInventory(root)) !== accepted.tree)
     throw new MargraveError(`installed source differs from the lock: ${source.id}`);
-  if (JSON.stringify(entries) !== JSON.stringify(toEntries(source.id, checked.skills, (d) => d)))
+  if (
+    JSON.stringify(toEntries(source.id, scan.skills, (d) => d)) !== JSON.stringify(toEntries(source.id, checked.skills, (d) => d)) ||
+    JSON.stringify(scan.duplicates) !== JSON.stringify(checked.duplicates)
+  )
     throw new MargraveError(`staged skills differ from the lock: ${source.id}`);
   if (!sameInventory(entries, source)) throw new MargraveError(`staged skills differ from the lock: ${source.id}`);
   return { entries, scan: accepted };
@@ -455,6 +500,7 @@ async function preflightSource(
     snapshot: `${source.commit}-${randomBytes(8).toString("hex")}`,
     installedAt: new Date().toISOString(),
     scan: staged.scan,
+    ...(source.selection == null ? {} : { selection: source.selection }),
   };
   return { ...staged, record, marker, verified: false, indexed: "" };
 }

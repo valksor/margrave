@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { searchSkills } from "../src/search.ts";
+import { formatSuggestions, searchSkills } from "../src/search.ts";
 import { handleHostedMcp } from "../src/hosted.ts";
 import { CLI, newEntry, runCli, seedIndex, tmp, writeCatalogRecords } from "./helpers.ts";
 
@@ -60,12 +60,17 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
   const missing = await searchSkills("unmatched & task", 2, false, true);
   assert.equal(missing.noSources, true);
   assert.deepEqual(missing.suggestions, [
-    { id: "Owner/Repo/one", source: "Owner/Repo", url: "https://skills.sh/Owner/Repo/one", installCommand: "margrave install Owner/Repo" },
+    {
+      id: "Owner/Repo/one",
+      source: "Owner/Repo",
+      url: "https://skills.sh/Owner/Repo/one",
+      installCommand: "margrave install Owner/Repo --skill one",
+    },
     {
       id: "other/project/two",
       source: "other/project",
       url: "https://skills.sh/other/project/two",
-      installCommand: "margrave install other/project",
+      installCommand: "margrave install other/project --skill two",
     },
   ]);
   assert.deepEqual(await readdir(home), []);
@@ -118,6 +123,39 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
     ["owner/repo/first"],
   );
   assert.deepEqual(requestedLimits, [25, 1]);
+  writeCatalogRecords(home, [{ ...sources[0], selection: ["first"] }]);
+  const partial = await searchSkills("nothing", 2, false, true);
+  assert.equal(partial.suggestions[0]?.id, "owner/repo/second");
+  assert.equal(partial.suggestions[0]?.installCommand, "margrave update visible --skill second");
+  assert.match(formatSuggestions(partial.suggestions), /Manual update: margrave update visible --skill second/u);
+  assert.match(formatSuggestions(partial.suggestions, true), /Ask the store operator to run the suggested command on this server\./u);
+  const privateSource = await searchSkills("nothing", 1, false, true, new Set());
+  assert.equal(privateSource.suggestions[0]?.installCommand, "margrave install owner/repo --skill first");
+  writeCatalogRecords(home, [
+    { ...sources[0], id: "a", selection: ["second"] },
+    { ...sources[0], id: "z", selection: ["first"] },
+  ]);
+  globalThis.fetch = () =>
+    Promise.resolve(
+      Response.json({
+        skills: [
+          { source: "owner/repo", skillId: "first" },
+          { source: "owner/repo", skillId: "second" },
+          { source: "owner/repo", skillId: "third" },
+        ],
+      }),
+    );
+  const combined = await searchSkills("nothing", 2, false, true);
+  assert.deepEqual(
+    combined.suggestions.map((item) => item.id),
+    ["owner/repo/third"],
+  );
+  assert.equal(combined.suggestions[0]?.installCommand, "margrave update a --skill third");
+  writeCatalogRecords(home, [
+    { ...sources[0], id: "z" },
+    { ...sources[0], id: "a", selection: ["second"] },
+  ]);
+  assert.deepEqual((await searchSkills("nothing", 2, false, true)).suggestions, []);
   globalThis.fetch = () => Promise.resolve(Response.json({ skills: [{ source: "other/project", skillId: "two" }] }));
   const weak = await searchSkills("repair toaster with docker", 2, true, true);
   assert.equal(weak.hits[0]?.recommended, false);

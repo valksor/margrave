@@ -23,8 +23,8 @@ import { formatSuggestions, searchSkills } from "./search.ts";
 
 const USAGE = `usage: margrave <command>
 
-  install <spec> [--ref R] [--allow-unsafe]   add a skill source (owner/repo[/sub/path], git URL, or local path)
-  update [source] [--ref R] [--allow-unsafe]  refresh one source, or all
+  install <spec> [--ref R] [--allow-unsafe] [--skill NAME ...]   add a skill source (owner/repo[/sub/path], git URL, or local path)
+  update [source] [--ref R] [--allow-unsafe] [--skill NAME ...]  refresh one source, or all
   check [source] [--json]                     check for updates and installed-file drift
   lock export [--source <id> ...]             export installed Git sources
   lock restore <file>                         restore locked Git sources
@@ -67,15 +67,27 @@ const json = (v: unknown): void => out(JSON.stringify(v, null, 2));
 
 const short = (sha: string | null): string => (sha === null ? "-" : sha.slice(0, 7));
 
+function selection(values: string[] | undefined): string[] | undefined {
+  if (values === undefined) return undefined;
+  const seen = new Set<string>();
+  for (const name of values) {
+    if (seen.has(name)) throw new UsageError(`skill "${name}" was selected more than once`);
+    if (name === "" || name.trim() !== name) throw new UsageError("invalid skill name");
+    seen.add(name);
+  }
+  return [...seen].sort();
+}
+
 async function updateCommand(rest: string[]): Promise<void> {
   const ctx = (allowUnsafe: boolean): Ctx => ({ log: err, allowUnsafe });
-  const p = parse(rest, { ref: { type: "string" }, "allow-unsafe": { type: "boolean" } });
+  const p = parse(rest, { ref: { type: "string" }, "allow-unsafe": { type: "boolean" }, skill: { type: "string", multiple: true } });
   if (p.values["ref"] !== undefined && p.positionals.length !== 1) throw new UsageError("update --ref requires one Git source");
   const [source] = positionals(p, 0, 1, "update [source]");
   const { results, errors } = await updateSources(
     source ?? null,
     ctx(p.values["allow-unsafe"] === true),
     typeof p.values["ref"] === "string" ? p.values["ref"] : null,
+    selection(p.values["skill"] as string[] | undefined),
   );
   for (const r of results) {
     out(r.kind === "git" ? `${clean(r.id)}: ${short(r.oldCommit)} → ${short(r.newCommit)}` : `${clean(r.id)}: reindexed`);
@@ -154,12 +166,13 @@ async function run(argv: string[]): Promise<void> {
       throw new UsageError("expected lock export or lock restore");
     }
     case "install": {
-      const p = parse(rest, { ref: { type: "string" }, "allow-unsafe": { type: "boolean" } });
+      const p = parse(rest, { ref: { type: "string" }, "allow-unsafe": { type: "boolean" }, skill: { type: "string", multiple: true } });
       const [spec] = positionals(p, 1, 1, "install <spec>");
       const r = await installSource(
         spec as string,
         typeof p.values["ref"] === "string" ? p.values["ref"] : null,
         ctx(p.values["allow-unsafe"] === true),
+        selection(p.values["skill"] as string[] | undefined),
       );
       out(`installed ${clean(r.id)} (${r.skills.length} skills)`);
       for (const s of r.skills) out(`  ${clean(s)}`);

@@ -33,6 +33,7 @@ export interface SourceRecord {
   /** Managed Git snapshot key. */
   snapshot?: string;
   scan?: ScanOutcome;
+  selection?: string[];
 }
 
 export interface IndexEntry {
@@ -113,6 +114,7 @@ function validSourceLocation(v: Record<string, unknown>): boolean {
 }
 
 function validSourceFields(v: Record<string, unknown>): boolean {
+  if (v["selection"] !== undefined && !validSelection(v["selection"])) return false;
   if (typeof v["id"] !== "string" || typeof v["spec"] !== "string") return false;
   if (v["kind"] !== "git" && v["kind"] !== "local") return false;
   if (typeof v["subpath"] !== "string") return false;
@@ -123,6 +125,14 @@ function validSourceFields(v: Record<string, unknown>): boolean {
   if (v["kind"] === "git")
     return typeof v["url"] === "string" && typeof v["ref"] === "string" && /^refs\/(?:heads|tags)\/.+/u.test(v["ref"]);
   return true;
+}
+
+export function validSelection(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((name, i) => typeof name === "string" && name !== "" && name.trim() === name && (i === 0 || value[i - 1] < name))
+  );
 }
 
 function validSource(v: unknown): v is SourceRecord {
@@ -183,7 +193,7 @@ export async function readLegacySources(): Promise<SourceRecord[]> {
   }
   if (Array.isArray(parsed)) {
     for (const record of parsed) {
-      if (isRecord(record) && typeof record["id"] === "string" && Object.hasOwn(record, "scan"))
+      if (isRecord(record) && typeof record["id"] === "string" && (Object.hasOwn(record, "scan") || Object.hasOwn(record, "selection")))
         throw new MargraveError(
           `cannot upgrade source "${record["id"]}" because its source record, index, or files disagree. Restore a known-good backup or recover the source from a verified lock`,
         );

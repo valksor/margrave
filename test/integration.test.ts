@@ -375,7 +375,7 @@ test("first lock restore retries after catalog publication fails", async () => {
   const from = await setup();
   const to = await setup();
   const repo = await makeRepo();
-  assert.equal((await mg(from, ["install", repo.url])).code, 0);
+  assert.equal((await mg(from, ["install", repo.url, "--skill", "react-perf"])).code, 0);
   const exported = await mg(from, ["lock", "export"]);
   assert.equal(exported.code, 0, exported.stderr);
   const dir = await tmp();
@@ -397,6 +397,42 @@ syncBuiltinESMExports();\n`,
   assert.equal(retried.code, 0, retried.stderr);
   const loaded = await mg(to, ["load", "react-perf"]);
   assert.equal(loaded.code, 0, loaded.stderr);
+});
+
+test("selective install expands and preserves the accepted revision when a skill disappears", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const missing = await mg(env, ["install", repo.url, "--skill", "missing-skill"]);
+  assert.match(missing.stderr, /skill "missing-skill" does not exist in source/u);
+  const duplicate = await mg(env, ["install", repo.url, "--skill", "react-perf", "--skill", "react-perf"]);
+  assert.match(duplicate.stderr, /skill "react-perf" was selected more than once/u);
+  const installed = await mg(env, ["install", repo.url, "--skill", "react-perf"]);
+  assert.equal(installed.code, 0, installed.stderr);
+  const id = sourceId(installed);
+  assert.deepEqual(indexIds(env.home), [`${id}/react-perf`]);
+  assert.match((await mg(env, ["update", "--skill", "postgres-tuning"])).stderr, /skill selection requires an explicit source ID/u);
+  assert.match(
+    (await mg(env, ["update", repo.url, "--skill", "postgres-tuning"])).stderr,
+    /skill selection requires an explicit source ID/u,
+  );
+  assert.match((await mg(env, ["update", id, "--skill", " react-perf"])).stderr, /invalid skill name/u);
+  const expanded = await mg(env, ["update", id, "--skill", "postgres-tuning"]);
+  assert.equal(expanded.code, 0, expanded.stderr);
+  assert.deepEqual(indexIds(env.home), [`${id}/postgres-tuning`, `${id}/react-perf`]);
+  assert.deepEqual(catalogRecords(env.home)[0]?.selection, ["postgres-tuning", "react-perf"]);
+  const before = await snapshot(env.home);
+  await rm(path.join(repo.dir, "skills", "postgres-tuning"), { recursive: true });
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-q", "-m", "remove skill");
+  const failed = await mg(env, ["update", id]);
+  assert.match(failed.stderr, /selected skill "postgres-tuning" is missing from the new revision\. The installed source is unchanged/u);
+  assert.deepEqual(await snapshot(env.home), before);
+  const ambiguousRepo = await makeRepo();
+  await writeSkill(path.join(ambiguousRepo.dir, "duplicate"), "react-perf", "another React skill");
+  await git(ambiguousRepo.dir, "add", "-A");
+  await git(ambiguousRepo.dir, "commit", "-q", "-m", "duplicate name");
+  const ambiguous = await mg(await setup(), ["install", ambiguousRepo.url, "--skill", "react-perf"]);
+  assert.match(ambiguous.stderr, /skill "react-perf" is ambiguous in source/u);
 });
 
 test("a verified pending lock repairs incomplete indexed rows", async () => {
@@ -922,6 +958,24 @@ test("schema 3 migration refuses changed local content without publication", asy
   assert.deepEqual(await readFile(path.join(env.home, "index.db")), before);
 });
 
+test("schema 3 migration rejects selection metadata", async () => {
+  const env = await setup();
+  const dir = await tmp();
+  await writeSkill(dir, "alpha", "Alpha skill");
+  const installed = await mg(env, ["install", dir]);
+  assert.equal(installed.code, 0, installed.stderr);
+  const records = catalogRecords(env.home);
+  records[0]!.selection = ["alpha"];
+  writeCatalogRecords(env.home, records);
+  const db = new DatabaseSync(path.join(env.home, "index.db"));
+  db.exec("PRAGMA user_version = 3");
+  db.close();
+  const before = await readFile(path.join(env.home, "index.db"));
+  const result = await mg(env, ["migrate"]);
+  assert.match(result.stderr, /cannot upgrade source/u);
+  assert.deepEqual(await readFile(path.join(env.home, "index.db")), before);
+});
+
 test("migration preserves a legacy local source with no indexed skills", async () => {
   const home = path.join(await tmp(), "store");
   const local = await tmp();
@@ -1206,7 +1260,7 @@ test("empty stores reject explicit source checks and export empty locks", async 
   assert.equal((await mg(env, ["reindex"])).code, 0);
   const exported = await mg(env, ["lock", "export"]);
   assert.equal(exported.code, 0, exported.stderr);
-  assert.deepEqual(JSON.parse(exported.stdout), { version: 1, sources: [] });
+  assert.deepEqual(JSON.parse(exported.stdout), { version: 2, sources: [] });
 });
 
 test("git source via file://: install, duplicate, find, load, update, remove", async () => {
@@ -2818,6 +2872,7 @@ test("lock restore rejects a competing pending marker without deleting its snaps
   const snapshotKey = `${source.commit}-0123456789abcdef`;
   const record = { ...source, kind: "git", snapshot: snapshotKey, installedAt: "2026-01-01T00:00:00.000Z" };
   delete (record as { skills?: unknown }).skills;
+  delete (record as { selection?: unknown }).selection;
   const marker = JSON.stringify({ source, record });
   const dir = await tmp();
   const file = path.join(dir, "lock.json");

@@ -33,6 +33,7 @@ export interface ManifestEntry {
 export interface ScanResult {
   skills: ScannedSkill[];
   warnings: string[];
+  duplicates: string[];
 }
 
 export interface ScanOptions {
@@ -128,6 +129,7 @@ interface ScanState {
   boundary: string;
   visited: Set<string>;
   names: Set<string>;
+  duplicates: Set<string>;
   skills: ScannedSkill[];
   warnings: string[];
 }
@@ -180,6 +182,7 @@ async function ingestSkill(state: ScanState, dir: string, skillMdIsSymlink: bool
     return;
   }
   if (state.names.has(parsed.skill.name)) {
+    state.duplicates.add(parsed.skill.name);
     state.warnings.push(`skipped ${file}: duplicate skill name "${parsed.skill.name}" in this source`);
     return;
   }
@@ -241,10 +244,11 @@ export async function scanSource(root: string, opts: ScanOptions): Promise<ScanR
     boundary: opts.boundary !== undefined ? await realpath(opts.boundary) : realRoot,
     visited: new Set(),
     names: new Set(),
+    duplicates: new Set(),
     skills: [],
     warnings: [],
   };
   await walkSource(state, root);
   state.skills.sort((a, b) => (a.name < b.name ? -1 : 1));
-  return { skills: state.skills, warnings: state.warnings };
+  return { skills: state.skills, warnings: state.warnings, duplicates: [...state.duplicates].sort() };
 }

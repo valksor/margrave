@@ -21,7 +21,7 @@ function installedRepo(record: SourceRecord): string | undefined {
   return `${match[1]}/${match[2]}`.toLowerCase();
 }
 
-async function catalog(task: string, limit: number, installed: Set<string>): Promise<Suggestion[]> {
+async function catalog(task: string, limit: number, installed: Map<string, SourceRecord[]>): Promise<Suggestion[]> {
   try {
     const query = new URLSearchParams({ q: task, limit: String(installed.size > 0 ? MAX_LIMIT : limit) });
     const response = await fetch(`https://skills.sh/api/search?${query}`, { signal: AbortSignal.timeout(2500), redirect: "error" });
@@ -42,10 +42,21 @@ async function catalog(task: string, limit: number, installed: Set<string>): Pro
       )
         continue;
       if (!component.test(row.skillId)) continue;
+      const skillName = row.skillId;
       const id = `${row.source}/${row.skillId}`;
-      if (seen.has(id.toLowerCase()) || installed.has(row.source.toLowerCase())) continue;
+      const existing = installed.get(row.source.toLowerCase()) ?? [];
+      if (seen.has(id.toLowerCase()) || existing.some((source) => source.selection === undefined || source.selection.includes(skillName)))
+        continue;
       seen.add(id.toLowerCase());
-      result.push({ id, source: row.source, url: `https://skills.sh/${id}`, installCommand: `margrave install ${row.source}` });
+      result.push({
+        id,
+        source: row.source,
+        url: `https://skills.sh/${id}`,
+        installCommand:
+          existing.length === 0
+            ? `margrave install ${row.source} --skill ${row.skillId}`
+            : `margrave update ${existing[0]!.id} --skill ${row.skillId}`,
+      });
       if (result.length === limit) break;
     }
     return result;
@@ -72,11 +83,11 @@ export async function searchSkills(
   }
   const noSources = ctx === null;
   if (!skillsSh || task.trim() === "" || hits.some((hit) => hit.recommended !== false)) return { hits, noSources, suggestions: [] };
-  const installed = new Set<string>();
-  for (const source of ctx?.sources ?? []) {
+  const installed = new Map<string, SourceRecord[]>();
+  for (const source of [...(ctx?.sources ?? [])].sort((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)))) {
     if (allowedSources !== undefined && !allowedSources.has(source.id)) continue;
     const repo = installedRepo(source);
-    if (repo !== undefined) installed.add(repo);
+    if (repo !== undefined) installed.set(repo, [...(installed.get(repo) ?? []), source]);
   }
   const suggestions = await catalog(task, clampLimit(limit), installed);
   return { hits, noSources, suggestions };
@@ -84,5 +95,9 @@ export async function searchSkills(
 
 export function formatSuggestions(suggestions: readonly Suggestion[], hosted = false): string {
   if (suggestions.length === 0) return "";
-  return `\n\nskills.sh suggestions\n${suggestions.map((s) => `  ${s.url}\n  Manual install: ${s.installCommand}`).join("\n")}${hosted ? "\nAsk the store operator to install a source on this server." : ""}`;
+  const hasUpdate = suggestions.some((s) => s.installCommand.startsWith("margrave update "));
+  const footer = hasUpdate
+    ? "Ask the store operator to run the suggested command on this server."
+    : "Ask the store operator to install a source on this server.";
+  return `\n\nskills.sh suggestions\n${suggestions.map((s) => `  ${s.url}\n  Manual ${s.installCommand.startsWith("margrave update ") ? "update" : "install"}: ${s.installCommand}`).join("\n")}${hosted ? `\n${footer}` : ""}`;
 }
