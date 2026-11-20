@@ -4,13 +4,12 @@ import { open, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import YAML from "yaml";
 import { buildFieldTokens } from "./bm25.ts";
-import { listFiles, readSkillFileBytes } from "./skill-files.ts";
+import { READ_NO_FOLLOW, listFiles, readSkillFileBytes } from "./skill-files.ts";
 import type { TokenStrings } from "./bm25.ts";
 
 const SKIP_DIRS = new Set(["node_modules"]);
 
 export { READ_NO_FOLLOW } from "./skill-files.ts";
-import { READ_NO_FOLLOW } from "./skill-files.ts";
 
 export interface ScannedSkill {
   name: string;
