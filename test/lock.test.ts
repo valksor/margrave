@@ -123,6 +123,68 @@ test("restore retains a malformed pending marker without publishing", async (t) 
   await assert.rejects(readFile(path.join(destination, "sources.json")), { code: "ENOENT" });
 });
 
+test("restore syncs an interrupted snapshot before retry publication", async (t) => {
+  const previousHome = process.env["MARGRAVE_HOME"];
+  const previousPath = process.env["PATH"];
+  process.env["MARGRAVE_HOME"] = await tmp("mg-home-");
+  process.env["PATH"] = `${await fakeRipwire()}:${previousPath ?? ""}`;
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    if (previousHome === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previousHome;
+    if (previousPath === undefined) delete process.env["PATH"];
+    else process.env["PATH"] = previousPath;
+  });
+  const repo = await makeRepo();
+  const ctx = { log: (): void => {}, allowUnsafe: false };
+  const { id } = await installSource(repo.url, null, ctx);
+  const lock = await exportLock([]);
+  const record = catalogRecords(process.env["MARGRAVE_HOME"])[0];
+  assert.ok(record?.snapshot);
+  const relativeFile = path.join("skills", "react-perf", "SKILL.md");
+  const bytes = await readFile(path.join(process.env["MARGRAVE_HOME"], "snapshots", id, record.snapshot, relativeFile));
+  const home = await tmp("mg-home-");
+  process.env["MARGRAVE_HOME"] = home;
+  const marker = path.join(home, "restore-pending", `${id}.json`);
+  const realOpen = fsp.open;
+  let interrupted = false;
+  let retrySynced = false;
+  let syncedFile = "";
+  mock.method(fsp, "open", (async (file: string, ...args: unknown[]) => {
+    const handle = await (realOpen as (...a: unknown[]) => ReturnType<typeof fsp.open>)(file, ...args);
+    if (typeof file === "string" && file.startsWith(path.join(home, "snapshots") + path.sep) && file.endsWith(relativeFile)) {
+      const sync = handle.sync.bind(handle);
+      mock.method(handle, "sync", async () => {
+        if (!interrupted) {
+          interrupted = true;
+          syncedFile = file;
+          throw new Error("snapshot sync interrupted");
+        }
+        assert.equal(file, syncedFile);
+        assert.deepEqual((await exportLock([])).sources, []);
+        await sync();
+        retrySynced = true;
+      });
+    }
+    return handle;
+  }) as typeof fsp.open);
+  syncBuiltinESMExports();
+  await assert.rejects(
+    restoreLock(lock, ctx, () => {}),
+    /snapshot sync interrupted/u,
+  );
+  assert.ok(interrupted);
+  assert.ok(existsSync(marker));
+  assert.deepEqual(await readFile(syncedFile), bytes);
+  assert.deepEqual((await exportLock([])).sources, []);
+  await restoreLock(lock, ctx, () => {});
+  assert.ok(retrySynced, "retry must sync the pending snapshot before publication");
+  assert.deepEqual(await readFile(syncedFile), bytes);
+  assert.deepEqual((await exportLock([])).sources, lock.sources);
+  assert.equal(existsSync(marker), false);
+});
+
 test("restore resumes a pending snapshot and rejects missing or non-directory destinations", async (t) => {
   const previousHome = process.env["MARGRAVE_HOME"];
   const previousPath = process.env["PATH"];

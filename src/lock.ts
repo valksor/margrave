@@ -548,8 +548,8 @@ async function publishSource(source: LockedSource, plan: RestorePlan): Promise<v
       )
         throw new MargraveError(`pending restore record is malformed: ${source.id}`);
       await rename(plan.dir as string, destination);
-      await syncSnapshot(destination);
     }
+    await syncSnapshot(destination);
     const entries = plan.entries.map((entry) => ({ ...entry, dir: path.relative(plan.dir as string, entry.dir) }));
     deleteSourceSkills(writer, source.id);
     insertSkills(writer, entries);
