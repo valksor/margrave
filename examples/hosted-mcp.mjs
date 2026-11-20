@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 
 const BODY_LIMIT = 256 * 1024;
+const BODY_TIMEOUT_MS = 10_000;
 const REQUEST_LIMIT = 60;
 const WINDOW_MS = 60_000;
 const CONCURRENCY_LIMIT = 8;
@@ -56,15 +57,20 @@ export function createHostedMcpApp({ principals, allowedHosts, allowedOrigins, h
       let size = 0;
       if (request.body !== null) {
         const reader = request.body.getReader();
+        const deadline = AbortSignal.timeout(BODY_TIMEOUT_MS);
+        const signal = AbortSignal.any([request.signal, deadline]);
         const abortBody = () => {
-          void reader.cancel(request.signal.reason).catch(() => {});
+          void reader.cancel(signal.reason).catch(() => {});
         };
-        request.signal.addEventListener("abort", abortBody, { once: true });
+        signal.addEventListener("abort", abortBody, { once: true });
         try {
-          if (request.signal.aborted) throw request.signal.reason;
+          if (signal.aborted) {
+            abortBody();
+            throw signal.reason;
+          }
           while (true) {
             const { done, value } = await reader.read();
-            if (request.signal.aborted) throw request.signal.reason;
+            if (signal.aborted) throw signal.reason;
             if (done) break;
             size += value.byteLength;
             if (size > BODY_LIMIT) {
@@ -74,8 +80,15 @@ export function createHostedMcpApp({ principals, allowedHosts, allowedOrigins, h
             }
             chunks.push(value);
           }
+        } catch (error) {
+          if (request.signal.aborted) throw request.signal.reason;
+          if (deadline.aborted) {
+            release();
+            return new Response("Request body timed out", { status: 408 });
+          }
+          throw error;
         } finally {
-          request.signal.removeEventListener("abort", abortBody);
+          signal.removeEventListener("abort", abortBody);
           reader.releaseLock();
         }
       }

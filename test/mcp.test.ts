@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp, { mkdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { createMcpHandler } from "@modelcontextprotocol/server";
+import { SUPPORTED_PROTOCOL_VERSIONS, createMcpHandler } from "@modelcontextprotocol/server";
 import { FIND_DESCRIPTION, LOAD_DESCRIPTION, READ_DESCRIPTION, SERVER_INSTRUCTIONS, createServer } from "../src/mcp.ts";
 import { CLI, fakeRipwire, newEntry, runCli, seedIndex, tmp, writeSkill } from "./helpers.ts";
 
@@ -358,25 +359,59 @@ test("stdio source allowlists scope search and both reads", async (t) => {
   }
 });
 
-test("stdio serves a client that opens with an older protocol revision", () => {
-  for (const protocolVersion of ["2025-11-25", "2025-06-18"]) {
-    const request = {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: { protocolVersion, capabilities: {}, clientInfo: { name: "test", version: "1" } },
+test("stdio serves a client that opens with an older protocol revision", { timeout: 30_000 }, async () => {
+  const home = await tmp("mg-home-");
+  const dir = await tmp("mg-legacy-");
+  const skill = await writeSkill(dir, "legacy-fixture", "Legacy fixture capability");
+  await writeFile(path.join(skill, "reference.txt"), "legacy reference\n");
+  const installed = await runCli(["install", dir], { home, fakeBin: await fakeRipwire() });
+  assert.equal(installed.code, 0, installed.stderr);
+  const id = `${/^installed (\S+)/u.exec(installed.stdout)?.[1] ?? ""}/legacy-fixture`;
+  for (const protocolVersion of SUPPORTED_PROTOCOL_VERSIONS) {
+    const child = spawn(process.execPath, [CLI, "mcp"], { env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home } });
+    const timeout = setTimeout(() => child.kill(), 10_000);
+    const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+    let nextId = 0;
+    const request = async (method: string, params: object) => {
+      const requestId = ++nextId;
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params })}\n`);
+      const line = await lines.next();
+      const response = JSON.parse(line.value ?? "") as {
+        id: number;
+        result?: {
+          protocolVersion?: string;
+          serverInfo?: { name: string };
+          tools?: { name: string }[];
+          isError?: boolean;
+          content?: { type: string; text: string }[];
+        };
+        error?: unknown;
+      };
+      assert.equal(response.id, requestId);
+      assert.equal(response.error, undefined);
+      return response.result;
     };
-    const result = spawnSync(process.execPath, [CLI, "mcp"], { input: `${JSON.stringify(request)}\n`, encoding: "utf8" });
-    assert.equal(result.status, 0, result.stderr);
-    const response = JSON.parse(result.stdout.split("\n")[0] ?? "") as {
-      id: number;
-      result?: { protocolVersion: string; serverInfo: { name: string } };
-      error?: unknown;
-    };
-    assert.equal(response.id, 1);
-    assert.equal(response.error, undefined);
-    assert.equal(response.result?.protocolVersion, protocolVersion);
-    assert.equal(response.result?.serverInfo.name, "margrave");
+    try {
+      const result = await request("initialize", { protocolVersion, capabilities: {}, clientInfo: { name: "test", version: "1" } });
+      assert.equal(result?.protocolVersion, protocolVersion);
+      assert.equal(result?.serverInfo?.name, "margrave");
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+      const tools = await request("tools/list", {});
+      assert.deepEqual(tools?.tools?.map((tool) => tool.name).sort(), ["find_skills", "load_skill", "read_skill_file"]);
+      for (const [name, args, expected] of [
+        ["find_skills", { task: "legacy fixture capability" }, id],
+        ["load_skill", { id }, "Body of legacy-fixture"],
+        ["read_skill_file", { id, path: "reference.txt" }, "legacy reference\n"],
+      ] as const) {
+        const tool = await request("tools/call", { name, arguments: args });
+        assert.notEqual(tool?.isError, true);
+        assert.ok(tool?.content?.some((item) => item.type === "text" && item.text.includes(expected)));
+      }
+    } finally {
+      clearTimeout(timeout);
+      child.stdin.end();
+      child.kill();
+    }
   }
 });
 

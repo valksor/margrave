@@ -4,7 +4,7 @@ import path from "node:path";
 import test, { mock } from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { createMcpHandler } from "@modelcontextprotocol/server";
+import { SUPPORTED_PROTOCOL_VERSIONS, createMcpHandler } from "@modelcontextprotocol/server";
 import { handleHostedMcp } from "../src/hosted.ts";
 import {
   FIND_DESCRIPTION,
@@ -531,33 +531,62 @@ test("hosted source options isolate requests on the same store", async (t) => {
   }
 });
 
-test("hosted serves a client that opens with an older protocol revision", async () => {
-  for (const protocolVersion of ["2025-11-25", "2025-06-18"]) {
-    const response = await handleHostedMcp(
-      new Request("http://test/mcp", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "initialize",
-          params: { protocolVersion, capabilities: {}, clientInfo: { name: "test", version: "1" } },
+test("hosted serves a client that opens with an older protocol revision", async (t) => {
+  const home = await useHome(t);
+  const dir = await tmp("mg-legacy-");
+  const skill = await writeSkill(dir, "legacy-fixture", "Legacy fixture capability");
+  await writeFile(path.join(skill, "reference.txt"), "legacy reference\n");
+  const installed = await runCli(["install", dir], { home, fakeBin: await fakeRipwire() });
+  assert.equal(installed.code, 0, installed.stderr);
+  const id = `${/^installed (\S+)/u.exec(installed.stdout)?.[1] ?? ""}/legacy-fixture`;
+  for (const protocolVersion of SUPPORTED_PROTOCOL_VERSIONS) {
+    let nextId = 0;
+    const request = async (method: string, params: object) => {
+      const requestId = ++nextId;
+      const response = await handleHostedMcp(
+        new Request("http://test/mcp", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            "MCP-Protocol-Version": protocolVersion,
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params }),
         }),
-      }),
-    );
-    assert.equal(response.status, 200);
-    const text = await response.text();
-    // A stateless 2025 answer may come as one server-sent event: take its data line.
-    const json = text.trimStart().startsWith("{") ? text : (text.split("\n").find((line) => line.startsWith("data: ")) ?? "").slice(6);
-    const body = JSON.parse(json) as {
-      id: number;
-      result?: { protocolVersion: string; serverInfo: { name: string } };
-      error?: unknown;
+      );
+      assert.equal(response.status, 200);
+      const text = await response.text();
+      // A stateless 2025 answer may come as one server-sent event: take its data line.
+      const json = text.trimStart().startsWith("{") ? text : (text.split("\n").find((line) => line.startsWith("data: ")) ?? "").slice(6);
+      const body = JSON.parse(json) as {
+        id: number;
+        result?: {
+          protocolVersion?: string;
+          serverInfo?: { name: string };
+          tools?: { name: string }[];
+          isError?: boolean;
+          content?: { type: string; text: string }[];
+        };
+        error?: unknown;
+      };
+      assert.equal(body.id, requestId);
+      assert.equal(body.error, undefined);
+      return body.result;
     };
-    assert.equal(body.id, 1);
-    assert.equal(body.error, undefined);
-    assert.equal(body.result?.protocolVersion, protocolVersion);
-    assert.equal(body.result?.serverInfo.name, "margrave");
+    const body = await request("initialize", { protocolVersion, capabilities: {}, clientInfo: { name: "test", version: "1" } });
+    assert.equal(body?.protocolVersion, protocolVersion);
+    assert.equal(body?.serverInfo?.name, "margrave");
+    const tools = await request("tools/list", {});
+    assert.deepEqual(tools?.tools?.map((tool) => tool.name).sort(), ["find_skills", "load_skill", "read_skill_file"]);
+    for (const [name, args, expected] of [
+      ["find_skills", { task: "legacy fixture capability" }, id],
+      ["load_skill", { id }, "Body of legacy-fixture"],
+      ["read_skill_file", { id, path: "reference.txt" }, "legacy reference\n"],
+    ] as const) {
+      const result = await request("tools/call", { name, arguments: args });
+      assert.notEqual(result?.isError, true);
+      assert.ok(result?.content?.some((item) => item.type === "text" && item.text.includes(expected)));
+    }
   }
 });
 
@@ -757,6 +786,56 @@ test("production integration retains admission through streamed responses", asyn
   assert.equal(await denied.text(), "Authentication required");
 });
 
+test("production integration times out an unfinished incoming body", async (t) => {
+  const { createHostedMcpApp } = await import(examplePath);
+  let deadline = new AbortController();
+  const timeout = t.mock.method(AbortSignal, "timeout", () => deadline.signal);
+  let calls = 0;
+  const app = createHostedMcpApp({
+    principals: [{ token: "dummy", allowedSources: [] }],
+    allowedHosts: ["test"],
+    allowedOrigins: [],
+    handle: () => {
+      calls++;
+      return Promise.resolve(new Response(null, { status: 204 }));
+    },
+  });
+  for (let i = 0; i < 8; i++) {
+    deadline = new AbortController();
+    let cancelled = false;
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"jsonrpc":"2.0"'));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const pending = app(
+      new Request("http://test/mcp", {
+        method: "POST",
+        headers: { host: "test", authorization: "Bearer dummy" },
+        body,
+        duplex: "half",
+      } as RequestInit),
+    );
+    assert.equal(timeout.mock.callCount(), i + 1);
+    assert.deepEqual(timeout.mock.calls[i]?.arguments, [10_000]);
+    deadline.abort(new DOMException("deadline", "TimeoutError"));
+    const response = await pending;
+    assert.equal(response.status, 408);
+    assert.equal(await response.text(), "Request body timed out");
+    assert.equal(cancelled, true);
+    assert.equal(calls, 0);
+  }
+  timeout.mock.restore();
+  const next = await app(
+    new Request("http://test/mcp", { method: "POST", headers: { host: "test", authorization: "Bearer dummy" }, body: "{}" }),
+  );
+  assert.equal(next.status, 204);
+  assert.equal(calls, 1);
+});
+
 test("production integration releases admission when an incoming body aborts", async () => {
   const { createHostedMcpApp } = await import(examplePath);
   let calls = 0;
@@ -792,6 +871,43 @@ test("production integration releases admission when an incoming body aborts", a
   const next = await app(new Request("http://test/mcp", { method: "POST", headers: { host: "test", authorization: "Bearer dummy" } }));
   assert.equal(next.status, 204);
   assert.equal(calls, 1);
+});
+
+test("production integration preserves client abort when the body deadline also fires", async (t) => {
+  const { createHostedMcpApp } = await import(examplePath);
+  const deadline = new AbortController();
+  t.mock.method(AbortSignal, "timeout", () => deadline.signal);
+  const client = new AbortController();
+  let cancelled = false;
+  let calls = 0;
+  const app = createHostedMcpApp({
+    principals: [{ token: "dummy", allowedSources: [] }],
+    allowedHosts: ["test"],
+    allowedOrigins: [],
+    handle: () => {
+      calls++;
+      return Promise.resolve(new Response(null, { status: 204 }));
+    },
+  });
+  const pending = app(
+    new Request("http://test/mcp", {
+      method: "POST",
+      headers: { host: "test", authorization: "Bearer dummy" },
+      body: new ReadableStream({
+        cancel() {
+          cancelled = true;
+        },
+      }),
+      signal: client.signal,
+      duplex: "half",
+    } as RequestInit),
+  );
+  deadline.abort(new DOMException("deadline", "TimeoutError"));
+  const reason = new Error("dummy abort");
+  client.abort(reason);
+  await assert.rejects(pending, (error: unknown) => error === reason);
+  assert.equal(cancelled, true);
+  assert.equal(calls, 0);
 });
 
 test("production integration releases admission after handler failure", async () => {
