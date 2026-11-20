@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { handleHostedMcp } from "../src/hosted.ts";
 import {
@@ -13,7 +15,7 @@ import {
   HOSTED_SERVER_ERROR,
   createServer,
 } from "../src/mcp.ts";
-import { fakeRipwire, git, leaveHotJournal, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
+import { CLI, ROOT, fakeRipwire, git, leaveHotJournal, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
 
 interface ToolText {
   isError: boolean;
@@ -69,6 +71,57 @@ async function useHome(t: { after: (fn: () => void) => void }): Promise<string> 
   });
   return home;
 }
+
+test("released v0.2.1 store remains usable after upgrade", async (t) => {
+  const home = await useHome(t);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  const source = "example.invalid__fixtures__margrave-upgrade";
+  const id = `${source}/release-upgrade`;
+  const body = "The installed upgrade skill survived.";
+  // Relocate the release index path through the copied source link.
+  const skillDir = await realpath(path.join(home, "sources", source, "release-upgrade"));
+  const db = new DatabaseSync(path.join(home, "index.db"));
+  try {
+    const result = db.prepare("UPDATE skills SET dir = ? WHERE id = ?").run(skillDir, id);
+    assert.equal(result.changes, 1);
+  } finally {
+    db.close();
+  }
+  const sources = await readFile(path.join(home, "sources.json"), "utf8");
+  const found = await runCli(["find", "release upgrade"], { home });
+  assert.equal(found.code, 0, found.stderr);
+  assert.ok(found.stdout.includes(id), found.stdout);
+  const loaded = await runCli(["load", id], { home });
+  assert.equal(loaded.code, 0, loaded.stderr);
+  assert.ok(loaded.stdout.includes(body), loaded.stdout);
+
+  const client = new Client({ name: "margrave-test", version: "0.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  t.after(() => client.close());
+  await client.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: [CLI, "mcp"],
+      env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home },
+    }),
+  );
+  const hosted = await connectHosted(t);
+  for (const mcp of [client, hosted]) {
+    const result = await call(mcp, "find_skills", { task: "release upgrade" });
+    assert.equal(result.isError, false, result.text);
+    assert.ok(result.text.includes(id), result.text);
+    const skill = await call(mcp, "load_skill", { id });
+    assert.equal(skill.isError, false, skill.text);
+    assert.ok(skill.text.includes(body), skill.text);
+  }
+  const reindex = await runCli(["reindex"], { home });
+  assert.equal(reindex.code, 0, reindex.stderr);
+  assert.match(reindex.stdout, /1 skills? from 1 sources?/u);
+  assert.equal(await readFile(path.join(home, "sources.json"), "utf8"), sources);
+  const after = await runCli(["load", id], { home });
+  assert.equal(after.code, 0, after.stderr);
+  assert.ok(after.stdout.includes(body), after.stdout);
+});
 
 test("hosted tools have the same names, input schemas, and instructions as the stdio server; only the two descriptions differ", async (t) => {
   await useHome(t);

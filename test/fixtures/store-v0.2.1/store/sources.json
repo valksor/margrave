@@ -1,0 +1,13 @@
+[
+  {
+    "id": "example.invalid__fixtures__margrave-upgrade",
+    "kind": "git",
+    "spec": "https://example.invalid/fixtures/margrave-upgrade.git",
+    "url": "https://example.invalid/fixtures/margrave-upgrade.git",
+    "subpath": "",
+    "ref": "refs/heads/master",
+    "commit": "29d8fef69168a981a9b40157a0ab717a15d348a4",
+    "snapshot": "29d8fef69168a981a9b40157a0ab717a15d348a4-7ca6d211a503c26c",
+    "installedAt": "2026-11-20T09:29:04.539Z"
+  }
+]

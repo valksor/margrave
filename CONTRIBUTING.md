@@ -75,6 +75,12 @@ Every push to `master` publishes a release. The first line of the commit message
 
 Only the first line counts. A token in the body of the message, such as in a squashed commit, does not change the bump. The release workflow commits the new version to `master` itself, so do not bump the version in `package.json` by hand.
 
+### Store compatibility
+
+A release must work with stores created by supported earlier releases. If a change makes their source records, index, or snapshots incompatible, ship a tested migration with the same release. Document how to back up the store, apply the migration, and roll back if it fails. Apply the migration before running the new CLI or restarting MCP servers. Preserve installed sources, pinned refs, snapshots, and skill content.
+
+Test the upgrade from a populated store created by the previous format. Keep that fixture in the release test suite for as long as the upgrade path is supported. Check that the CLI, local MCP server, and hosted MCP handler can find and load existing skills after the upgrade. A clean-install test alone does not cover an upgrade.
+
 ### macOS signing
 
 Releases sign the macOS `margrave` binary and ripwire in the `sign-macos` job and have Apple notarize them. A release fails until the signing setup below exists. `sign-macos` submits both binaries to Apple without waiting, and the release is published at once as a pre-release. The `Notarize release` workflow (`notarize.yml`) waits up to 6 hours for Apple's verdict on a hosted macOS runner. When Apple accepts, it makes the release a normal release. The promotion lets GitHub pick the latest release by creation date and version (`make_latest=legacy`), so a late promotion does not replace a newer latest release. Homebrew follows the latest release. If the check fails, the release stays a pre-release, and GitHub notifies whoever pushed the commit, under their notification settings. The log of the failed job says which case applies. On a timeout, re-run the failed jobs within 7 days. On a key or API error, fix the secrets, then re-run. On a rejection, read the notarytool log, fix the cause, and release again; delete the pre-release or leave it. The workflow also uses `release-signing`. Under `workflow_run`, the master-only branch rule of that environment does not apply, so the `if:` of the workflow is what keeps other branches and forks away from the API key. If the environment gets a required reviewer, every check waits for approval.
