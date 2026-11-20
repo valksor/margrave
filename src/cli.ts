@@ -30,7 +30,7 @@ const USAGE = `usage: margrave <command>
   lock restore <file>                         restore locked Git sources
   remove <source>                             remove a source (never deletes a local directory)
   list [--skills] [--json]                    list sources, and with --skills every skill
-  find "<task>" [--limit N] [--json] [--explain]  rank installed skills for a task
+  find "<task>" [--limit N] [--json] [--explain] [--catalog-query QUERY]  rank installed skills for a task
   load <id> [--json] [--revision <hash>]      print one skill
   load <id> --file <path> [--revision <hash>] print one file inside a skill directory
   reindex                                     rescan all sources
@@ -216,7 +216,12 @@ async function run(argv: string[]): Promise<void> {
       return;
     }
     case "find": {
-      const p = parse(rest, { limit: { type: "string" }, json: { type: "boolean" }, explain: { type: "boolean" } });
+      const p = parse(rest, {
+        limit: { type: "string" },
+        json: { type: "boolean" },
+        explain: { type: "boolean" },
+        "catalog-query": { type: "string" },
+      });
       const words = positionals(p, 1, Number.POSITIVE_INFINITY, 'find "<task>"');
       const task = words.join(" ");
       const { hits, noSources, suggestions } = await searchSkills(
@@ -224,6 +229,8 @@ async function run(argv: string[]): Promise<void> {
         p.values["limit"],
         p.values["explain"] === true,
         process.env["MARGRAVE_SKILLS_SH"] === "1",
+        undefined,
+        typeof p.values["catalog-query"] === "string" ? p.values["catalog-query"] : undefined,
       );
       if (p.values["json"] === true)
         json({

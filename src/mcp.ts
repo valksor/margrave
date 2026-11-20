@@ -184,14 +184,19 @@ function registerFind(server: McpServer, variant: Variant, allowedSources: Reado
       description:
         FIND_DESCRIPTION +
         (skillsSh
-          ? " On a local miss, this tool sends the task to skills.sh. Offer catalog suggestions to the user. Wait for an explicit request before installation."
+          ? " Supply catalogQuery with a short capability description to request public suggestions after a local miss. Do not include task details. Offer catalog suggestions to the user. Wait for an explicit request before installation."
           : ""),
-      inputSchema: z.object({ task: z.string(), limit: z.number().int().optional(), explain: z.boolean().optional() }),
+      inputSchema: z.object({
+        task: z.string(),
+        limit: z.number().int().optional(),
+        explain: z.boolean().optional(),
+        catalogQuery: z.string().optional(),
+      }),
       outputSchema: FIND_OUTPUT_SCHEMA,
     },
-    async ({ task, limit, explain }) => {
+    async ({ task, limit, explain, catalogQuery }) => {
       try {
-        const { hits, noSources, suggestions } = await searchSkills(task, limit, explain === true, skillsSh, allowedSources);
+        const { hits, noSources, suggestions } = await searchSkills(task, limit, explain === true, skillsSh, allowedSources, catalogQuery);
         return {
           ...ok(
             (noSources ? variant.noSources : formatFind(hits, variant.findText)) + formatSuggestions(suggestions, !variant.showHostPaths),

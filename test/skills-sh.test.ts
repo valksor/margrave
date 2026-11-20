@@ -28,7 +28,8 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
     const url = new URL(input);
     assert.equal(url.origin, "https://skills.sh");
     assert.equal(url.pathname, "/api/search");
-    assert.equal(url.searchParams.get("q"), "unmatched & task");
+    assert.equal(url.searchParams.get("q"), "terraform modules");
+    assert.ok(!input.includes("private-prompt-marker"));
     limits.push(url.searchParams.get("limit"));
     assert.equal(init?.redirect, "error");
     assert.ok(init?.signal instanceof AbortSignal);
@@ -54,10 +55,11 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
       }),
     );
   };
-  assert.deepEqual((await searchSkills("unmatched & task", 2, false, false)).suggestions, []);
-  assert.deepEqual((await searchSkills(" ", 2, false, true)).suggestions, []);
+  assert.deepEqual((await searchSkills("private-prompt-marker", 2, false, false, undefined, "terraform modules")).suggestions, []);
+  assert.deepEqual((await searchSkills("private-prompt-marker", 2, false, true, undefined, "  ")).suggestions, []);
+  assert.deepEqual((await searchSkills("private-prompt-marker", 2, false, true)).suggestions, []);
   assert.equal(calls, 0);
-  const missing = await searchSkills("unmatched & task", 2, false, true);
+  const missing = await searchSkills("private-prompt-marker", 2, false, true, undefined, "  terraform modules  ");
   assert.equal(missing.noSources, true);
   assert.deepEqual(missing.suggestions, [
     {
@@ -90,11 +92,13 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
   await seedIndex([newEntry("visible", "local", "unrelated subject", "docker")], [...sources]);
   const before = await readdir(home);
   const indexBytes = await readFile(path.join(home, "index.db"));
-  const scoped = await searchSkills("unmatched & task", 2, false, true, new Set());
+  const scoped = await searchSkills("private-prompt-marker", 2, false, true, new Set(), "terraform modules");
   assert.equal(scoped.suggestions[0]?.id, "Owner/Repo/one");
-  const visible = await searchSkills("unmatched & task", 2, false, true);
+  const visible = await searchSkills("private-prompt-marker", 2, false, true, undefined, "  terraform modules  ");
   assert.equal(visible.suggestions[0]?.id, "other/project/two");
   assert.deepEqual(limits, ["2", "2", "25"]);
+  assert.ok((await searchSkills("", 2, false, true, undefined, "terraform modules")).suggestions.length > 0);
+  assert.ok((await searchSkills("terraform modules", 2, false, true, undefined, "terraform modules")).suggestions.length > 0);
   assert.deepEqual(await readdir(home), before);
   assert.deepEqual(await readFile(path.join(home, "index.db")), indexBytes);
   const requestedLimits: number[] = [];
@@ -112,24 +116,24 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
       }),
     );
   };
-  const filtered = await searchSkills("nothing", 1, false, true);
+  const filtered = await searchSkills("nothing", 1, false, true, undefined, "terraform modules");
   assert.deepEqual(
     filtered.suggestions.map((item) => item.id),
     ["other/project/third"],
   );
-  const hidden = await searchSkills("nothing", 1, false, true, new Set());
+  const hidden = await searchSkills("nothing", 1, false, true, new Set(), "terraform modules");
   assert.deepEqual(
     hidden.suggestions.map((item) => item.id),
     ["owner/repo/first"],
   );
   assert.deepEqual(requestedLimits, [25, 1]);
   writeCatalogRecords(home, [{ ...sources[0], selection: ["first"] }]);
-  const partial = await searchSkills("nothing", 2, false, true);
+  const partial = await searchSkills("nothing", 2, false, true, undefined, "terraform modules");
   assert.equal(partial.suggestions[0]?.id, "owner/repo/second");
   assert.equal(partial.suggestions[0]?.installCommand, "margrave update visible --skill second");
   assert.match(formatSuggestions(partial.suggestions), /Manual update: margrave update visible --skill second/u);
   assert.match(formatSuggestions(partial.suggestions, true), /Ask the store operator to run the suggested command on this server\./u);
-  const privateSource = await searchSkills("nothing", 1, false, true, new Set());
+  const privateSource = await searchSkills("nothing", 1, false, true, new Set(), "terraform modules");
   assert.equal(privateSource.suggestions[0]?.installCommand, "margrave install owner/repo --skill first");
   writeCatalogRecords(home, [
     { ...sources[0], id: "a", selection: ["second"] },
@@ -145,7 +149,7 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
         ],
       }),
     );
-  const combined = await searchSkills("nothing", 2, false, true);
+  const combined = await searchSkills("nothing", 2, false, true, undefined, "terraform modules");
   assert.deepEqual(
     combined.suggestions.map((item) => item.id),
     ["owner/repo/third"],
@@ -155,9 +159,9 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
     { ...sources[0], id: "z" },
     { ...sources[0], id: "a", selection: ["second"] },
   ]);
-  assert.deepEqual((await searchSkills("nothing", 2, false, true)).suggestions, []);
+  assert.deepEqual((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions, []);
   globalThis.fetch = () => Promise.resolve(Response.json({ skills: [{ source: "other/project", skillId: "two" }] }));
-  const weak = await searchSkills("repair toaster with docker", 2, true, true);
+  const weak = await searchSkills("repair toaster with docker", 2, true, true, undefined, "terraform modules");
   assert.equal(weak.hits[0]?.recommended, false);
   assert.equal(weak.suggestions.length, 1);
   let unexpectedCalls = 0;
@@ -165,20 +169,20 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
     unexpectedCalls++;
     return Promise.reject(new Error("must not fetch"));
   };
-  const recommended = await searchSkills("local", 2, false, true);
+  const recommended = await searchSkills("local", 2, false, true, undefined, "terraform modules");
   assert.equal(recommended.hits[0]?.id, "visible/local");
   assert.deepEqual(recommended.suggestions, []);
   assert.equal(unexpectedCalls, 0);
   globalThis.fetch = () => Promise.resolve(Response.json({ skills: "invalid" }));
-  assert.deepEqual((await searchSkills("nothing", 2, false, true)).suggestions, []);
+  assert.deepEqual((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions, []);
   globalThis.fetch = () => Promise.resolve(Response.json(null));
-  assert.deepEqual((await searchSkills("nothing", 2, false, true)).suggestions, []);
+  assert.deepEqual((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions, []);
   globalThis.fetch = () => Promise.resolve(new Response("not json"));
-  assert.deepEqual((await searchSkills("nothing", 2, false, true)).suggestions, []);
+  assert.deepEqual((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions, []);
   globalThis.fetch = () => Promise.resolve(new Response(null, { status: 500 }));
-  assert.deepEqual((await searchSkills("nothing", 2, false, true)).suggestions, []);
+  assert.deepEqual((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions, []);
   globalThis.fetch = () => Promise.reject(new Error("offline"));
-  assert.deepEqual((await searchSkills("nothing", 2, false, true)).suggestions, []);
+  assert.deepEqual((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions, []);
   globalThis.fetch = () => Promise.resolve(Response.json({ skills: [{ source: "Owner/Repo", skillId: "one" }] }));
   for (const [spec, url, subpath, suppressed] of [
     ["git@github.com:OWNER/REPO.git", "git@github.com:OWNER/REPO.git", "", true],
@@ -200,7 +204,7 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
         installedAt: "now",
       },
     ]);
-    assert.equal((await searchSkills("nothing", 2, false, true)).suggestions.length, suppressed ? 0 : 1);
+    assert.equal((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions.length, suppressed ? 0 : 1);
   }
   const db = new DatabaseSync(path.join(home, "index.db"));
   db.prepare("UPDATE sources SET record = ?").run("invalid json");
@@ -209,7 +213,7 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
     unexpectedCalls++;
     return Promise.reject(new Error("must not fetch"));
   };
-  await assert.rejects(searchSkills("nothing", 2, false, true));
+  await assert.rejects(searchSkills("nothing", 2, false, true, undefined, "terraform modules"));
   assert.equal(unexpectedCalls, 0);
 });
 
@@ -219,7 +223,12 @@ test("CLI, stdio and hosted opt in through trusted configuration", async (t) => 
   const originalFetch = globalThis.fetch;
   process.env["MARGRAVE_HOME"] = home;
   const preload = path.join(home, "fetch.mjs");
-  await writeFile(preload, 'globalThis.fetch = async () => Response.json({ skills: [{ source: "owner/repo", skillId: "skill" }] });\n');
+  const fetchLog = path.join(home, "fetch.log");
+  await writeFile(fetchLog, "");
+  await writeFile(
+    preload,
+    `import { appendFileSync } from "node:fs"; globalThis.fetch = async (input) => { appendFileSync(${JSON.stringify(fetchLog)}, "fetch\\n"); if (new URL(input).searchParams.get("q") !== "terraform modules") throw new Error("wrong query"); return Response.json({ skills: [{ source: "owner/repo", skillId: "skill" }] }); };\n`,
+  );
   t.after(async () => {
     globalThis.fetch = originalFetch;
     if (previous === undefined) delete process.env["MARGRAVE_HOME"];
@@ -228,12 +237,29 @@ test("CLI, stdio and hosted opt in through trusted configuration", async (t) => 
   });
   const extra = { MARGRAVE_SKILLS_SH: "1" };
   const nodeArgs = ["--import", preload];
-  const enabled = await runCli(["find", "task", "--json"], { home, extra, nodeArgs });
+  const enabled = await runCli(["find", "private-prompt-marker", "--json", "--catalog-query", "terraform modules"], {
+    home,
+    extra,
+    nodeArgs,
+  });
   assert.equal(enabled.code, 0, enabled.stderr);
+  assert.equal((JSON.parse(enabled.stdout) as { task: string }).task, "private-prompt-marker");
   assert.equal((JSON.parse(enabled.stdout) as { suggestions: { id: string }[] }).suggestions[0]?.id, "owner/repo/skill");
-  const disabled = await runCli(["find", "task", "--json"], { home, extra: { MARGRAVE_SKILLS_SH: "0" }, nodeArgs });
+  const disabled = await runCli(["find", "private-prompt-marker", "--json", "--catalog-query", "terraform modules"], {
+    home,
+    extra: { MARGRAVE_SKILLS_SH: "0" },
+    nodeArgs,
+  });
   assert.equal("suggestions" in (JSON.parse(disabled.stdout) as object), false);
-  const text = await runCli(["find", "task"], { home, extra, nodeArgs });
+  for (const args of [
+    ["find", "private-prompt-marker", "--json"],
+    ["find", "private-prompt-marker", "--json", "--catalog-query", "  "],
+  ]) {
+    const result = await runCli(args, { home, extra, nodeArgs });
+    assert.equal("suggestions" in (JSON.parse(result.stdout) as object), false);
+  }
+  assert.equal(await readFile(fetchLog, "utf8"), "fetch\n");
+  const text = await runCli(["find", "private-prompt-marker", "--catalog-query", "terraform modules"], { home, extra, nodeArgs });
   assert.match(
     text.stdout,
     /skills\.sh suggestions\n  https:\/\/skills\.sh\/owner\/repo\/skill\n  Manual install: margrave install owner\/repo/u,
@@ -249,14 +275,25 @@ test("CLI, stdio and hosted opt in through trusted configuration", async (t) => 
   try {
     const tools = await client.listTools();
     assert.match(tools.tools.find((tool) => tool.name === "find_skills")?.description ?? "", /Wait for an explicit request/u);
-    const result = await client.callTool({ name: "find_skills", arguments: { task: "task" } });
+    for (const catalogQuery of [undefined, "  "]) {
+      const local = await client.callTool({ name: "find_skills", arguments: { task: "private-prompt-marker", catalogQuery } });
+      assert.deepEqual((local.structuredContent as { suggestions: unknown[] }).suggestions, []);
+    }
+    assert.equal(await readFile(fetchLog, "utf8"), "fetch\nfetch\n");
+    const result = await client.callTool({
+      name: "find_skills",
+      arguments: { task: "private-prompt-marker", catalogQuery: "terraform modules" },
+    });
     assert.match(JSON.stringify(result.content), /skills\.sh suggestions/u);
   } finally {
     await client.close();
   }
   let calls = 0;
-  globalThis.fetch = () => {
+  globalThis.fetch = (input) => {
     calls++;
+    assert.ok(typeof input === "string");
+    assert.equal(new URL(input).searchParams.get("q"), "terraform modules");
+    assert.ok(!input.includes("private-prompt-marker"));
     return Promise.resolve(Response.json({ skills: [{ source: "owner/repo", skillId: "skill" }] }));
   };
   for (const enabledHosted of [false, true]) {
@@ -271,7 +308,15 @@ test("CLI, stdio and hosted opt in through trusted configuration", async (t) => 
       }),
     );
     try {
-      const result = await hosted.callTool({ name: "find_skills", arguments: { task: "task", skillsSh: true } });
+      for (const catalogQuery of [undefined, "  "]) {
+        const local = await hosted.callTool({ name: "find_skills", arguments: { task: "private-prompt-marker", catalogQuery } });
+        assert.deepEqual((local.structuredContent as { suggestions: unknown[] }).suggestions, []);
+        assert.equal(calls, 0);
+      }
+      const result = await hosted.callTool({
+        name: "find_skills",
+        arguments: { task: "private-prompt-marker", catalogQuery: "terraform modules", skillsSh: true },
+      });
       const output = JSON.stringify(result.content);
       assert.equal(output.includes("skills.sh suggestions"), enabledHosted);
       if (enabledHosted) assert.match(output, /Ask the store operator to install a source on this server\./u);

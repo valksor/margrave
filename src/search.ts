@@ -31,9 +31,9 @@ function installedRepo(record: SourceRecord): string | undefined {
   return `${match[1]}/${match[2]}`.toLowerCase();
 }
 
-async function catalog(task: string, limit: number, installed: Map<string, SourceRecord[]>): Promise<Suggestion[]> {
+async function catalog(catalogQuery: string, limit: number, installed: Map<string, SourceRecord[]>): Promise<Suggestion[]> {
   try {
-    const query = new URLSearchParams({ q: task, limit: String(installed.size > 0 ? MAX_LIMIT : limit) });
+    const query = new URLSearchParams({ q: catalogQuery, limit: String(installed.size > 0 ? MAX_LIMIT : limit) });
     const response = await fetch(`https://skills.sh/api/search?${query}`, { signal: AbortSignal.timeout(2500), redirect: "error" });
     if (!response.ok) return [];
     const body: unknown = await response.json();
@@ -103,6 +103,7 @@ export async function searchSkills(
   explain: boolean,
   skillsSh: boolean,
   allowedSources?: ReadonlySet<string>,
+  catalogQuery?: string,
 ): Promise<{ hits: Recommendation[]; noSources: boolean; suggestions: Suggestion[] }> {
   const ctx = await loadContext();
   let hits: Recommendation[] = [];
@@ -114,14 +115,15 @@ export async function searchSkills(
     }
   }
   const noSources = ctx === null;
-  if (!skillsSh || task.trim() === "" || hits.some((hit) => hit.recommended !== false)) return { hits, noSources, suggestions: [] };
+  const publicQuery = catalogQuery?.trim();
+  if (!skillsSh || !publicQuery || hits.some((hit) => hit.recommended !== false)) return { hits, noSources, suggestions: [] };
   const installed = new Map<string, SourceRecord[]>();
   for (const source of [...(ctx?.sources ?? [])].sort((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)))) {
     if (allowedSources !== undefined && !allowedSources.has(source.id)) continue;
     const repo = installedRepo(source);
     if (repo !== undefined) installed.set(repo, [...(installed.get(repo) ?? []), source]);
   }
-  const suggestions = await catalog(task, clampLimit(limit), installed);
+  const suggestions = await catalog(publicQuery, clampLimit(limit), installed);
   return { hits, noSources, suggestions };
 }
 
