@@ -293,6 +293,10 @@ margrave does no auth, TLS, CORS, Host/Origin checks, or rate limiting. The host
 
 Example (Node, `node:http`):
 
+The quick-start listener accepts connections on loopback. The [production integration example](examples/hosted-mcp.mjs) is designed for a private listener behind TLS termination. It authenticates each caller, selects the caller's allowed sources, and limits request sizes, rates, and concurrency before it calls MCP. Configure the proxy and the example with the exact public Host and allowed browser origins. Hosted skill reads accept files up to 1 MiB.
+
+Pass `handleHostedMcp` as the example's `handle` option. Supply bearer tokens from the host secret store and map each token to its allowed source IDs.
+
 ```ts
 import { createServer } from "node:http";
 import { handleHostedMcp } from "margrave/hosted";
@@ -319,7 +323,7 @@ createServer(async (incoming, outgoing) => {
     if (!outgoing.headersSent) outgoing.writeHead(500);
     outgoing.end();
   }
-}).listen(8080);
+}).listen(8080, "127.0.0.1");
 ```
 
 ## Ranking

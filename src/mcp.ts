@@ -51,6 +51,7 @@ export interface Variant {
   /** undefined = the formatFind default. */
   findText: FindText | undefined;
   showHostPaths: boolean;
+  readLimit?: number;
   fail: (err: unknown) => ToolResult;
 }
 
@@ -70,6 +71,7 @@ export const HOSTED: Variant = {
   noSources: HOSTED_NO_SOURCES_MESSAGE,
   findText: { loadHint: (id) => `load: call load_skill with id ${id}`, noMatch: "no match\ntry other words" },
   showHostPaths: false,
+  readLimit: 1024 * 1024,
   fail: (err) => {
     if (err instanceof RequestError) return fail(err);
     console.error(err);
@@ -105,13 +107,18 @@ function resolveEntry(
   }
 }
 
-async function loadForMcp(ctx: Context, selected: ReturnType<typeof resolveEntry>, showHostPaths: boolean): Promise<string> {
-  const result = await loadSkill(selected.entry, ctx.sources, selected.revision, selected.gitDrift);
+async function loadForMcp(
+  ctx: Context,
+  selected: ReturnType<typeof resolveEntry>,
+  showHostPaths: boolean,
+  limit?: number,
+): Promise<string> {
+  const result = await loadSkill(selected.entry, ctx.sources, selected.revision, selected.gitDrift, limit);
   return formatLoad(result, { hostPaths: showHostPaths });
 }
 
-function readForMcp(selected: ReturnType<typeof resolveEntry>, file: string): Promise<string> {
-  return readSelectedFile(selected.entry, file, selected.revision, selected.gitDrift);
+function readForMcp(selected: ReturnType<typeof resolveEntry>, file: string, limit?: number): Promise<string> {
+  return readSelectedFile(selected.entry, file, selected.revision, selected.gitDrift, limit);
 }
 
 export interface ServerOptions {
@@ -176,7 +183,7 @@ function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | und
         if (ctx === null)
           return variant.fail(new RequestError(revision === undefined ? variant.noSources : "skill revision changed; search again"));
         const selected = resolveEntry(ctx, id, revision, allowedSources);
-        return ok(await loadForMcp(ctx, selected, variant.showHostPaths));
+        return ok(await loadForMcp(ctx, selected, variant.showHostPaths, variant.readLimit));
       } catch (err) {
         return variant.fail(err);
       }
@@ -193,7 +200,7 @@ function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | und
         if (ctx === null)
           return variant.fail(new RequestError(revision === undefined ? variant.noSources : "skill revision changed; search again"));
         const selected = resolveEntry(ctx, id, revision, allowedSources);
-        return ok(await readForMcp(selected, path));
+        return ok(await readForMcp(selected, path, variant.readLimit));
       } catch (err) {
         return variant.fail(err);
       }

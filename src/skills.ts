@@ -7,7 +7,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { FIELDS, FIELD_WEIGHTS, NAME_BONUS, clampLimit, hasRecommendationEvidence, queryTerms } from "./bm25.ts";
 import type { Field, MatchedTerms } from "./bm25.ts";
 import { splitSkillMd } from "./scan.ts";
-import { listFiles, readSkillFile, readSkillFileBytes } from "./skill-files.ts";
+import { HostedSizeError, listFiles, readSkillFile, readSkillFileBytes } from "./skill-files.ts";
 import type { ManifestEntry } from "./scan.ts";
 import { clean, cleanBlock, shellQuote } from "./text.ts";
 export { listFiles, readSkillFile } from "./skill-files.ts";
@@ -243,16 +243,22 @@ function gitDriftMessage(surface: "cli" | "mcp"): string {
     : "skill files differ from the accepted revision. Ask the store operator to restore a verified copy";
 }
 
-export async function readSelectedFile(entry: IndexEntry, rel: string, revision?: string, gitDrift?: "cli" | "mcp"): Promise<string> {
-  if (revision === undefined) return readSkillFile(entry.dir, rel);
+export async function readSelectedFileBytes(
+  entry: IndexEntry,
+  rel: string,
+  revision: string,
+  gitDrift?: "cli" | "mcp",
+  limit?: number,
+): Promise<Buffer> {
   validateRevision(revision);
   if (entry.revision !== revision) throw new RequestError("skill revision changed; search again");
   const item = (JSON.parse(entry.manifest) as ManifestEntry[]).find((f) => f.path === rel);
   if (item === undefined) throw new RequestError("file is not in the selected skill revision");
   let bytes: Buffer | undefined;
   try {
-    bytes = await readSkillFileBytes(entry.dir, rel, true);
+    bytes = await readSkillFileBytes(entry.dir, rel, true, false, limit);
   } catch (err) {
+    if (err instanceof HostedSizeError) throw err;
     const code = (err as NodeJS.ErrnoException).code;
     if (!(err instanceof RequestError) && code !== "ENOENT" && code !== "ENOTDIR") throw err;
   }
@@ -262,7 +268,18 @@ export async function readSelectedFile(entry: IndexEntry, rel: string, revision?
     if (gitDrift !== undefined) throw new RequestError(gitDriftMessage(gitDrift));
     throw new RequestError("skill files changed since indexing; ask the store operator to run margrave reindex, then search again");
   }
-  return bytes.toString("utf8");
+  return bytes;
+}
+
+export async function readSelectedFile(
+  entry: IndexEntry,
+  rel: string,
+  revision?: string,
+  gitDrift?: "cli" | "mcp",
+  limit?: number,
+): Promise<string> {
+  if (revision === undefined) return readSkillFile(entry.dir, rel);
+  return (await readSelectedFileBytes(entry, rel, revision, gitDrift, limit)).toString("utf8");
 }
 
 export async function loadSkill(
@@ -270,10 +287,11 @@ export async function loadSkill(
   sources: readonly SourceRecord[],
   revision?: string,
   gitDrift?: "cli" | "mcp",
+  limit?: number,
 ): Promise<LoadResult> {
   const st = revision === undefined ? await lstat(entry.dir).catch(() => null) : true;
   if (st === null) throw new MargraveError(`skill directory ${clean(entry.dir)} is gone; run: margrave reindex`);
-  const text = await readSelectedFile(entry, "SKILL.md", revision, gitDrift);
+  const text = await readSelectedFile(entry, "SKILL.md", revision, gitDrift, limit);
   const { rawFrontmatter, body } = splitSkillMd(text);
   const src = sources.find((s) => s.id === entry.source);
   const snapshotRoot = path.join(home(), "snapshots", entry.source);

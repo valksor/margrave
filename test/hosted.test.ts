@@ -16,6 +16,8 @@ import {
 } from "../src/mcp.ts";
 import { CLI, ROOT, catalogRecords, fakeRipwire, git, leaveHotJournal, makeRepo, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
 
+const examplePath = "../examples/hosted-mcp.mjs";
+
 interface ToolText {
   isError: boolean;
   text: string;
@@ -549,4 +551,255 @@ test("hosted serves a client that opens with an older protocol revision", async 
     assert.equal(body.result?.protocolVersion, protocolVersion);
     assert.equal(body.result?.serverInfo.name, "margrave");
   }
+});
+
+test("production integration admits authenticated requests and enforces limits", async () => {
+  const { createHostedMcpApp } = await import(examplePath);
+  let calls = 0;
+  let clock = 0;
+  const releases: (() => void)[] = [];
+  let hold = false;
+  const app = createHostedMcpApp({
+    principals: [
+      { token: "dummy-one", allowedSources: ["one"] },
+      { token: "dummy-two", allowedSources: ["two"] },
+    ],
+    allowedHosts: ["example.test"],
+    allowedOrigins: ["https://browser.test"],
+    now: () => clock,
+    handle: async (_request: Request, options: { allowedSources: string[] }) => {
+      calls++;
+      if (hold)
+        await new Promise<void>((resolve) => {
+          releases.push(resolve);
+        });
+      return Response.json(options);
+    },
+  });
+  const request = (headers: Record<string, string> = {}, body = "{}") =>
+    new Request("http://private/mcp", {
+      method: "POST",
+      headers: { host: "example.test", authorization: "Bearer dummy-one", ...headers },
+      body,
+    });
+  assert.deepEqual(await (await app(request())).json(), { allowedSources: ["one"] });
+  assert.deepEqual(await (await app(request({ authorization: "Bearer dummy-two", origin: "https://browser.test" }))).json(), {
+    allowedSources: ["two"],
+  });
+  for (const [headers, status, message] of [
+    [{ authorization: "Bearer wrong" }, 401, "Authentication required"],
+    [{ host: "bad.test" }, 403, "Request origin is not allowed"],
+    [{ origin: "https://bad.test" }, 403, "Request origin is not allowed"],
+    [{ "content-length": "262145" }, 413, "Request body is too large"],
+  ] as const) {
+    const response = await app(request(headers));
+    assert.equal(response.status, status);
+    assert.equal(await response.text(), message);
+  }
+  assert.equal((await app(request({}, "x".repeat(262145)))).status, 413);
+  assert.equal(calls, 2);
+  const exact = await app(request({}, "x".repeat(262144)));
+  assert.equal(exact.status, 200);
+  await exact.arrayBuffer();
+  hold = true;
+  const pending = Array.from({ length: 8 }, () => app(request()));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((await app(request())).status, 503);
+  hold = false;
+  for (const release of releases) release();
+  for (const response of await Promise.all(pending)) await response.arrayBuffer();
+  const after = await app(request());
+  assert.equal(after.status, 200);
+  await after.arrayBuffer();
+  clock = 60_001;
+  for (let i = 0; i < 60; i++) {
+    const response = await app(request());
+    assert.equal(response.status, 200);
+    await response.arrayBuffer();
+  }
+  const throttled = await app(request());
+  assert.equal(throttled.status, 429);
+  assert.equal(await throttled.text(), "Request limit reached");
+  const other = await app(request({ authorization: "Bearer dummy-two" }));
+  assert.equal(other.status, 200);
+  await other.arrayBuffer();
+  clock += 60_001;
+  const renewed = await app(request());
+  assert.equal(renewed.status, 200);
+  await renewed.arrayBuffer();
+});
+
+test("production integration passes authenticated source scope to hosted MCP", async (t) => {
+  const { createHostedMcpApp } = await import(examplePath);
+  const home = await useHome(t);
+  const fakeBin = await fakeRipwire();
+  const ids: string[] = [];
+  for (let i = 0; i < 2; i++) {
+    const dir = await tmp("mg-example-scope-");
+    await writeSkill(dir, "shared", "Shared terraform modules");
+    const installed = await runCli(["install", dir], { home, fakeBin });
+    assert.equal(installed.code, 0, installed.stderr);
+    ids.push(/^installed (\S+)/u.exec(installed.stdout)?.[1] ?? "");
+  }
+  const app = createHostedMcpApp({
+    principals: [{ token: "dummy", allowedSources: [ids[0]] }],
+    allowedHosts: ["test"],
+    allowedOrigins: [],
+    handle: handleHostedMcp,
+  });
+  const client = new Client({ name: "test", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL("http://test/mcp"), {
+      fetch: (url, init) => {
+        const headers = new Headers(init?.headers);
+        headers.set("host", "test");
+        headers.set("authorization", "Bearer dummy");
+        return app(new Request(url, { ...init, headers }));
+      },
+    }),
+  );
+  t.after(() => client.close());
+  assert.equal((await call(client, "load_skill", { id: `${ids[0]}/shared`, allowedSources: ids })).isError, false);
+  assert.equal((await call(client, "load_skill", { id: `${ids[1]}/shared`, allowedSources: ids })).isError, true);
+});
+
+test("hosted file reads enforce the limit and detect growth after stat", async (t) => {
+  const { open, appendFile } = await import("node:fs/promises");
+  const { readSkillFileBytes } = await import("../src/skill-files.ts");
+  const home = await useHome(t);
+  const dir = await tmp("mg-hosted-limit-");
+  const skill = await writeSkill(dir, "large", "Large skill fixture");
+  const limit = 1024 * 1024;
+  await writeFile(path.join(skill, "exact.txt"), Buffer.alloc(limit, 120));
+  await writeFile(path.join(skill, "large.txt"), Buffer.alloc(limit + 1, 120));
+  const installed = await runCli(["install", dir], { home, fakeBin: await fakeRipwire() });
+  assert.equal(installed.code, 0, installed.stderr);
+  const id = `${/^installed (\S+)/u.exec(installed.stdout)?.[1] ?? ""}/large`;
+  const client = await connectHosted(t);
+  assert.equal((await call(client, "read_skill_file", { id, path: "exact.txt" })).text.length, limit);
+  assert.deepEqual(await call(client, "read_skill_file", { id, path: "large.txt" }), {
+    isError: true,
+    text: "skill file exceeds the hosted size limit",
+  });
+  await writeFile(path.join(skill, "SKILL.md"), Buffer.alloc(limit + 1, 120));
+  assert.deepEqual(await call(client, "load_skill", { id }), { isError: true, text: "skill file exceeds the hosted size limit" });
+  const probe = await open(path.join(skill, "exact.txt"));
+  const prototype = Object.getPrototypeOf(probe) as typeof probe;
+  await probe.close();
+  const original = Object.getOwnPropertyDescriptor(prototype, "stat")!.value as typeof probe.stat;
+  const stat = mock.method(prototype, "stat", async function (this: typeof probe, ...args: Parameters<typeof original>) {
+    const result = await original.apply(this, args);
+    await appendFile(path.join(skill, "exact.txt"), "x");
+    return result;
+  });
+  await assert.rejects(readSkillFileBytes(skill, "exact.txt", false, false, limit), {
+    message: "skill file exceeds the hosted size limit",
+  });
+  stat.mock.restore();
+});
+
+test("production integration retains admission through streamed responses", async () => {
+  const { createHostedMcpApp } = await import(examplePath);
+  const controllers: ReadableStreamDefaultController<Uint8Array>[] = [];
+  const app = createHostedMcpApp({
+    principals: [{ token: "dummy", allowedSources: [] }],
+    allowedHosts: ["test"],
+    allowedOrigins: [],
+    handle: () =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controllers.push(controller);
+            },
+          }),
+          { status: 201, headers: { "x-test": "value" } },
+        ),
+      ),
+  });
+  const request = (signal?: AbortSignal) =>
+    new Request("http://test/mcp", { method: "POST", headers: { host: "test", authorization: "Bearer dummy" }, signal });
+  const responses = await Promise.all(Array.from({ length: 8 }, () => app(request())));
+  assert.equal(responses[0].status, 201);
+  assert.equal(responses[0].headers.get("x-test"), "value");
+  assert.equal((await app(request())).status, 503);
+  await responses[0].body!.cancel();
+  const replacement = await app(request());
+  assert.equal(replacement.status, 201);
+  controllers[1]!.close();
+  await responses[1].arrayBuffer();
+  const aborter = new AbortController();
+  const aborted = await app(request(aborter.signal));
+  assert.equal(aborted.status, 201);
+  aborter.abort();
+  const last = await app(request());
+  assert.equal(last.status, 201);
+  await Promise.all([...responses.slice(2), replacement, aborted, last].map((r) => r.body!.cancel()));
+  const ambiguous = createHostedMcpApp({
+    principals: [
+      { token: "dummy", allowedSources: [] },
+      { token: "dummy", allowedSources: [] },
+    ],
+    allowedHosts: ["test"],
+    allowedOrigins: [],
+    handle: handleHostedMcp,
+  });
+  const denied = await ambiguous(request());
+  assert.equal(denied.status, 401);
+  assert.equal(await denied.text(), "Authentication required");
+});
+
+test("production integration releases admission when an incoming body aborts", async () => {
+  const { createHostedMcpApp } = await import(examplePath);
+  let calls = 0;
+  let cancelled = false;
+  const app = createHostedMcpApp({
+    principals: [{ token: "dummy", allowedSources: [] }],
+    allowedHosts: ["test"],
+    allowedOrigins: [],
+    handle: () => {
+      calls++;
+      return Promise.resolve(new Response(null, { status: 204 }));
+    },
+  });
+  const aborter = new AbortController();
+  const body = new ReadableStream({
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const request = new Request("http://test/mcp", {
+    method: "POST",
+    headers: { host: "test", authorization: "Bearer dummy" },
+    body,
+    signal: aborter.signal,
+    duplex: "half",
+  } as RequestInit);
+  const pending = app(request);
+  const reason = new Error("dummy abort");
+  aborter.abort(reason);
+  await assert.rejects(pending, (error: unknown) => error === reason);
+  assert.equal(cancelled, true);
+  assert.equal(calls, 0);
+  const next = await app(new Request("http://test/mcp", { method: "POST", headers: { host: "test", authorization: "Bearer dummy" } }));
+  assert.equal(next.status, 204);
+  assert.equal(calls, 1);
+});
+
+test("production integration releases admission after handler failure", async () => {
+  const { createHostedMcpApp } = await import(examplePath);
+  let fails = true;
+  const app = createHostedMcpApp({
+    principals: [{ token: "dummy", allowedSources: [] }],
+    allowedHosts: ["test"],
+    allowedOrigins: [],
+    handle: () => {
+      if (fails) return Promise.reject(new Error("dummy failure"));
+      return Promise.resolve(new Response(null, { status: 204 }));
+    },
+  });
+  const request = () => new Request("http://test/mcp", { method: "POST", headers: { host: "test", authorization: "Bearer dummy" } });
+  for (let i = 0; i < 8; i++) await assert.rejects(app(request()), /dummy failure/u);
+  fails = false;
+  assert.equal((await app(request())).status, 204);
 });
