@@ -32,7 +32,7 @@ await build({
   bundle: true,
   platform: "node",
   format: "esm",
-  target: "node24",
+  target: "node26",
   outfile: path.join(root, "build", ...(dev ? ["dev", "margrave.mjs"] : ["margrave.mjs"])),
   banner: {
     js: "import { createRequire as __mgCreateRequire } from 'node:module'; const require = __mgCreateRequire(import.meta.url);",

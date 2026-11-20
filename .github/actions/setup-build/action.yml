@@ -1,5 +1,5 @@
 name: Setup Build Environment
-description: Repeated setup shared by the test, bundle, and release jobs. Activates pnpm (pinned by the packageManager field), sets up Node (the node-version input, else the version in .nvmrc) with a pnpm cache, optionally pulls the bumped package.json artifact, and installs dependencies.
+description: Repeated setup shared by the test, bundle, and release jobs. Activates pnpm (pinned by the packageManager field), sets up Node from .nvmrc with a pnpm cache, optionally pulls the bumped package.json artifact, and installs dependencies.
 
 inputs:
   download-bumped:
@@ -10,10 +10,6 @@ inputs:
     description: When 'true' (default), run `pnpm install --frozen-lockfile`. Set 'false' for jobs that want to install differently.
     required: false
     default: "true"
-  node-version:
-    description: Node version for actions/setup-node. When empty (default), the version in .nvmrc is used.
-    required: false
-    default: ""
 
 runs:
   using: composite
@@ -22,8 +18,7 @@ runs:
 
     - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
       with:
-        node-version: ${{ inputs.node-version }}
-        node-version-file: ${{ inputs.node-version == '' && '.nvmrc' || '' }}
+        node-version-file: .nvmrc
         cache: "pnpm"
 
     - if: inputs.download-bumped == 'true'

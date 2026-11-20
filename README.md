@@ -15,7 +15,7 @@ Skills are not loaded into the agent by default, so 1000+ installed skills cost 
 
 ## 1. Install margrave itself
 
-The release bundles and the Homebrew formula need no Node. The npm package and a build from source need Node 24 or newer. The repo pins `26.13.1` in `.nvmrc`: `nvm use` selects it, and the release binary embeds that version.
+The release bundles and the Homebrew formula need no Node. The npm package and a build from source need Node 26 or newer. The repo pins `26.13.1` in `.nvmrc`: `nvm use` selects it, and the release binary embeds that version.
 
 ### From source
 
@@ -34,7 +34,7 @@ If an older install from this checkout with `pnpm add -g "$PWD"` still shadows H
 
 ### From a release
 
-Every push to `master` publishes a release at https://github.com/valksor/margrave/releases with these assets. The bundles need no Node. The npm package needs Node 24 or newer.
+Every push to `master` publishes a release at https://github.com/valksor/margrave/releases with these assets. The bundles need no Node. The npm package needs Node 26 or newer.
 
 | Asset                                                                                | Contents                                                                                                                                                                                                                         |
 | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

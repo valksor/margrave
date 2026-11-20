@@ -5,11 +5,13 @@
 overrides:
   glob: "14.0.6"
   minimatch: "11.0.8"
+minimumReleaseAge: 360
+engineStrict: true
+strictPeerDependencies: true
+autoInstallPeers: true
 allowBuilds:
   # lefthook's only build script is a convenience that auto-runs `lefthook install`;
   # our `prepare` script does that explicitly, so no lifecycle script is needed here.
   lefthook: false
   # esbuild's platform binary comes from optionalDependencies, so the postinstall is not needed.
   esbuild: false
-minimumReleaseAgeExclude:
-  - knip@6.46.1

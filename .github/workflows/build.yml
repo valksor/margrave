@@ -880,7 +880,7 @@ jobs:
             ## Install
 
             - **Bundle** (`margrave-v${{ steps.get_version.outputs.VERSION }}-<platform>.tar.gz`, for linux-x64, linux-arm64, and macos-arm64): margrave as one standalone binary (`bin/margrave`, Node embedded) with ripwire and license files; needs no Node. Linux bundles need glibc (musl/Alpine: use the package).
-            - **Package** (`margrave-v${{ steps.get_version.outputs.VERSION }}.tgz`): the npm package without ripwire. Run `node <package dir>/scripts/ensure-ripwire.mjs` to vendor the pinned ripwire, or put a `ripwire` of the same version or newer on `PATH`. Needs Node 24 or newer.
+            - **Package** (`margrave-v${{ steps.get_version.outputs.VERSION }}.tgz`): the npm package without ripwire. Run `node <package dir>/scripts/ensure-ripwire.mjs` to vendor the pinned ripwire, or put a `ripwire` of the same version or newer on `PATH`. Needs Node 26 or newer.
             - **Homebrew** (macOS arm64, Linux): `brew install valksor/tap/margrave`; needs no Node.
 
             Upgrading a bundle or Homebrew install from 0.1.2 or earlier: first, if you symlinked a bundle, point that symlink at `margrave/bin/margrave` (`ln -sf`). Then run `margrave wrap <agent>` again and apply its output, because old agent configs start `node .../dist/cli.js`, which no longer exists. The README section "Upgrading from 0.1.2 or earlier" has the exact commands.
