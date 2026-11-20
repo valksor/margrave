@@ -1,6 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import { BODY_TOKEN_LIMIT, MAX_QUERY_TERMS, buildFieldTokens, clampLimit, queryTerms, tokenize } from "../src/bm25.ts";
+
+test("Unicode terms normalize identically in the query and FTS vocabulary", () => {
+  const terms = queryTerms("pieturzīmes हिन्दी 資料 TESTING");
+  assert.deepEqual(terms, ["pieturzīmes", "हिन्दी", "資料", "test"]);
+  const db = new DatabaseSync(":memory:");
+  try {
+    db.exec("CREATE VIRTUAL TABLE fts USING fts5(text, tokenize='ascii'); CREATE VIRTUAL TABLE vocab USING fts5vocab(fts, 'row')");
+    db.prepare("INSERT INTO fts VALUES (?)").run(terms.join(" "));
+    const vocabulary = db.prepare("SELECT term FROM vocab ORDER BY term").all() as { term: string }[];
+    assert.deepEqual(vocabulary.map((row) => row.term).sort(), [...terms].sort());
+  } finally {
+    db.close();
+  }
+});
+
+test("single Unicode words and leading combining marks", () => {
+  assert.deepEqual(tokenize("火 a \u0301b"), ["火"]);
+});
 
 test("tokenizer lowercases, splits on non-alphanumerics, drops stopwords", () => {
   assert.deepEqual(tokenize("The Quick-Brown FOX, and the dog!"), ["quick", "brown", "fox", "dog"]);

@@ -103,6 +103,14 @@ test("a name match outweighs the same word in the body", async (t) => {
   assert.equal(hits[0]?.id, "s/redis");
 });
 
+test("a visible name match keeps a unique description match weak", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  const entries = [newEntry("s", "redis-guide", "General guide"), newEntry("s", "cache-guide", "Redis configuration")];
+  assert.deepEqual(ids(await ranked(entries, "redis")), ["s/redis-guide"]);
+  const explained = await ranked(entries, "redis", 5, true);
+  assert.deepEqual(ids(explained), ["s/redis-guide", "s/cache-guide"]);
+});
+
 test("an exact name or id match ranks first, even against a skill with strong hits in several columns", async (t) => {
   useHome(t, await tmp("mg-home-"));
   const entries = [
@@ -157,10 +165,10 @@ test("equal scores break by id in byte order, in any insert order", async (t) =>
 
 test("the tie-break is SQLite byte order: a high BMP id sorts before an astral id", async (t) => {
   useHome(t, await tmp("mg-home-"));
-  // Names without a-z0-9 give no name tokens, so both rows tie on the description. UTF-8: U+FF21 is EF BC A1, U+1F600 is F0 9F 98 80.
+  // Both names yield one token. UTF-8 orders U+FF21 before U+10400.
   // In UTF-16 order the astral id (D83D ...) would come first.
-  const entries = ["\u{1F600}", "Ａ"].map((n) => newEntry("s", n, "identical description text"));
-  assert.deepEqual(ids(await ranked(entries, "identical description")), ["s/Ａ", "s/\u{1F600}"]);
+  const entries = ["\u{10400}", "Ａ"].map((n) => newEntry("s", n, "identical description text"));
+  assert.deepEqual(ids(await ranked(entries, "identical description")), ["s/Ａ", "s/\u{10400}"]);
 });
 
 test("the limit cuts the result list", async (t) => {
@@ -306,7 +314,7 @@ test("a concurrent migration is recognized after acquiring the writer lock", asy
   const hook = changeAtLock(t, 1, () => {
     const db = new DatabaseSync(path.join(home, "index.db"));
     db.exec(
-      "CREATE TABLE sources(id TEXT PRIMARY KEY, record TEXT NOT NULL, position INTEGER NOT NULL); UPDATE skills SET dir = 'release-upgrade'; PRAGMA user_version = 3",
+      "CREATE TABLE sources(id TEXT PRIMARY KEY, record TEXT NOT NULL, position INTEGER NOT NULL); UPDATE skills SET dir = 'release-upgrade'; PRAGMA user_version = 4",
     );
     db.prepare("INSERT INTO sources(id, record, position) VALUES (?, ?, 0)").run(records[0]!.id, JSON.stringify(records[0]));
     db.close();
@@ -329,14 +337,14 @@ test("opening a missing catalog and a catalog without its source table fails clo
 
 // ---- the writer connection ----
 
-test("the catalog uses the DELETE journal, user_version 3, and leaves no side files after a read", async (t) => {
+test("the catalog uses the DELETE journal, user_version 4, and leaves no side files after a read", async (t) => {
   const home = await tmp("mg-home-");
   useHome(t, home);
   await seedIndex([newEntry("s", "a")]);
   const db = await openIndexRead();
   try {
     assert.equal((db.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode, "delete");
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 3);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 4);
   } finally {
     db.close();
   }
@@ -547,7 +555,7 @@ test("the schema probe sees a concurrent initial commit as one snapshot", async 
       committed = true;
       const writer = new DatabaseSync(file);
       writer.exec(
-        "BEGIN IMMEDIATE; CREATE TABLE skills(rowid INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, id_lc TEXT NOT NULL, name TEXT NOT NULL, name_lc TEXT NOT NULL, description TEXT NOT NULL, source TEXT NOT NULL, dir TEXT NOT NULL, hash TEXT NOT NULL, manifest TEXT NOT NULL, frontmatter TEXT NOT NULL); CREATE INDEX skills_name_lc ON skills(name_lc); CREATE INDEX skills_id_lc ON skills(id_lc); CREATE INDEX skills_source ON skills(source); CREATE TABLE sources(id TEXT PRIMARY KEY, record TEXT NOT NULL, position INTEGER NOT NULL); CREATE VIRTUAL TABLE fts USING fts5(name, description, headings, body, content='', contentless_delete=1, tokenize='unicode61'); PRAGMA user_version = 3; COMMIT",
+        "BEGIN IMMEDIATE; CREATE TABLE skills(rowid INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, id_lc TEXT NOT NULL, name TEXT NOT NULL, name_lc TEXT NOT NULL, description TEXT NOT NULL, source TEXT NOT NULL, dir TEXT NOT NULL, hash TEXT NOT NULL, manifest TEXT NOT NULL, frontmatter TEXT NOT NULL); CREATE INDEX skills_name_lc ON skills(name_lc); CREATE INDEX skills_id_lc ON skills(id_lc); CREATE INDEX skills_source ON skills(source); CREATE TABLE sources(id TEXT PRIMARY KEY, record TEXT NOT NULL, position INTEGER NOT NULL); CREATE VIRTUAL TABLE fts USING fts5(name, description, headings, body, content='', contentless_delete=1, tokenize='ascii'); PRAGMA user_version = 4; COMMIT",
       );
       writer.close();
     }

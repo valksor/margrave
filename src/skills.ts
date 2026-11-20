@@ -119,6 +119,26 @@ const FIND_TAIL = `SELECT k.rowid, k.id, k.name, k.description, k.hash AS revisi
 FROM cand c JOIN skills k ON k.rowid = c.rowid
 WHERE (? IS NULL OR k.source IN (SELECT value FROM json_each(?)))`;
 
+function rankEvidence(
+  ranked: (FindHit & { recommended: boolean; exact: boolean; matchedTerms: MatchedTerms })[],
+  terms: string[],
+  limit: unknown,
+  explain: boolean,
+): FindHit[] {
+  const uniqueDescription =
+    terms.length === 1 &&
+    !ranked.some((hit) => hit.matchedTerms.name.length > 0) &&
+    ranked.filter((hit) => hit.matchedTerms.description.length > 0).length === 1;
+  for (const hit of ranked)
+    hit.recommended =
+      hit.exact || hasRecommendationEvidence(terms, hit.matchedTerms) || (uniqueDescription && hit.matchedTerms.description.length > 0);
+  const selected = [...ranked.filter((hit) => hit.recommended), ...(explain ? ranked.filter((hit) => !hit.recommended) : [])].slice(
+    0,
+    clampLimit(limit),
+  );
+  return explain ? selected : selected.map(({ id, name, description, revision, score }) => ({ id, name, description, revision, score }));
+}
+
 /** BM25 over the FTS columns. An exact name or id match ranks first. Ties break by id in byte order. */
 export function findSkills(db: DatabaseSync, task: string, limit: unknown, explain = false, scope?: ReadonlySet<string>): FindHit[] {
   // The MATCH text comes only from tokenize() output, never from the raw task.
@@ -171,13 +191,7 @@ export function findSkills(db: DatabaseSync, task: string, limit: unknown, expla
     }
     if (hit !== undefined && row.col !== null && row.term !== null) hit.matchedTerms[row.col].push(row.term);
   }
-  const ranked = [...hits.values()];
-  for (const hit of ranked) hit.recommended = hit.exact || hasRecommendationEvidence(terms, hit.matchedTerms);
-  const selected = [...ranked.filter((hit) => hit.recommended), ...(explain ? ranked.filter((hit) => !hit.recommended) : [])].slice(
-    0,
-    clampLimit(limit),
-  );
-  return explain ? selected : selected.map(({ id, name, description, revision, score }) => ({ id, name, description, revision, score }));
+  return rankEvidence([...hits.values()], terms, limit, explain);
 }
 
 export interface FindText {

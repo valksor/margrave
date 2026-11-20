@@ -34,7 +34,7 @@ const USAGE = `usage: margrave <command>
   load <id> [--json] [--revision <hash>]      print one skill
   load <id> --file <path> [--revision <hash>] print one file inside a skill directory
   reindex                                     rescan all sources
-  migrate                                    upgrade a v0.2.1 store
+  migrate                                    upgrade the skill catalog
   mcp                                         run the stdio MCP server
   wrap <claude|codex|bb|generic>              print setup text for an agent
   version                                     print the version

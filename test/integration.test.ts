@@ -879,6 +879,49 @@ test("migration rejects changed legacy skill bytes without publishing", async ()
   assert.deepEqual(await readFile(path.join(home, "index.db")), before);
 });
 
+test("schema 3 migration rebuilds search and preserves accepted Git records", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(env, ["install", repo.url]);
+  assert.equal(installed.code, 0, installed.stderr);
+  const before = await snapshot(env.home);
+  const db = new DatabaseSync(path.join(env.home, "index.db"));
+  db.exec(
+    "DROP TABLE fts; CREATE VIRTUAL TABLE fts USING fts5(name, description, headings, body, content='', contentless_delete=1, tokenize='unicode61'); PRAGMA user_version = 3",
+  );
+  db.close();
+  const source = sourceId(installed);
+  const skill = path.join(env.home, "sources", source, "skills", "react-perf", "SKILL.md");
+  const accepted = await readFile(skill);
+  const oldCatalog = await readFile(path.join(env.home, "index.db"));
+  await writeFile(skill, "changed bytes");
+  const rejected = await mg(env, ["migrate"]);
+  assert.equal(rejected.code, 1);
+  assert.match(rejected.stderr, /cannot upgrade source/u);
+  assert.deepEqual(await readFile(path.join(env.home, "index.db")), oldCatalog);
+  await writeFile(skill, accepted);
+  const migrated = await mg(env, ["migrate"]);
+  assert.equal(migrated.code, 0, migrated.stderr);
+  assert.deepEqual(await snapshot(env.home), before);
+  assert.match((await mg(env, ["find", "react-perf"])).stdout, /react-perf/u);
+});
+
+test("schema 3 migration refuses changed local content without publication", async () => {
+  const env = await setup();
+  const dir = await tmp();
+  await writeSkill(dir, "alpha", "Original description");
+  assert.equal((await mg(env, ["install", dir])).code, 0);
+  const db = new DatabaseSync(path.join(env.home, "index.db"));
+  db.exec("PRAGMA user_version = 3");
+  db.close();
+  const before = await readFile(path.join(env.home, "index.db"));
+  await writeSkill(dir, "alpha", "Changed description");
+  const result = await mg(env, ["migrate"]);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /cannot upgrade source/u);
+  assert.deepEqual(await readFile(path.join(env.home, "index.db")), before);
+});
+
 test("migration preserves a legacy local source with no indexed skills", async () => {
   const home = path.join(await tmp(), "store");
   const local = await tmp();
@@ -934,6 +977,16 @@ test("migration refuses incomplete and conflicting legacy catalogs", async () =>
   const source = "example.invalid__fixtures__margrave-upgrade";
   const cases: { name: string; mutate: (home: string) => Promise<void> | void; expected: RegExp }[] = [
     { name: "missing source file", mutate: async (home) => rm(path.join(home, "sources.json")), expected: /sources\.json is missing/u },
+    {
+      name: "legacy scan provenance",
+      mutate: async (home) => {
+        const file = path.join(home, "sources.json");
+        const records = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>[];
+        records[0]!["scan"] = { code: 0, files: [], keys: [], overridden: false, tree: null, verdict: "clean", version: null };
+        await writeFile(file, JSON.stringify(records));
+      },
+      expected: new RegExp(`cannot upgrade source "${source}"`, "u"),
+    },
     {
       name: "malformed source file",
       mutate: async (home) => writeFile(path.join(home, "sources.json"), "invalid json"),
@@ -1088,7 +1141,7 @@ test("migration rolls back a failed temporary catalog transaction", async () => 
     preload,
     `import { DatabaseSync } from "node:sqlite";
 const exec = DatabaseSync.prototype.exec;
-DatabaseSync.prototype.exec = function(sql) { if (sql === "PRAGMA user_version = 3; COMMIT") throw new Error("migration commit failed"); return exec.call(this, sql); };\n`,
+DatabaseSync.prototype.exec = function(sql) { if (sql === "PRAGMA user_version = 4; COMMIT") throw new Error("migration commit failed"); return exec.call(this, sql); };\n`,
   );
   const failed = await runCli(["migrate"], { home, nodeArgs: ["--import", preload] });
   assert.equal(failed.code, 1);

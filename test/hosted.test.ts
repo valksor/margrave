@@ -84,6 +84,7 @@ test("released v0.2.1 store remains usable after upgrade", async (t) => {
   assert.match(beforeMigration.stderr, /store upgrade required/u);
   const migration = await runCli(["migrate"], { home });
   assert.equal(migration.code, 0, migration.stderr);
+  assert.equal(catalogRecords(home)[0]?.scan, undefined);
   assert.equal(migration.stdout, "store upgraded\n");
   const filesBeforeRepeat = (await readdir(home)).sort();
   const repeated = await runCli(["migrate"], { home });

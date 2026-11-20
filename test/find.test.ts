@@ -5,9 +5,94 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { BODY_TOKEN_LIMIT, FIELD_WEIGHTS, NAME_BONUS, queryTerms } from "../src/bm25.ts";
+import { BODY_TOKEN_LIMIT, FIELD_WEIGHTS, NAME_BONUS, buildFieldTokens, queryTerms } from "../src/bm25.ts";
 import { findSkills } from "../src/skills.ts";
+import { insertSkills, temporaryCatalog } from "../src/store.ts";
 import { CLI, fakeRipwire, runCli, tmp, writeSkill } from "./helpers.ts";
+
+test("frozen search benchmark", async (t) => {
+  const home = await tmp("mg-benchmark-");
+  const previous = process.env["MARGRAVE_HOME"];
+  process.env["MARGRAVE_HOME"] = home;
+  const { db } = await temporaryCatalog();
+  if (previous === undefined) delete process.env["MARGRAVE_HOME"];
+  else process.env["MARGRAVE_HOME"] = previous;
+  t.after(async () => {
+    db.close();
+    await rm(home, { recursive: true, force: true });
+  });
+  const skills = [
+    ["benchmark-core/api-contracts", "Review API contracts and endpoint idempotency in a deployment workflow."],
+    ["benchmark-core/terraform-modules", "Plan reusable Terraform modules for infrastructure in a deployment workflow."],
+    ["benchmark-extra/terraform-aws", "Configure the AWS provider for Terraform."],
+    [
+      "benchmark-core/incident-review",
+      "Review incident escalation and write an incident summary.",
+      "PagerDuty notifications appear in this example.",
+    ],
+    ["benchmark-core/latvian-proofreader", "Labojiet pieturzīmes, komatus un pareizrakstību."],
+    ["benchmark-core/hindi-editor", "हिन्दी वाक्य संपादन और व्याकरण।"],
+    ["benchmark-extra/japanese-catalog", "資料 目録 の 編集。"],
+    ["benchmark-core/release-notes", "Write public release summaries."],
+    ["benchmark-extra/release-notes", "Write internal release summaries."],
+  ] as const;
+  insertSkills(
+    db,
+    skills.map(([id, description, body]) => {
+      const [source = "", name = ""] = id.split("/");
+      return {
+        id,
+        source,
+        name,
+        description,
+        dir: name,
+        revision: "revision",
+        manifest: "{}",
+        frontmatter: "{}",
+        tokens: buildFieldTokens({ name, description, headings: [], body: body ?? "Use this guide." }),
+      };
+    }),
+  );
+  const cases: [string, string[]][] = [
+    ["benchmark-core/api-contracts", ["benchmark-core/api-contracts"]],
+    ["Terraform modules", ["benchmark-core/terraform-modules"]],
+    ["Please compare reusable Terraform modules for an infrastructure plan", ["benchmark-core/terraform-modules"]],
+    ["incident review escalation", ["benchmark-core/incident-review"]],
+    ["release-notes", ["benchmark-core/release-notes", "benchmark-extra/release-notes"]],
+    ["benchmark-extra/release-notes", ["benchmark-extra/release-notes"]],
+    ["idempotency", ["benchmark-core/api-contracts"]],
+    ["pieturzīmes", ["benchmark-core/latvian-proofreader"]],
+    ["हिन्दी", ["benchmark-core/hindi-editor"]],
+    ["資料", ["benchmark-extra/japanese-catalog"]],
+    ["workflow", []],
+    ["quasar", []],
+    ["pagerduty", []],
+    ["workflow quasar", []],
+  ];
+  let top = 0,
+    recall = 0,
+    falseRecommendations = 0;
+  for (const [query, expected] of cases) {
+    const ids = findSkills(db, query, 5).map((hit) => hit.id);
+    if (expected.length === 0) falseRecommendations += Number(ids.length > 0);
+    else {
+      top += Number(expected.includes(ids[0] ?? ""));
+      recall += Number(ids.some((id) => expected.includes(id)));
+    }
+    console.log(`benchmark ${query}: ${ids.join(", ") || "abstain"}`);
+  }
+  console.log(`benchmark top-1 ${top}/10, recall@5 ${recall}/10, false recommendations ${falseRecommendations}/4`);
+  assert.equal(top, 10);
+  assert.equal(recall, 10);
+  assert.equal(falseRecommendations, 0);
+  assert.deepEqual(findSkills(db, "summaries", 5), []);
+  assert.equal(findSkills(db, "summaries", 5, false, new Set(["benchmark-extra"]))[0]?.id, "benchmark-extra/release-notes");
+  db.exec("CREATE VIRTUAL TABLE temp.benchmark_vocab USING fts5vocab(main, fts, instance)");
+  for (const term of ["pieturzīmes", "हिन्दी", "資料"]) {
+    assert.equal(queryTerms(term)[0], term);
+    assert.ok(db.prepare("SELECT term FROM temp.benchmark_vocab WHERE term = ?").get(term));
+  }
+});
 
 test("search relevance and CLI/MCP parity on an installed corpus", async (t) => {
   const dir = await tmp("mg-find-source-");

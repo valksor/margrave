@@ -181,6 +181,14 @@ export async function readLegacySources(): Promise<SourceRecord[]> {
   } catch (err) {
     throw new MargraveError(`${file} is not valid JSON (${(err as Error).message}); fix or delete it`);
   }
+  if (Array.isArray(parsed)) {
+    for (const record of parsed) {
+      if (isRecord(record) && typeof record["id"] === "string" && Object.hasOwn(record, "scan"))
+        throw new MargraveError(
+          `cannot upgrade source "${record["id"]}" because its source record, index, or files disagree. Restore a known-good backup or recover the source from a verified lock`,
+        );
+    }
+  }
   if (!Array.isArray(parsed) || !parsed.every(validSource)) {
     throw new MargraveError(`${file} is malformed (expected a list of source records); fix or delete it`);
   }
@@ -189,7 +197,9 @@ export async function readLegacySources(): Promise<SourceRecord[]> {
 
 // ---- index.db ----
 
-const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
+export const FTS_SCHEMA =
+  "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(name, description, headings, body, content='', contentless_delete=1, tokenize='ascii')";
 const READ_TIMEOUT_MS = 5000;
 const WRITE_TIMEOUT_MS = 30000;
 const SQLITE_NOTADB = 26;
@@ -215,7 +225,7 @@ CREATE INDEX IF NOT EXISTS skills_name_lc ON skills(name_lc);
 CREATE INDEX IF NOT EXISTS skills_id_lc ON skills(id_lc);
 CREATE INDEX IF NOT EXISTS skills_source ON skills(source);
 CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY, record TEXT NOT NULL, position INTEGER NOT NULL);
-CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(name, description, headings, body, content='', contentless_delete=1, tokenize='unicode61');
+${FTS_SCHEMA};
 PRAGMA user_version = ${SCHEMA_VERSION};
 `;
 
@@ -256,7 +266,7 @@ interface Probe {
 }
 
 /**
- * Reads the version and schema of an open database. Only versions 0 and 2 are recognized.
+ * Reads the version and schema of an open database. Recognizes empty, legacy, and current catalogs.
  * So is user_version 0 with any schema object: margrave creates its schema in one transaction, so another program wrote it.
  */
 function readProbe(db: DatabaseSync, file: string): Probe {
@@ -275,7 +285,7 @@ function readProbe(db: DatabaseSync, file: string): Probe {
     fts: number | bigint;
   };
   const version = Number(counts.user_version);
-  if (version !== 0 && version !== 2 && version !== SCHEMA_VERSION) throw new MargraveError(foreignMessage(file));
+  if (version !== 0 && version !== 2 && version !== 3 && version !== SCHEMA_VERSION) throw new MargraveError(foreignMessage(file));
   if (version === 0 && Number(counts.total) > 0) throw new MargraveError(foreignMessage(file));
   if (
     version !== 0 &&
@@ -288,7 +298,7 @@ function readProbe(db: DatabaseSync, file: string): Probe {
   )
     throw new MargraveError(foreignMessage(file));
   if (
-    version === SCHEMA_VERSION &&
+    version >= 3 &&
     Number(db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'sources'").get()?.["n"]) !== 1
   )
     throw new MargraveError(foreignMessage(file));
@@ -322,7 +332,7 @@ function openCurrent(file: string, options: OpenOptions): DatabaseSync {
   const { db, probe } = openProbed(file, options);
   if (probe.version === SCHEMA_VERSION) return db;
   db.close();
-  if (probe.version === 2)
+  if (probe.version === 2 || probe.version === 3)
     throw new MargraveError("store upgrade required. Stop Margrave processes, back up the store, and run: margrave migrate");
   throw new MargraveError(foreignMessage(file));
 }

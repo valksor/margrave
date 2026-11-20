@@ -11,6 +11,8 @@ import { esc, scanWithRipwire } from "./safety.ts";
 import {
   MargraveError,
   UsageError,
+  FTS_SCHEMA,
+  SCHEMA_VERSION,
   deleteAllSkills,
   deleteSourceSkills,
   ensureDirs,
@@ -974,7 +976,7 @@ export async function migrateStore(): Promise<boolean> {
   const current = await openLegacyCatalog();
   if (current !== null) {
     current.db.close();
-    if (current.version === 3) return false;
+    if (current.version === SCHEMA_VERSION) return false;
   }
   const lock = await writerLock();
   let temp: { db: DatabaseSync; file: string } | undefined;
@@ -992,6 +994,8 @@ export async function migrateStore(): Promise<boolean> {
       await readSources();
       return false;
     }
+    let version: number;
+    let sources: SourceRecord[] | undefined;
     let rows: {
       id: string;
       name: string;
@@ -1003,8 +1007,10 @@ export async function migrateStore(): Promise<boolean> {
       frontmatter: string;
     }[];
     try {
-      if (legacy.version === 3) return false;
-      if (legacy.version !== 2) throw new MargraveError(`${indexDbFile()} is not a supported margrave catalog`);
+      if (legacy.version === SCHEMA_VERSION) return false;
+      if (legacy.version !== 2 && legacy.version !== 3) throw new MargraveError(`${indexDbFile()} is not a supported margrave catalog`);
+      version = legacy.version;
+      if (version === 3) sources = catalogSources(legacy.db);
       rows = legacy.db
         .prepare("SELECT id, name, description, source, dir, hash AS revision, manifest, frontmatter FROM skills ORDER BY id")
         .all() as typeof rows;
@@ -1012,20 +1018,23 @@ export async function migrateStore(): Promise<boolean> {
       legacy.db.close();
     }
     if (
+      version === 2 &&
       (await lstat(sourcesFile()).catch((err: NodeJS.ErrnoException) => {
         if (err.code === "ENOENT") return null;
         throw err;
       })) === null
     )
       throw new MargraveError(`cannot upgrade the store because ${sourcesFile()} is missing. Restore the complete v0.2.1 backup`);
-    let sources: SourceRecord[];
-    try {
-      sources = await readLegacySources();
-    } catch (err) {
-      throw new MargraveError(`cannot upgrade the v0.2.1 catalog: ${err instanceof Error ? err.message : String(err)}`);
+    if (sources === undefined) {
+      try {
+        sources = await readLegacySources();
+      } catch (err) {
+        throw new MargraveError(`cannot upgrade the v0.2.1 catalog: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
     const ids = new Set<string>();
     const paths = new Map<string, string>();
+    const entries: NewEntry[] = [];
     for (const rec of sources) {
       const conflict = (): MargraveError =>
         new MargraveError(
@@ -1057,7 +1066,7 @@ export async function migrateStore(): Promise<boolean> {
           )
             throw conflict();
           let indexedDir = row.dir;
-          if (rec.kind === "git") {
+          if (rec.kind === "git" && version === 2) {
             const marker = `${path.sep}snapshots${path.sep}${rec.id}${path.sep}${rec.snapshot}`;
             const at = row.dir.lastIndexOf(marker);
             if (!path.isAbsolute(row.dir) || at < 0) throw conflict();
@@ -1068,6 +1077,7 @@ export async function migrateStore(): Promise<boolean> {
           }
           if (indexedDir !== entry.dir) throw conflict();
           paths.set(row.id, indexedDir);
+          entries.push(entry);
         }
       } catch {
         throw conflict();
@@ -1076,11 +1086,20 @@ export async function migrateStore(): Promise<boolean> {
     if (rows.some((row) => !ids.has(row.source)) || paths.size !== rows.length)
       throw new MargraveError("cannot upgrade the v0.2.1 catalog: index contains an unknown source");
     temp = await copyLegacyCatalog();
-    temp.db.exec("BEGIN IMMEDIATE; CREATE TABLE sources(id TEXT PRIMARY KEY, record TEXT NOT NULL, position INTEGER NOT NULL)");
-    putCatalogSources(temp.db, sources);
+    temp.db.exec("BEGIN IMMEDIATE");
+    if (version === 2) {
+      temp.db.exec("CREATE TABLE sources(id TEXT PRIMARY KEY, record TEXT NOT NULL, position INTEGER NOT NULL)");
+      putCatalogSources(temp.db, sources);
+    }
     const update = temp.db.prepare("UPDATE skills SET dir = ? WHERE id = ?");
     for (const [id, dir] of paths) update.run(dir, id);
-    temp.db.exec("PRAGMA user_version = 3; COMMIT");
+    temp.db.exec(`DROP TABLE fts; ${FTS_SCHEMA}`);
+    const insert = temp.db.prepare(
+      "INSERT INTO fts(rowid, name, description, headings, body) SELECT rowid, ?, ?, ?, ? FROM skills WHERE id = ?",
+    );
+    for (const entry of entries)
+      insert.run(entry.tokens.name, entry.tokens.description, entry.tokens.headings, entry.tokens.body, entry.id);
+    temp.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}; COMMIT`);
     temp.db.close();
     await publishCatalog(temp.file);
     await repairAliases(sources, sources);

@@ -90,17 +90,21 @@ const STOPWORDS = new Set([
   "after",
 ]);
 
-/** Lazily yields the tokens of `input`: lowercase, split on non-alphanumerics, stopwords dropped, Porter-stemmed. Keeps duplicates. */
+/** Lazily yields normalized words, stemming ASCII terms and keeping duplicates. */
 function* tokens(input: string): Generator<string> {
-  for (const [raw] of input.toLowerCase().matchAll(/[a-z0-9]+/gu)) {
-    if (raw.length < 2 || STOPWORDS.has(raw)) continue;
-    const word = stemmer(raw);
-    if (word.length < 2 || STOPWORDS.has(word)) continue;
+  for (const [raw] of input
+    .normalize("NFC")
+    .toLowerCase()
+    .matchAll(/[\p{L}\p{N}][\p{L}\p{N}\p{M}]*/gu)) {
+    const ascii = /^[a-z0-9]+$/u.test(raw);
+    if ((ascii && raw.length < 2) || STOPWORDS.has(raw)) continue;
+    const word = ascii ? stemmer(raw) : raw;
+    if ((ascii && word.length < 2) || STOPWORDS.has(word)) continue;
     yield word;
   }
 }
 
-/** Lowercase, split on non-alphanumerics, drop stopwords, Porter-stem. Keeps duplicates. */
+/** Normalize words, drop stopwords, and stem ASCII terms. Keeps duplicates. */
 export function tokenize(input: string): string[] {
   return [...tokens(input)];
 }

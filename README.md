@@ -326,11 +326,11 @@ createServer(async (incoming, outgoing) => {
 
 Each result includes the indexed skill revision. Pass it with `margrave load <id> --revision <hash>` to verify the selected content.
 
-The index is a SQLite FTS5 table in `index.db` (the built-in `node:sqlite` module). Ranking is FTS5 BM25 per column, with k1 = 1.2 and b = 0.75 fixed by FTS5. Column weights: name 3, description 2, headings 1, body 0.3. The first 2000 body tokens are indexed. Tokens are lowercased, split on non-alphanumerics, stripped of stopwords, and stemmed with the Porter algorithm (the `stemmer` package). The stopword check runs on the word and again on its stem. margrave builds the tokens itself, so FTS5 only splits on spaces.
+Margrave ranks results with weighted SQLite FTS5 BM25. Field weights are name 3, description 2, headings 1, and body 0.3. The index uses the first 2,000 body tokens. Margrave normalizes Unicode text, preserves accents, and applies English stemming to ASCII words.
 
 An exact match of the query to a name or id (case-insensitive) ranks first. Its shown score has a fixed bonus of 10. Ties break by id in byte order (the UTF-8 bytes of the id). A query uses at most 32 distinct tokens, in the order they appear; later tokens are dropped.
 
-An exact match is always recommended. For a one-term query, the term must appear in the skill name. For longer queries, a skill qualifies when all terms match or when at least two distinct terms match its name, description, or headings and cover at least one third of the query.
+An exact query match to a skill name or ID ranks first. A single term also qualifies when it uniquely matches a visible skill description and matches no visible skill name. For longer queries, a skill qualifies when all terms match or when at least two distinct terms match its name, description, or headings and cover one third of the query.
 
 `margrave find --explain` includes weak matches after recommendations. The explanation shows the indexed fields and stemmed terms that matched. The JSON output adds `recommended`, `exact`, and `matchedTerms` to each result. The load hint points to a recommended result when one exists.
 
@@ -355,7 +355,7 @@ To reclaim space, stop all Margrave readers and writers. Use `margrave list --js
 3. Install the new CLI and update any host package. Run `margrave migrate` with the original `MARGRAVE_HOME`.
 4. Run `margrave find` and `margrave load` on an existing skill. Restart servers after both commands succeed.
 
-Migration checks that the v0.2.1 source records, index, and snapshot files agree. If migration reports a conflict, keep the backup and restore a known-good copy or recover the affected source from a verified lock.
+Migration checks that source records, index entries, and snapshot files agree. It rebuilds the search index from the verified files. If migration reports a conflict, keep the backup and restore a known-good copy or recover the affected source from a verified lock.
 
 To roll back, stop Margrave processes. Move the upgraded store aside and restore the complete backup at its original path. Start the previous CLI and restart the previous MCP servers.
 

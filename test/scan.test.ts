@@ -40,6 +40,13 @@ test("a skill carries the four token strings, with headings in their own column,
   }
 });
 
+test("skill fields retain normalized Unicode tokens", () => {
+  const parsed = parseSkillMd("---\nname: guide\ndescription: pieturzīmes हिन्दी 資料\n---\n# 火\n");
+  assert.ok(parsed.ok);
+  assert.equal(parsed.skill.tokens.description, "pieturzīmes हिन्दी 資料");
+  assert.equal(parsed.skill.tokens.headings, "火");
+});
+
 test("splitSkillMd handles CRLF and a BOM, and returns the body unchanged", () => {
   const s = splitSkillMd("﻿---\r\nname: x\r\ndescription: y\r\n---\r\nbody \u001b[31mred\u001b[0m\r\n");
   assert.equal(s.rawFrontmatter, "name: x\r\ndescription: y");
