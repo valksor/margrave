@@ -87,12 +87,31 @@ export function version(): string {
 }
 
 /** Resolve an id, then close the handle: nothing else needs the database. */
-function resolveEntry(ctx: Context, id: string, revision: string | undefined, allowedSources: ReadonlySet<string> | undefined): IndexEntry {
+function resolveEntry(
+  ctx: Context,
+  id: string,
+  revision: string | undefined,
+  allowedSources: ReadonlySet<string> | undefined,
+): { entry: IndexEntry; revision: string; gitDrift: "mcp" | undefined } {
   try {
-    return resolveSkill(ctx.db, id, revision, allowedSources);
+    const entry = resolveSkill(ctx.db, id, revision, allowedSources, true);
+    return {
+      entry,
+      revision: revision ?? entry.revision,
+      gitDrift: ctx.sources.some((s) => s.id === entry.source && s.kind === "git") ? "mcp" : undefined,
+    };
   } finally {
     ctx.db.close();
   }
+}
+
+async function loadForMcp(ctx: Context, selected: ReturnType<typeof resolveEntry>, showHostPaths: boolean): Promise<string> {
+  const result = await loadSkill(selected.entry, ctx.sources, selected.revision, selected.gitDrift);
+  return formatLoad(result, { hostPaths: showHostPaths });
+}
+
+function readForMcp(selected: ReturnType<typeof resolveEntry>, file: string): Promise<string> {
+  return readSelectedFile(selected.entry, file, selected.revision, selected.gitDrift);
 }
 
 export interface ServerOptions {
@@ -156,8 +175,8 @@ function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | und
         const ctx = await loadContext();
         if (ctx === null)
           return variant.fail(new RequestError(revision === undefined ? variant.noSources : "skill revision changed; search again"));
-        const entry = resolveEntry(ctx, id, revision, allowedSources);
-        return ok(formatLoad(await loadSkill(entry, ctx.sources, revision), { hostPaths: variant.showHostPaths }));
+        const selected = resolveEntry(ctx, id, revision, allowedSources);
+        return ok(await loadForMcp(ctx, selected, variant.showHostPaths));
       } catch (err) {
         return variant.fail(err);
       }
@@ -173,8 +192,8 @@ function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | und
         const ctx = await loadContext();
         if (ctx === null)
           return variant.fail(new RequestError(revision === undefined ? variant.noSources : "skill revision changed; search again"));
-        const entry = resolveEntry(ctx, id, revision, allowedSources);
-        return ok(await readSelectedFile(entry, path, revision));
+        const selected = resolveEntry(ctx, id, revision, allowedSources);
+        return ok(await readForMcp(selected, path));
       } catch (err) {
         return variant.fail(err);
       }

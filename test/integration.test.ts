@@ -88,6 +88,74 @@ test("a copied Git store loads its own snapshot while the original remains", asy
   assert.doesNotMatch(loaded.stdout, /Original store content/u);
 });
 
+test("Git reindex preserves the accepted inventory when installed files drift", async () => {
+  const env = await setup();
+  const repo = await makeRepo();
+  const installed = await mg(env, ["install", repo.url]);
+  assert.equal(installed.code, 0, installed.stderr);
+  const id = sourceId(installed);
+  const before = await snapshot(env.home);
+  const normal = await mg(env, ["reindex"]);
+  assert.equal(normal.code, 0, normal.stderr);
+  assert.deepEqual(await snapshot(env.home), before);
+  await writeFile(path.join(env.home, "sources", id, "skills", "react-perf", "SKILL.md"), skillMd("react-perf", "Changed"));
+  const drift = await mg(env, ["reindex"]);
+  assert.match(
+    drift.stdout + drift.stderr,
+    /installed Git files differ from the accepted revision\. Restore a verified lock or a known-good backup/u,
+  );
+  assert.deepEqual(await snapshot(env.home), before);
+});
+
+test("interrupted Git recovery resumes only for the original catalog and scanned bytes", async () => {
+  for (const action of ["retry", "repaired", "lost", "competing", "removed", "changed"] as const) {
+    const env = await setup();
+    const repo = await makeRepo();
+    const installed = await mg(env, ["install", repo.url]);
+    assert.equal(installed.code, 0, installed.stderr);
+    const id = sourceId(installed);
+    const exported = await mg(env, ["lock", "export"]);
+    const lockFile = path.join(await tmp(), "lock.json");
+    await writeFile(lockFile, exported.stdout);
+    const old = catalogRecords(env.home)[0]!;
+    await writeFile(path.join(env.home, "sources", id, "skills", "react-perf", "SKILL.md"), "drift\n");
+    const preload = path.join(await tmp(), "fail-recovery.mjs");
+    await writeFile(
+      preload,
+      `import fs from "node:fs/promises"; import { syncBuiltinESMExports } from "node:module";
+const rename = fs.rename; fs.rename = function(from, to) { if (to === ${JSON.stringify(path.join(env.home, "index.db"))}) return Promise.reject(new Error("publication failed")); return rename.call(this, from, to); }; syncBuiltinESMExports();`,
+    );
+    const stopped = await runCli(["lock", "restore", lockFile], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+    assert.equal(stopped.code, 1);
+    const marker = JSON.parse(await readFile(path.join(env.home, "restore-pending", `${id}.json`), "utf8")) as {
+      record: { snapshot: string };
+    };
+    if (action === "competing") {
+      const records = catalogRecords(env.home);
+      records[0]!.installedAt = "competing update";
+      writeCatalogRecords(env.home, records);
+    } else if (action === "removed") writeCatalogRecords(env.home, []);
+    else if (action === "lost") await rm(path.join(env.home, "snapshots", id, marker.record.snapshot), { recursive: true });
+    else if (action === "repaired")
+      await writeFile(
+        path.join(env.home, "sources", id, "skills", "react-perf", "SKILL.md"),
+        await readFile(path.join(repo.dir, "skills", "react-perf", "SKILL.md")),
+      );
+    else if (action === "changed") await writeFile(path.join(env.home, "snapshots", id, marker.record.snapshot, "extra.txt"), "changed");
+    const resumed = await mg(env, ["lock", "restore", lockFile]);
+    if (action === "retry" || action === "repaired" || action === "lost") {
+      assert.equal(resumed.code, 0, resumed.stderr);
+      assert.equal(resumed.stdout, `restored ${id}\n`);
+      assert.notEqual(catalogRecords(env.home)[0]!.snapshot, old.snapshot);
+      assert.equal(catalogRecords(env.home)[0]!.ref, old.ref);
+    } else {
+      assert.equal(resumed.code, 1);
+      assert.match(resumed.stderr, /installed source differs from the lock/u);
+      if (action !== "removed") assert.equal(catalogRecords(env.home)[0]!.snapshot, old.snapshot);
+    }
+  }
+});
+
 test("Git skill paths cannot escape their managed snapshot", async () => {
   const env = await setup();
   const repo = await makeRepo();
@@ -1579,6 +1647,32 @@ test("update refuses a duplicated known line (the baseline is a multiset)", asyn
   assert.equal(newFindings(r.stderr).length, 1);
 });
 
+test("update ignores findings added to the mutable installed copy", async () => {
+  const m = await marked();
+  const injected = "new FAKE-CRIT EXFILTRATE:injected";
+  const file = path.join(m.env.home, "sources", m.id, "skills", "react-perf", "SKILL.md");
+  await writeFile(file, `${await readFile(file, "utf8")}\n${injected}\n`);
+  await setBody(m, [KNOWN_CRIT, KNOWN_WARN, injected]);
+  const result = await refusedUpdate(m);
+  assert.match(result.stderr, /EXFILTRATE:injected/u);
+});
+
+test("recovery preserves an accepted critical scan for identical bytes", async () => {
+  const m = await marked();
+  const original = catalogRecords(m.env.home)[0]!;
+  assert.equal(original.scan?.verdict, "critical");
+  assert.equal(original.scan?.overridden, true);
+  const exported = await mg(m.env, ["lock", "export"]);
+  const lock = path.join(await tmp(), "lock.json");
+  await writeFile(lock, exported.stdout);
+  await writeFile(path.join(m.env.home, "sources", m.id, "skills", "react-perf", "SKILL.md"), "drift\n");
+  const restored = await mg(m.env, ["lock", "restore", lock]);
+  assert.equal(restored.code, 0, restored.stderr);
+  assert.equal(restored.stdout, `restored ${m.id}\n`);
+  assert.deepEqual(catalogRecords(m.env.home)[0]?.scan, original.scan);
+  assert.equal(await installedFile(m), await readFile(m.file, "utf8"));
+});
+
 test("update refuses a known line whose severity rose from warn to critical", async () => {
   const m = await marked([KNOWN_WARN]);
   // the content is identical, so an update proceeds
@@ -1645,32 +1739,31 @@ test("update with staging exit 3 refuses and shows ripwire's stderr", async () =
   assert.match(r.stderr, /ripwire could not read the files \(exit 3\)\nfake ripwire: security --scan-skills=/u);
 });
 
-test("update falls back to today's rules when the baseline scan fails", async () => {
+test("update applies install rules when the accepted scan is unknown", async () => {
   const m = await marked();
-  const failBaseline = { FAKE_RIPWIRE_FAIL_ON: "/snapshots/" };
+  const records = catalogRecords(m.env.home);
+  delete records[0]?.scan;
+  writeCatalogRecords(m.env.home, records);
   // the known critical line counts as new without a baseline, so exit 2 refuses
   await setBody(m, [KNOWN_CRIT, KNOWN_WARN, "x"]);
-  const r = await refusedUpdate(m, failBaseline);
-  assert.match(r.stderr, /^scan: no baseline \(ripwire could not read the files \(exit 3\)\); every finding counts as new$/mu);
+  const r = await refusedUpdate(m);
+  assert.match(r.stderr, /^scan: no accepted baseline\. Applying install rules$/mu);
   assert.match(r.stderr, /refused: ripwire found CRITICAL findings \(exit 2\)/u);
 
   // the other direction: warn-only content proceeds, with the no-baseline line
   await setBody(m, [KNOWN_WARN]);
-  const ok = await mg(m.env, ["update", m.id], failBaseline);
+  const ok = await mg(m.env, ["update", m.id]);
   assert.equal(ok.code, 0, ok.stderr);
-  assert.match(ok.stderr, /scan: no baseline \(ripwire could not read the files \(exit 3\)\)/u);
+  assert.match(ok.stderr, /scan: no accepted baseline\. Applying install rules/u);
   assert.match(ok.stderr, /^scan: WARN — 1 finding\(s\) \(1 warn\)/mu);
 });
 
-test("update with no installed copy uses today's rules and prints the no-baseline line", async () => {
+test("update compares against the accepted scan when the installed copy is missing", async () => {
   const m = await marked();
   await rm(await realpath(path.join(m.env.home, "sources", m.id)), { recursive: true });
-  const before = await snapshot(m.env.home);
   const r = await mg(m.env, ["update", m.id]);
-  assert.equal(r.code, 1, r.stderr);
-  assert.match(r.stderr, /^scan: no baseline \(the installed copy is missing\); every finding counts as new$/mu);
-  assert.match(r.stderr, /refused: ripwire found CRITICAL findings \(exit 2\)/u);
-  assert.deepEqual(await snapshot(m.env.home), before);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /0 new vs installed copy/u);
   assert.deepEqual(await names(path.join(m.env.home, "sources")), [m.id]);
   assert.deepEqual(await names(path.join(m.env.home, "staging")), []);
 });
@@ -2371,11 +2464,17 @@ test("reference-only updates change revision and pinned reads detect drift", asy
   await writeFile(local, "drift\n");
   assert.match(
     (await mg(env, ["load", id, "--file", "references/tips.md", "--revision", current])).stderr,
-    /skill files changed since indexing/u,
+    /installed Git files differ from the accepted revision/u,
   );
-  assert.equal((await mg(env, ["reindex"])).code, 0);
+  const reindex = await mg(env, ["reindex"]);
+  assert.equal(reindex.code, 0);
+  assert.match(reindex.stdout + reindex.stderr, /installed Git files differ from the accepted revision/u);
   const refreshed = (await find()).results[0]!.revision;
-  assert.equal((await mg(env, ["load", id, "--file", "references/tips.md", "--revision", refreshed])).stdout, "drift\n");
+  assert.equal(refreshed, current);
+  assert.match(
+    (await mg(env, ["load", id, "--file", "references/tips.md", "--revision", refreshed])).stderr,
+    /installed Git files differ from the accepted revision/u,
+  );
 });
 
 test("concurrent Git updates retain the active and retired snapshots", async () => {
@@ -2409,7 +2508,10 @@ test("a Git skill at the snapshot root reports drift", async () => {
   const revision = indexRows(env.home).find((row) => row.id === skill)!.hash;
   await writeFile(path.join(env.home, "sources", id, "SKILL.md"), skillMd("root-skill", "changed"));
   const result = await mg(env, ["load", skill, "--revision", revision]);
-  assert.match(result.stderr, /skill files changed since indexing/u);
+  assert.match(result.stderr, /installed Git files differ from the accepted revision/u);
+  await rm(await realpath(path.join(env.home, "sources", id)), { recursive: true });
+  const missing = await mg(env, ["load", skill, "--revision", revision]);
+  assert.match(missing.stderr, /installed Git files differ from the accepted revision/u);
 });
 
 test("lock export and restore pins an annotated tag and verifies installed bytes", async () => {
@@ -2446,10 +2548,11 @@ test("lock export and restore pins an annotated tag and verifies installed bytes
   assert.equal((await stat(path.join(to.home, "index.db"))).ino, inode);
   await writeFile(path.join(to.home, "sources", id, "skills", "react-perf", "guide.txt"), "changed");
   const conflict = await mg(to, ["lock", "restore", file]);
-  assert.equal(conflict.code, 1);
-  assert.match(conflict.stderr, /installed source differs from the lock/u);
+  assert.equal(conflict.code, 0, conflict.stderr);
+  assert.equal(conflict.stdout, `restored ${id}\n`);
+  assert.equal(await readFile(path.join(to.home, "sources", id, "skills", "react-perf", "guide.txt"), "utf8"), "original");
   await rm(path.join(to.home, "sources", id, "skills", "react-perf", "guide.txt"));
-  assert.equal((await mg(to, ["lock", "restore", file])).code, 1);
+  assert.equal((await mg(to, ["lock", "restore", file])).code, 0);
 });
 
 for (const aliasState of ["missing", "incorrect"] as const) {

@@ -109,7 +109,7 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   assert.deepEqual(file, { isError: false, text: "reference text\n" });
   const escape = await call(client, "read_skill_file", { id: `${id}/terraform-modules`, path: "../secret.txt" });
   assert.equal(escape.isError, true);
-  assert.match(escape.text, /outside/u);
+  assert.equal(escape.text, "file is not in the selected skill revision");
   const abs = await call(client, "read_skill_file", { id: `${id}/terraform-modules`, path: path.join(dir, "secret.txt") });
   assert.equal(abs.isError, true);
 
@@ -217,7 +217,7 @@ test("MCP in-process: load_skill and read_skill_file work, and every tool turns 
   assert.match((await call(client, "load_skill", { id: "nope" })).text, /no skill "nope"/u);
   const escape = await call(client, "read_skill_file", { id, path: "../x" });
   assert.equal(escape.isError, true);
-  assert.match(escape.text, /outside/u);
+  assert.equal(escape.text, "file is not in the selected skill revision");
 
   // A corrupt index.db is a tool error for all three tools.
   await writeFile(path.join(home, "index.db"), "garbage that is not a database");
@@ -269,9 +269,11 @@ test("stdio source allowlists scope search and both reads", async (t) => {
   const home = await tmp("mg-home-");
   const fakeBin = await fakeRipwire();
   const ids: string[] = [];
+  const dirs: string[] = [];
   for (const description of ["Shared terraform modules", "Shared terraform modules terraform modules"]) {
     const dir = await tmp("mg-scope-");
     const skill = await writeSkill(dir, "shared", description);
+    dirs.push(skill);
     await writeFile(path.join(skill, "reference.txt"), description);
     const result = await runCli(["install", dir], { home, fakeBin });
     assert.equal(result.code, 0, result.stderr);
@@ -315,6 +317,16 @@ test("stdio source allowlists scope search and both reads", async (t) => {
         if (scope === "")
           assert.deepEqual(visibleResult, { ...unknown, text: unknown.text.replace("unknown/shared", `${visible}/shared`) });
         else if (token === undefined || scope !== undefined) assert.equal(visibleResult.isError, false);
+      }
+    }
+    if (scope !== undefined && scope !== "" && revision !== undefined) {
+      await writeFile(path.join(dirs[0]!, "reference.txt"), "updated reference");
+      const update = await runCli(["update", visible], { home, fakeBin });
+      assert.equal(update.code, 0, update.stderr);
+      for (const tool of ["load_skill", "read_skill_file"]) {
+        const args = { id: `${visible}/shared`, ...(tool === "read_skill_file" ? { path: "reference.txt" } : {}) };
+        assert.match((await call(client, tool, { ...args, revision })).text, /skill revision changed/u);
+        assert.equal((await call(client, tool, args)).isError, false);
       }
     }
   }

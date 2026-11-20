@@ -14,7 +14,7 @@ import {
   HOSTED_SERVER_ERROR,
   createServer,
 } from "../src/mcp.ts";
-import { CLI, ROOT, fakeRipwire, git, leaveHotJournal, makeRepo, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
+import { CLI, ROOT, catalogRecords, fakeRipwire, git, leaveHotJournal, makeRepo, runCli, skillMd, tmp, writeSkill } from "./helpers.ts";
 
 interface ToolText {
   isError: boolean;
@@ -266,6 +266,10 @@ test("hosted: find, load, read, and request errors, with no server path in any t
     text: "file is not in the selected skill revision",
   });
   await writeFile(path.join(skillDir, "references", "x.md"), "x".repeat("reference text\n".length));
+  assert.deepEqual(await call(client, "read_skill_file", { id, path: "references/x.md" }), {
+    isError: true,
+    text: "skill files changed since indexing; ask the store operator to run margrave reindex, then search again",
+  });
   assert.deepEqual(await call(client, "read_skill_file", { id, path: "references/x.md", revision }), {
     isError: true,
     text: "skill files changed since indexing; ask the store operator to run margrave reindex, then search again",
@@ -314,12 +318,20 @@ test("hosted: find, load, read, and request errors, with no server path in any t
   for (const bad of ["../secret.txt", path.join(dir, "secret.txt")]) {
     const r = await call(client, "read_skill_file", { id, path: bad });
     assert.equal(r.isError, true, bad);
-    assert.match(r.text, bad.startsWith("..") ? /outside/u : /relative/u, bad);
+    assert.equal(r.text, "file is not in the selected skill revision", bad);
   }
   const unknown = await call(client, "load_skill", { id: "nope" });
   assert.equal(unknown.isError, true);
   assert.match(unknown.text, /no skill "nope"/u);
   noPaths(unknown.text);
+  await writeFile(path.join(skillDir, "references", "x.md"), "updated reference\n");
+  const update = await runCli(["update", sourceId], { home, fakeBin });
+  assert.equal(update.code, 0, update.stderr);
+  for (const tool of ["load_skill", "read_skill_file"]) {
+    const args = { id, ...(tool === "read_skill_file" ? { path: "references/x.md" } : {}) };
+    assert.match((await call(client, tool, { ...args, revision })).text, /skill revision changed/u);
+    assert.equal((await call(client, tool, args)).isError, false);
+  }
 });
 
 test("hosted: read_skill_file refuses .git and the text holds no store path", async (t) => {
@@ -336,7 +348,7 @@ test("hosted: read_skill_file refuses .git and the text holds no store path", as
 
   const r = await call(client, "read_skill_file", { id, path: ".git/config" });
   assert.equal(r.isError, true);
-  assert.match(r.text, /inside \.git/u);
+  assert.equal(r.text, "file is not in the selected skill revision");
   assert.ok(!r.text.includes(home), r.text);
   assert.ok(!r.text.includes(dir), r.text);
   assert.ok(!r.text.includes("token"), r.text);
@@ -359,8 +371,19 @@ test("hosted: a git source with SKILL.md at the repository root serves no .git f
   for (const p of [".git/config", ".git/logs/HEAD"]) {
     const r = await call(client, "read_skill_file", { id, path: p });
     assert.equal(r.isError, true, p);
-    assert.match(r.text, /inside \.git/u);
+    assert.equal(r.text, "file is not in the selected skill revision");
   }
+  const source = id.split("/")[0]!;
+  const snapshotSkill = path.join(home, "sources", source, "SKILL.md");
+  await writeFile(snapshotSkill, skillMd("root-skill", "Changed"));
+  const drift = "skill files differ from the accepted revision. Ask the store operator to restore a verified copy";
+  assert.deepEqual(await call(client, "load_skill", { id }), { isError: true, text: drift });
+  assert.deepEqual(await call(client, "read_skill_file", { id, path: "SKILL.md" }), { isError: true, text: drift });
+  await rm(path.join(home, "sources", source), { force: true });
+  const record = catalogRecords(home).find((s) => s.id === source)!;
+  await rm(path.join(home, "snapshots", source, record.snapshot!), { recursive: true });
+  assert.deepEqual(await call(client, "load_skill", { id }), { isError: true, text: drift });
+  assert.deepEqual(await call(client, "read_skill_file", { id, path: "SKILL.md" }), { isError: true, text: drift });
 });
 
 test("hosted: a store failure returns a generic error and logs the cause", async (t) => {

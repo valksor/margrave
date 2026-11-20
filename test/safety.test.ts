@@ -3,8 +3,8 @@ import { chmod, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { PINNED_RIPWIRE, VERSION_TIMEOUT_MS, esc, parseScanXml, runRipwire, scanWithRipwire } from "../src/safety.ts";
-import { MargraveError } from "../src/store.ts";
+import { PINNED_RIPWIRE, VERSION_TIMEOUT_MS, esc, parseScanXml, runRipwire, scanWithRipwire as scan } from "../src/safety.ts";
+import { MargraveError, validScan } from "../src/store.ts";
 import { ROOT, fakeRipwire, mkfifo, releaseFifo, tmp } from "./helpers.ts";
 
 // ---- parser ----
@@ -124,12 +124,107 @@ const opts = (logs: string[], over: { allowUnsafe?: boolean; baselineDir?: strin
   ...(over.baselineDir === undefined ? {} : { baselineDir: over.baselineDir }),
 });
 
+async function scanWithRipwire(dir: string, options: ReturnType<typeof opts>): ReturnType<typeof scan> {
+  const { baselineDir, ...rest } = options;
+  const baseline =
+    baselineDir === undefined
+      ? undefined
+      : baselineDir === null
+        ? null
+        : await scan(baselineDir, { ...rest, allowUnsafe: true, log: () => {}, verifyContent: true });
+  return scan(dir, { ...rest, ...(baseline === undefined ? {} : { baseline }) });
+}
+
+test("accepted scan records retain verdicts and native relative fingerprints", async () => {
+  const e = await env();
+  const clean = await scanDir({ "a/SKILL.md": "clean\n" });
+  const warn = await scanDir({ "a/back\\slash.md": "x FAKE-WARN INJECTION:eval\n" });
+  const critical = await scanDir({ "a/SKILL.md": "x FAKE-CRIT EXFILTRATE:net-exfil\n" });
+  const a = await e.run(() => scan(clean, { ...opts([]), verifyContent: true }));
+  const b = await e.run(() => scan(warn, { ...opts([]), verifyContent: true }));
+  const c = await e.run(() => scan(critical, { ...opts([], { allowUnsafe: true }), verifyContent: true }));
+  const d = await e.run(() => scan(clean, { ...opts([], { allowUnsafe: true }), verifyContent: true }), { FAKE_RIPWIRE_EXIT: "3" });
+  assert.deepEqual([a.verdict, b.verdict, c.verdict, d.verdict], ["clean", "warn", "critical", "failed"]);
+  assert.deepEqual([a.overridden, b.overridden, c.overridden, d.overridden], [false, false, true, true]);
+  for (const result of [a, b, c, d]) {
+    assert.equal(result.version, PINNED_RIPWIRE);
+    assert.ok(result.tree);
+    assert.ok(validScan(JSON.parse(JSON.stringify(result))));
+    assert.ok(!JSON.stringify(result).includes(clean));
+  }
+  assert.equal(b.files[0]?.[0], "a/back\\slash.md");
+  assert.equal(validScan({ ...b, keys: [[JSON.stringify(["x", "rule", "warn", 123]), 1]] }), false);
+  for (const value of [
+    null,
+    {},
+    { ...b, extra: 1 },
+    { ...b, tree: "bad" },
+    { ...b, tree: 12 },
+    { ...b, version: 1 },
+    { ...b, overridden: "yes" },
+    { ...b, verdict: "unknown" },
+    { ...b, code: 0 },
+    { ...a, code: 1 },
+    { ...c, code: 1 },
+    { ...d, code: "bad" },
+    { ...b, keys: null },
+    { ...b, files: null },
+    { ...b, keys: [null] },
+    { ...b, keys: [["bad"]] },
+    { ...b, keys: [[0, 1]] },
+    { ...b, keys: [["bad", 0]] },
+    { ...b, keys: [["not json", 1]] },
+    ...[
+      null,
+      [],
+      ["x"],
+      ["/absolute", "r", "warn", "a".repeat(64)],
+      ["../escape", "r", "warn", "a".repeat(64)],
+      ["x", 2, "warn", "a".repeat(64)],
+      ["x", "r", "other", "a".repeat(64)],
+      ["x", "r", "warn", "bad"],
+    ].map((key) => ({ ...b, keys: [[JSON.stringify(key), 1]] })),
+    ...[null, [], ["/absolute", "a".repeat(64)], ["../escape", "a".repeat(64)], ["x", 1], ["x", "bad"]].map((item) => ({
+      ...b,
+      files: [item],
+    })),
+  ])
+    assert.equal(validScan(value), false);
+  const logs: string[] = [];
+  await assert.rejects(
+    e.run(() => scan(critical, { ...opts(logs), baseline: d })),
+    /refused: ripwire found CRITICAL/u,
+  );
+  assert.equal(logs[0], "scan: no accepted baseline. Applying install rules");
+});
+
+test("verified scans reject changed trees and non-file entries", async (t) => {
+  const dir = await scanDir({ "a/SKILL.md": "clean\n" });
+  const bin = await tmp("mg-mutating-scanner-");
+  const executable = path.join(bin, "ripwire");
+  await writeFile(
+    executable,
+    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'ripwire ${PINNED_RIPWIRE}'; exit 0; fi\ndir=\${2#--scan-skills=}; printf changed > "$dir/added.txt"; exit 0\n`,
+  );
+  await chmod(executable, 0o755);
+  await assert.rejects(
+    withPath(bin, () => scan(dir, { ...opts([]), verifyContent: true })),
+    /staged skills changed during scan/u,
+  );
+  const fifo = path.join(dir, "pipe");
+  await mkfifo(fifo);
+  t.after(() => releaseFifo(fifo));
+  await assert.rejects(scan(dir, { ...opts([]), verifyContent: true }), /staged skills changed during scan/u);
+});
+
 test("clean scan continues without logging and writes no report", async () => {
   const e = await env();
   const dir = await scanDir({ "a/SKILL.md": "nothing here\n" });
   const logs: string[] = [];
   const r = await e.run(() => scanWithRipwire(dir, opts(logs)));
-  assert.deepEqual(r, { code: 0, overridden: false });
+  assert.equal(r.code, 0);
+  assert.equal(r.verdict, "clean");
+  assert.equal(r.overridden, false);
   assert.deepEqual(logs, []);
 });
 
@@ -580,7 +675,7 @@ test("baseline: a clean installed copy makes every finding new; a missing one pr
   const warnOnly = await scanDir({ "a/SKILL.md": "x FAKE-WARN INJECTION:eval\n" });
   const r = await e.run(() => scanWithRipwire(warnOnly, opts(logs, { baselineDir: null })));
   assert.equal(r.code, 1);
-  assert.equal(logs[0], "scan: no baseline (the installed copy is missing); every finding counts as new");
+  assert.equal(logs[0], "scan: no accepted baseline. Applying install rules");
   await assert.rejects(
     e.run(() => scanWithRipwire(staging, opts([], { baselineDir: null }))),
     /refused: ripwire found CRITICAL findings \(exit 2\)/u,
@@ -660,7 +755,9 @@ test("a scan root that cannot be resolved refuses, and --allow-unsafe overrides"
   );
   const logs: string[] = [];
   const r = await withScripted(bin, () => scanWithRipwire(gone, opts(logs, { allowUnsafe: true })));
-  assert.deepEqual(r, { code: null, overridden: true });
+  assert.equal(r.code, null);
+  assert.equal(r.verdict, "failed");
+  assert.equal(r.overridden, true);
 });
 
 test("ripwire's own output is shown cut to 40 lines of 500 characters", async () => {

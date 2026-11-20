@@ -391,6 +391,33 @@ const passRename = (): void => {
   syncBuiltinESMExports();
 };
 
+test("Git install and update refuse staged changes before the scanner reads", async (t) => {
+  await inStore(t, async (home) => {
+    const repo = await makeRepo();
+    const real = fsp.readdir;
+    const inject = (): void => {
+      let fired = false;
+      mock.method(fsp, "readdir", (async (dir: string, ...args: unknown[]) => {
+        if (!fired && dir.includes(`${path.sep}staging${path.sep}`) && dir.endsWith(`${path.sep}repo`) && args.length === 0) {
+          fired = true;
+          await writeFile(path.join(dir, "skills", "react-perf", "SKILL.md"), "changed\n");
+        }
+        return (real as (...a: unknown[]) => Promise<unknown>)(dir, ...args);
+      }) as typeof fsp.readdir);
+      syncBuiltinESMExports();
+    };
+    inject();
+    await assert.rejects(installSource(repo.url, null, quiet), /staged skills changed during scan/u);
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    const { id } = await installSource(repo.url, null, quiet);
+    const before = catalogRecords(home);
+    inject();
+    await assert.rejects(updateSources(id, quiet), /staged skills changed during scan/u);
+    assert.deepEqual(catalogRecords(home), before);
+  });
+});
+
 const read = async (home: string, file: string): Promise<string | null> => {
   if (file === "sources.json") {
     try {

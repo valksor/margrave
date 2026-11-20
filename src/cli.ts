@@ -236,13 +236,14 @@ async function run(argv: string[]): Promise<void> {
       } finally {
         c.db.close();
       }
+      const gitDrift = c.sources.some((s) => s.id === entry.source && s.kind === "git") ? "cli" : undefined;
       if (typeof p.values["file"] === "string") {
-        const content = await readSelectedFile(entry, p.values["file"], revision);
+        const content = await readSelectedFile(entry, p.values["file"], revision, gitDrift);
         if (p.values["json"] === true) json({ id: entry.id, path: p.values["file"], content });
         else process.stdout.write(content);
         return;
       }
-      const r = await loadSkill(entry, c.sources, revision);
+      const r = await loadSkill(entry, c.sources, revision, gitDrift);
       // Written as is: the body is the payload, so no newline is added.
       if (p.values["json"] === true) json(r);
       else process.stdout.write(formatLoad(r));

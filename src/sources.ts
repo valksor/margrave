@@ -651,7 +651,13 @@ async function installGit(
     if (scan.skills.length === 0) {
       throw new MargraveError(`no valid skills (SKILL.md with name and description) found in ${spec}`);
     }
-    await scanWithRipwire(scanRoot, { ...ctx, sourceId: id, skills: scan.skills });
+    const acceptedScan = await scanWithRipwire(scanRoot, { ...ctx, sourceId: id, skills: scan.skills, verifyContent: true });
+    const checked = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone, strict: true });
+    if (
+      JSON.stringify(toEntries(id, checked.skills, (d) => path.relative(realClone, d))) !==
+      JSON.stringify(toEntries(id, scan.skills, (d) => path.relative(realClone, d)))
+    )
+      throw new MargraveError("staged skills changed during scan");
     const { snapshot, entries } = await prepareSnapshot(id, sha, clone, realClone, scan.skills);
     const record: SourceRecord = {
       id,
@@ -662,6 +668,7 @@ async function installGit(
       ref: pinned,
       commit: sha,
       snapshot,
+      scan: acceptedScan,
       installedAt: new Date().toISOString(),
     };
 
@@ -765,9 +772,20 @@ async function updateOne(id: string, ctx: Ctx, ref: string | null): Promise<Upda
     const scan = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone, strict: true });
     logWarnings(ctx, scan.warnings);
     if (scan.skills.length === 0) throw new MargraveError(`no valid skills found in the new revision of ${id}; kept the old copy`);
-    // The baseline: the installed copy, scanned before the swap. It is what the user accepted.
-    const baselineDir = await installedScanRoot(gitDir(rec), rec.subpath);
-    await scanWithRipwire(scanRoot, { ...ctx, sourceId: id, skills: scan.skills, baselineDir });
+    // Compare against the accepted scan stored with the current snapshot.
+    const acceptedScan = await scanWithRipwire(scanRoot, {
+      ...ctx,
+      sourceId: id,
+      skills: scan.skills,
+      baseline: rec.scan ?? null,
+      verifyContent: true,
+    });
+    const checked = await scanSource(scanRoot, { followSymlinks: false, boundary: realClone, strict: true });
+    if (
+      JSON.stringify(toEntries(id, checked.skills, (d) => path.relative(realClone, d))) !==
+      JSON.stringify(toEntries(id, scan.skills, (d) => path.relative(realClone, d)))
+    )
+      throw new MargraveError("staged skills changed during scan");
     const { snapshot, entries } = await prepareSnapshot(id, sha, clone, realClone, scan.skills);
     await commit((fresh, db) => {
       const current = fresh.find((s) => s.id === id);
@@ -779,20 +797,10 @@ async function updateOne(id: string, ctx: Ctx, ref: string | null): Promise<Upda
       deleteSourceSkills(db, id);
       insertSkills(db, entries);
       diff.value = diffEntries(before, entries);
-      return fresh.map((s) => (s.id === id ? { ...s, commit: sha, snapshot, ref: selected } : s));
+      return fresh.map((s) => (s.id === id ? { ...s, commit: sha, snapshot, ref: selected, scan: acceptedScan } : s));
     });
     return { id, kind: "git" as const, oldCommit: rec.commit, newCommit: sha, ...(diff.value as ReturnType<typeof diffEntries>) };
   });
-}
-
-/** The real scan root inside the installed copy of a git source, or null when it is not there. */
-async function installedScanRoot(final: string, subpath: string): Promise<string | null> {
-  if ((await lstat(final).catch(() => null)) === null) return null;
-  try {
-    return await realpath(await resolveScanRoot(await realpath(final), subpath));
-  } catch {
-    return null;
-  }
 }
 
 async function scanLocal(rec: SourceRecord, ctx: Ctx): Promise<NewEntry[]> {
@@ -906,27 +914,60 @@ async function scanInstalledSources(sources: readonly SourceRecord[], ctx: Ctx):
       entries.push(...(await scanInstalledSource(rec, ctx)));
     } catch (err) {
       failed.add(rec.id);
-      ctx.log(`warning: ${rec.id}: ${esc(err instanceof Error ? err.message : String(err))}; skipped`);
+      const code = (err as NodeJS.ErrnoException)?.code;
+      const missing = code === "ENOENT" || code === "ENOTDIR" || (err instanceof MargraveError && err.message.startsWith("subpath "));
+      const message =
+        rec.kind === "git" && missing
+          ? "installed Git files differ from the accepted revision. Restore a verified lock or a known-good backup"
+          : esc(err instanceof Error ? err.message : String(err));
+      ctx.log(`warning: ${rec.id}: ${message}; skipped`);
     }
   }
   return { entries, failed };
 }
 
-function applyReindex(sources: readonly SourceRecord[], scan: ReindexScan, fresh: SourceRecord[], db: DatabaseSync): SourceRecord[] {
+function verifyReindex(sources: readonly SourceRecord[], scan: ReindexScan, db: DatabaseSync, ctx: Ctx): void {
+  for (const rec of sources) {
+    if (rec.kind !== "git" || scan.failed.has(rec.id)) continue;
+    const indexed = db.prepare("SELECT id, hash AS revision, dir, manifest FROM skills WHERE source = ? ORDER BY id").all(rec.id);
+    const observed = scan.entries
+      .filter((entry) => entry.source === rec.id)
+      .map(({ id, revision, dir, manifest }) => ({ id, revision, dir, manifest }))
+      .sort((a, b) => Number(a.id > b.id) - Number(a.id < b.id));
+    if (JSON.stringify(indexed) !== JSON.stringify(observed)) {
+      scan.failed.add(rec.id);
+      ctx.log(
+        `warning: ${rec.id}: installed Git files differ from the accepted revision. Restore a verified lock or a known-good backup; skipped`,
+      );
+    }
+  }
+}
+
+function applyReindex(
+  sources: readonly SourceRecord[],
+  scan: ReindexScan,
+  fresh: SourceRecord[],
+  db: DatabaseSync,
+  ctx: Ctx,
+): SourceRecord[] {
   if (JSON.stringify(fresh) !== JSON.stringify(sources)) {
     throw new MargraveError("sources changed during reindex; run: margrave reindex");
   }
+  verifyReindex(sources, scan, db, ctx);
   if (scan.failed.size === 0) deleteAllSkills(db);
   else for (const rec of sources) if (!scan.failed.has(rec.id)) deleteSourceSkills(db, rec.id);
-  insertSkills(db, scan.entries);
+  insertSkills(
+    db,
+    scan.entries.filter((entry) => !scan.failed.has(entry.source)),
+  );
   return fresh;
 }
 
 export async function reindexAll(ctx: Ctx): Promise<{ skills: number; sources: number }> {
   const sources = await readSources();
   const scan = await scanInstalledSources(sources, ctx);
-  await commit((fresh, db) => applyReindex(sources, scan, fresh, db));
-  return { skills: scan.entries.length, sources: sources.length };
+  await commit((fresh, db) => applyReindex(sources, scan, fresh, db, ctx));
+  return { skills: scan.entries.filter((entry) => !scan.failed.has(entry.source)).length, sources: sources.length };
 }
 
 export async function migrateStore(): Promise<boolean> {

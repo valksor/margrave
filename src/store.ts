@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { TokenStrings } from "./bm25.ts";
+import type { ScanOutcome } from "./safety.ts";
 
 /** An error whose message is meant for the user. The CLI prints it and exits 1. */
 export class MargraveError extends Error {}
@@ -31,6 +32,7 @@ export interface SourceRecord {
   installedAt: string;
   /** Managed Git snapshot key. */
   snapshot?: string;
+  scan?: ScanOutcome;
 }
 
 export interface IndexEntry {
@@ -110,8 +112,7 @@ function validSourceLocation(v: Record<string, unknown>): boolean {
   );
 }
 
-function validSource(v: unknown): v is SourceRecord {
-  if (!isRecord(v)) return false;
+function validSourceFields(v: Record<string, unknown>): boolean {
   if (typeof v["id"] !== "string" || typeof v["spec"] !== "string") return false;
   if (v["kind"] !== "git" && v["kind"] !== "local") return false;
   if (typeof v["subpath"] !== "string") return false;
@@ -122,6 +123,51 @@ function validSource(v: unknown): v is SourceRecord {
   if (v["kind"] === "git")
     return typeof v["url"] === "string" && typeof v["ref"] === "string" && /^refs\/(?:heads|tags)\/.+/u.test(v["ref"]);
   return true;
+}
+
+function validSource(v: unknown): v is SourceRecord {
+  return isRecord(v) && validSourceFields(v) && (v["scan"] === undefined || (v["kind"] === "git" && validScan(v["scan"])));
+}
+
+export function validScan(value: unknown): value is ScanOutcome {
+  if (!isRecord(value) || Object.keys(value).sort().join(",") !== "code,files,keys,overridden,tree,verdict,version") return false;
+  if (value["tree"] !== null && (typeof value["tree"] !== "string" || !/^[0-9a-f]{64}$/u.test(value["tree"]))) return false;
+  if (!(value["version"] === null || typeof value["version"] === "string") || typeof value["overridden"] !== "boolean") return false;
+  const verdict = value["verdict"];
+  if (!(["clean", "warn", "critical", "failed"] as unknown[]).includes(verdict)) return false;
+  if (
+    (verdict === "clean" && value["code"] !== 0) ||
+    (verdict === "warn" && value["code"] !== 1) ||
+    (verdict === "critical" && value["code"] !== 2)
+  )
+    return false;
+  if (verdict === "failed" && value["code"] !== null && typeof value["code"] !== "number") return false;
+  const relative = (s: unknown): s is string =>
+    typeof s === "string" && s !== "" && !path.isAbsolute(s) && !s.split(path.sep).some((p) => p === ".." || p === "");
+  if (!Array.isArray(value["keys"]) || !Array.isArray(value["files"])) return false;
+  for (const item of value["keys"]) {
+    if (!Array.isArray(item) || item.length !== 2 || typeof item[0] !== "string" || !Number.isSafeInteger(item[1]) || item[1] < 1)
+      return false;
+    try {
+      const key: unknown = JSON.parse(item[0]);
+      if (
+        !Array.isArray(key) ||
+        key.length !== 4 ||
+        !relative(key[0]) ||
+        typeof key[1] !== "string" ||
+        !["warn", "critical"].includes(key[2]) ||
+        typeof key[3] !== "string" ||
+        !/^[0-9a-f]{64}$/u.test(key[3])
+      )
+        return false;
+    } catch {
+      return false;
+    }
+  }
+  return value["files"].every(
+    (item: unknown) =>
+      Array.isArray(item) && item.length === 2 && relative(item[0]) && typeof item[1] === "string" && /^[0-9a-f]{64}$/u.test(item[1]),
+  );
 }
 
 /** A missing file is an empty list. A malformed file is an error. */

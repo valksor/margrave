@@ -148,7 +148,9 @@ Set `MARGRAVE_SKILLS_SH=1` to enable skills.sh suggestions for the CLI and stdio
 
 `margrave lock restore margrave-lock.json` verifies and restores the locked Git sources. Use a clean store for an exact catalog. Restore keeps unrelated installed sources and rejects conflicting copies.
 
-If a restore stops during publication, run the same command again. Margrave verifies completed content and resumes the missing sources.
+Git reindex verifies the installed files against the accepted manifest. If the files differ, the command reports drift and keeps the accepted revision. Restore the source from a verified lock or restore a known-good backup. Local reindex refreshes the authoring index. An unscanned local revision has unknown scan provenance.
+
+If a restore stops during publication, run the same command again. Margrave verifies completed content and resumes the restore.
 
 `margrave update <source> --ref refs/heads/<name>` selects a different branch. Use `refs/tags/<name>` for a tag. The new tracking ref is saved after a successful update.
 
@@ -230,17 +232,17 @@ For every scan that is not clean, ripwire's raw XML for the new copy is written 
 
 ### Baseline on `update`
 
-The baseline is the installed copy in `sources/<id>/`: what you accepted, either because it was clean or because you installed it with `--allow-unsafe`. `update` of a git source scans both the installed copy and the new copy, then refuses only on findings that the installed copy does not have. Nothing is stored for this. A source installed before this rule gets its baseline from its first `update`. `update` therefore runs ripwire twice (the baseline scan is skipped when the new copy is clean).
+Git installs and updates scan a staged copy before publication. Margrave records the scan verdict and any override with that revision. Updates compare against the accepted scan. A source with no accepted scan follows the install rules. Historical scan results that the catalog cannot verify are unknown.
 
 A finding is identified by `(path inside the source, rule, severity, sha256 of the trimmed flagged line)`. The line number is not part of it, so an edit elsewhere in a file creates no new finding. Findings are compared as a multiset: a second copy of a known line is new. Severity `warn` is warn; any other value counts as critical, and a rise from warn to critical is new.
 
-| Situation                                                                      | Outcome                                                                                         |
-| ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
-| The new copy is clean, or every finding is in the installed copy               | continue                                                                                        |
-| New findings, all warn                                                         | continue, new findings listed                                                                   |
-| Any new critical finding, or a finding whose line cannot be read               | refuse, new findings listed                                                                     |
-| The new scan fails (exit 3, another code, unparseable output, ripwire missing) | refuse                                                                                          |
-| No baseline: the installed copy is missing, or its scan fails                  | print `scan: no baseline (<reason>); every finding counts as new` and apply the `install` rules |
+| Situation                                                                      | Outcome                                                                                  |
+| ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| The new copy is clean, or the accepted scan contains every finding             | continue                                                                                 |
+| New findings, all warn                                                         | continue, new findings listed                                                            |
+| Any new critical finding, or a finding whose line cannot be read               | refuse, new findings listed                                                              |
+| The new scan fails (exit 3, another code, unparseable output, ripwire missing) | refuse                                                                                   |
+| No accepted baseline or the accepted scan failed                               | print `scan: no accepted baseline. Applying install rules` and apply the `install` rules |
 
 A flagged line cannot be read when its file is a symlink or has a symlink in its path, is outside the scan root, is not valid UTF-8, or the line number does not exist. Such a finding always counts as new, in the new copy and in the baseline. Output is unparseable when it has no `<skillscan>` element, its row count differs from `findings=`, it reports CRITICAL without a critical row, or it exits 1 without a row.
 
@@ -258,7 +260,7 @@ Limit: the baseline compares the flagged line, not the lines around it. A known 
 | `load_skill`      | `id`, `revision?`            | The same text as `margrave load`.                                                                                                       |
 | `read_skill_file` | `id`, `path`, `revision?`    | One file, with the same guard as `--file`.                                                                                              |
 
-Supply the search result's revision to verify a load or a supporting file read.
+Both MCP load tools verify file contents against the selected revision. The active indexed revision applies when the caller omits `revision`.
 
 Set `MARGRAVE_ALLOWED_SOURCES` for a stdio server to a comma-separated list of source IDs from `margrave list`. Leave the variable unset to serve all sources. Set it to an empty string to serve none.
 

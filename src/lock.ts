@@ -1,9 +1,10 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { scanSource } from "./scan.ts";
-import { scanWithRipwire } from "./safety.ts";
+import { scanInventory, scanWithRipwire } from "./safety.ts";
+import type { ScanOutcome } from "./safety.ts";
 import {
   commit,
   git,
@@ -26,6 +27,7 @@ import {
   home,
   insertSkills,
   isRecord,
+  validScan,
   openCatalogReadOptional,
 } from "./store.ts";
 import type { NewEntry, SourceRecord } from "./store.ts";
@@ -185,7 +187,6 @@ function indexedEntries(db: DatabaseSync, id: string): { id: string; revision: s
 
 async function verifyInstalled(rec: SourceRecord, locked: LockedSource, db: DatabaseSync): Promise<void> {
   try {
-    if (!matchesLock(rec, locked)) throw new Error();
     const scanned = await scanInstalledSource(rec, { log: () => {}, allowUnsafe: false });
     const indexed = indexedEntries(db, rec.id);
     if (!sameInventory(scanned, locked) || !sameInventory(indexed, locked)) throw new Error();
@@ -235,7 +236,11 @@ export async function exportLock(selected: string[]): Promise<LockFile> {
   }
 }
 
-type PendingRestore = { source: LockedSource; record: SourceRecord };
+type PendingRestore = { source: LockedSource; record: SourceRecord; original?: string };
+const recoveryIdentity = (rec: SourceRecord, rows: unknown): string =>
+  createHash("sha256")
+    .update(JSON.stringify([rec, rows]))
+    .digest("hex");
 const pendingPath = (id: string): string => path.join(home(), "restore-pending", `${id}.json`);
 
 async function readPending(source: LockedSource): Promise<PendingRestore | undefined> {
@@ -249,7 +254,9 @@ async function readPending(source: LockedSource): Promise<PendingRestore | undef
   let pending: PendingRestore;
   try {
     const raw: unknown = JSON.parse(data);
-    if (!isRecord(raw) || Object.keys(raw).sort().join(",") !== "record,source") throw new Error();
+    if (!isRecord(raw) || !["record,source", "original,record,source"].includes(Object.keys(raw).sort().join(","))) throw new Error();
+    if (raw["original"] !== undefined && (typeof raw["original"] !== "string" || !/^[0-9a-f]{64}$/u.test(raw["original"])))
+      throw new Error();
     const locked = parseLock({ version: 1, sources: [raw["source"]] }).sources[0];
     const record = raw["record"] as SourceRecord;
     if (
@@ -257,14 +264,18 @@ async function readPending(source: LockedSource): Promise<PendingRestore | undef
       locked.id !== source.id ||
       typeof record !== "object" ||
       record === null ||
-      Object.keys(record).sort().join(",") !== "commit,id,installedAt,kind,ref,snapshot,spec,subpath,url" ||
+      ![
+        "commit,id,installedAt,kind,ref,snapshot,spec,subpath,url",
+        "commit,id,installedAt,kind,ref,scan,snapshot,spec,subpath,url",
+      ].includes(Object.keys(record).sort().join(",")) ||
+      (record.scan !== undefined && !validScan(record.scan)) ||
       typeof record.installedAt !== "string" ||
       typeof record.snapshot !== "string" ||
       !new RegExp(`^${locked.commit}-[0-9a-f]{16}$`, "u").test(record.snapshot) ||
       !matchesLock(record, locked)
     )
       throw new Error();
-    pending = { source: locked, record };
+    pending = { source: locked, record, ...(typeof raw["original"] === "string" ? { original: raw["original"] } : {}) };
   } catch {
     throw new MargraveError(`pending restore record is malformed: ${source.id}`);
   }
@@ -273,15 +284,30 @@ async function readPending(source: LockedSource): Promise<PendingRestore | undef
   return pending;
 }
 
-async function scanLockedDirectory(dir: string, source: LockedSource, ctx: Ctx): Promise<NewEntry[]> {
+async function scanLockedDirectory(
+  dir: string,
+  source: LockedSource,
+  ctx: Ctx,
+  prior?: ScanOutcome,
+): Promise<{ entries: NewEntry[]; scan: Awaited<ReturnType<typeof scanWithRipwire>> }> {
   const root = await resolveScanRoot(dir, source.subpath);
   const scan = await scanSource(root, { followSymlinks: false, boundary: await realpath(dir), strict: true });
   logWarnings(ctx, scan.warnings);
   if (scan.skills.length === 0) throw new MargraveError(`staged skills differ from the lock: ${source.id}`);
-  await scanWithRipwire(root, { ...ctx, sourceId: source.id, skills: scan.skills });
+  let accepted: ScanOutcome;
+  if (prior?.tree !== undefined && prior.tree !== null && (await scanInventory(root)) !== prior.tree)
+    throw new MargraveError(`installed source differs from the lock: ${source.id}`);
+  if (prior !== undefined && prior.verdict !== "failed" && prior.tree !== null) {
+    accepted = prior;
+  } else accepted = await scanWithRipwire(root, { ...ctx, sourceId: source.id, skills: scan.skills, verifyContent: true });
+  const checked = await scanSource(root, { followSymlinks: false, boundary: await realpath(dir), strict: true });
   const entries = toEntries(source.id, scan.skills, (d) => d);
+  if (accepted.tree !== null && (await scanInventory(root)) !== accepted.tree)
+    throw new MargraveError(`installed source differs from the lock: ${source.id}`);
+  if (JSON.stringify(entries) !== JSON.stringify(toEntries(source.id, checked.skills, (d) => d)))
+    throw new MargraveError(`staged skills differ from the lock: ${source.id}`);
   if (!sameInventory(entries, source)) throw new MargraveError(`staged skills differ from the lock: ${source.id}`);
-  return entries;
+  return { entries, scan: accepted };
 }
 
 interface RestorePlan {
@@ -291,9 +317,15 @@ interface RestorePlan {
   marker: PendingRestore | undefined;
   verified: boolean;
   indexed: string;
+  original?: SourceRecord;
 }
 
-async function stageLockedCommit(source: LockedSource, stage: string, ctx: Ctx): Promise<{ dir: string; entries: NewEntry[] }> {
+async function stageLockedCommit(
+  source: LockedSource,
+  stage: string,
+  ctx: Ctx,
+  prior?: ScanOutcome,
+): Promise<{ dir: string; entries: NewEntry[]; scan: Awaited<ReturnType<typeof scanWithRipwire>> }> {
   const clone = path.join(stage, source.id);
   try {
     await git(["init", "--quiet", ...(source.commit.length === 64 ? ["--object-format=sha256"] : []), clone]);
@@ -302,10 +334,101 @@ async function stageLockedCommit(source: LockedSource, stage: string, ctx: Ctx):
     await git(["-C", clone, "checkout", "--detach", "FETCH_HEAD"]);
     if ((await git(["-C", clone, "rev-parse", "HEAD"])).trim() !== source.commit) throw new Error();
   } catch {
-    throw new MargraveError(`locked commit is unavailable for ${source.id}`);
+    throw new MargraveError(`locked commit is unavailable for ${source.id}; restore a known-good backup`);
   }
   await rm(path.join(clone, ".git"), { recursive: true, force: true });
-  return { dir: clone, entries: await scanLockedDirectory(clone, source, ctx) };
+  return { dir: clone, ...(await scanLockedDirectory(clone, source, ctx, prior)) };
+}
+
+function verifyStagedRows(source: LockedSource, staged: { dir: string; entries: NewEntry[] }, indexed: string): void {
+  const rows = staged.entries
+    .map(({ id, revision, manifest, dir }) => ({ id, revision, manifest, dir: path.relative(staged.dir, dir) }))
+    .sort((a, b) => Number(a.id > b.id) - Number(a.id < b.id));
+  if (JSON.stringify(rows) !== indexed) throw new MargraveError(`installed source differs from the lock: ${source.id}`);
+}
+
+async function preflightPending(
+  source: LockedSource,
+  marker: PendingRestore,
+  rec: SourceRecord | undefined,
+  db: DatabaseSync | null,
+  stage: string,
+  ctx: Ctx,
+): Promise<RestorePlan | undefined> {
+  const destination = gitDir(marker.record);
+  const exists = await lstat(destination).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  });
+  const originalMatches =
+    rec !== undefined &&
+    db !== null &&
+    marker.original !== undefined &&
+    recoveryIdentity(rec, indexedEntries(db, source.id)) === marker.original;
+  if (marker.original !== undefined && rec === undefined) throw new MargraveError(`installed source differs from the lock: ${source.id}`);
+  if (rec !== undefined && (!matchesLock(rec, source) || (rec.snapshot !== marker.record.snapshot && !originalMatches)))
+    throw new MargraveError(`installed source differs from the lock: ${source.id}`);
+  if (exists !== null) {
+    if (!exists.isDirectory() || exists.isSymbolicLink()) throw new MargraveError(`pending restore record is malformed: ${source.id}`);
+    const { entries } = await scanLockedDirectory(destination, source, ctx, marker.record.scan);
+    let verified = false;
+    if (rec !== undefined && db !== null && rec.snapshot === marker.record.snapshot) {
+      try {
+        await verifyInstalled(rec, source, db);
+        verified = true;
+      } catch {
+        /* A pending publication can have incomplete index rows. */
+      }
+    }
+    if (originalMatches && db !== null) {
+      verifyStagedRows(source, { dir: destination, entries }, JSON.stringify(indexedEntries(db, source.id)));
+    }
+    return {
+      dir: destination,
+      record: marker.record,
+      entries,
+      marker,
+      verified,
+      indexed: JSON.stringify(db === null ? [] : indexedEntries(db, source.id)),
+      ...(originalMatches ? { original: rec } : {}),
+    };
+  }
+  if (rec !== undefined && !originalMatches) throw new MargraveError(`installed source differs from the lock: ${source.id}`);
+  if (originalMatches && db !== null) {
+    const staged = await stageLockedCommit(source, stage, ctx, marker.record.scan);
+    const indexed = JSON.stringify(indexedEntries(db, source.id));
+    verifyStagedRows(source, staged, indexed);
+    return { dir: staged.dir, entries: staged.entries, record: marker.record, marker, verified: false, indexed, original: rec };
+  }
+  return undefined;
+}
+
+async function preflightInstalled(
+  source: LockedSource,
+  rec: SourceRecord,
+  db: DatabaseSync,
+  stage: string,
+  ctx: Ctx,
+): Promise<RestorePlan> {
+  if (!matchesLock(rec, source) || !sameInventory(indexedEntries(db, source.id), source))
+    throw new MargraveError(`installed source differs from the lock: ${source.id}`);
+  const indexed = JSON.stringify(indexedEntries(db, source.id));
+  try {
+    await verifyInstalled(rec, source, db);
+    return { dir: null, record: rec, entries: [], marker: undefined, verified: true, indexed };
+  } catch {
+    const staged = await stageLockedCommit(source, stage, ctx, rec.scan);
+    verifyStagedRows(source, staged, indexed);
+    return {
+      dir: staged.dir,
+      entries: staged.entries,
+      record: { ...rec, snapshot: `${source.commit}-${randomBytes(8).toString("hex")}`, scan: staged.scan },
+      marker: undefined,
+      verified: false,
+      indexed,
+      original: rec,
+    };
+  }
 }
 
 async function preflightSource(
@@ -317,40 +440,10 @@ async function preflightSource(
   ctx: Ctx,
 ): Promise<RestorePlan> {
   if (marker !== undefined) {
-    const destination = gitDir(marker.record);
-    const exists = await lstat(destination).catch((err: NodeJS.ErrnoException) => {
-      if (err.code === "ENOENT") return null;
-      throw err;
-    });
-    if (rec !== undefined && (!matchesLock(rec, source) || rec.snapshot !== marker.record.snapshot))
-      throw new MargraveError(`installed source differs from the lock: ${source.id}`);
-    if (exists !== null) {
-      if (!exists.isDirectory() || exists.isSymbolicLink()) throw new MargraveError(`pending restore record is malformed: ${source.id}`);
-      const entries = await scanLockedDirectory(destination, source, ctx);
-      let verified = false;
-      if (rec !== undefined && db !== null) {
-        try {
-          await verifyInstalled(rec, source, db);
-          verified = true;
-        } catch {
-          /* A pending publication can have incomplete index rows. */
-        }
-      }
-      return {
-        dir: destination,
-        record: marker.record,
-        entries,
-        marker,
-        verified,
-        indexed: JSON.stringify(db === null ? [] : indexedEntries(db, source.id)),
-      };
-    }
-    if (rec !== undefined) throw new MargraveError(`installed source differs from the lock: ${source.id}`);
-  } else if (rec !== undefined && db !== null) {
-    await verifyInstalled(rec, source, db);
-    return { dir: null, record: rec, entries: [], marker, verified: true, indexed: JSON.stringify(indexedEntries(db, source.id)) };
-  }
-  const staged = await stageLockedCommit(source, stage, ctx);
+    const pending = await preflightPending(source, marker, rec, db, stage, ctx);
+    if (pending !== undefined) return pending;
+  } else if (rec !== undefined && db !== null) return preflightInstalled(source, rec, db, stage, ctx);
+  const staged = await stageLockedCommit(source, stage, ctx, marker?.record.scan);
   const record: SourceRecord = marker?.record ?? {
     id: source.id,
     kind: "git",
@@ -361,30 +454,44 @@ async function preflightSource(
     commit: source.commit,
     snapshot: `${source.commit}-${randomBytes(8).toString("hex")}`,
     installedAt: new Date().toISOString(),
+    scan: staged.scan,
   };
   return { ...staged, record, marker, verified: false, indexed: "" };
+}
+
+async function checkPublication(source: LockedSource, plan: RestorePlan, fresh: SourceRecord[], writer: DatabaseSync): Promise<void> {
+  const currentMarker = await readPending(source);
+  if (JSON.stringify(currentMarker) !== JSON.stringify(plan.marker))
+    throw new MargraveError(`restore is pending for a different lock source: ${source.id}`);
+  const current = fresh.find((s) => s.id === source.id);
+  const sameRows = (): boolean => JSON.stringify(indexedEntries(writer, source.id)) === plan.indexed;
+  if (plan.verified && (current === undefined || JSON.stringify(current) !== JSON.stringify(plan.record) || !sameRows()))
+    throw new MargraveError(`installed source differs from the lock: ${source.id}`);
+  if (plan.original !== undefined && (JSON.stringify(current) !== JSON.stringify(plan.original) || !sameRows()))
+    throw new MargraveError(`installed source differs from the lock: ${source.id}`);
+  if (
+    !plan.verified &&
+    current !== undefined &&
+    plan.original === undefined &&
+    (plan.marker === undefined || !matchesLock(current, source) || current.snapshot !== plan.record.snapshot)
+  )
+    throw new MargraveError(`installed source differs from the lock: ${source.id}`);
+}
+
+function markerFor(source: LockedSource, plan: RestorePlan): PendingRestore {
+  return {
+    source,
+    record: plan.record,
+    ...(plan.original === undefined ? {} : { original: recoveryIdentity(plan.original, JSON.parse(plan.indexed) as unknown) }),
+  };
 }
 
 async function publishSource(source: LockedSource, plan: RestorePlan): Promise<void> {
   const destination = gitDir(plan.record);
   await commit(async (fresh, writer) => {
-    const currentMarker = await readPending(source);
-    if (JSON.stringify(currentMarker) !== JSON.stringify(plan.marker))
-      throw new MargraveError(`restore is pending for a different lock source: ${source.id}`);
-    const current = fresh.find((s) => s.id === source.id);
-    if (plan.verified) {
-      if (
-        current === undefined ||
-        JSON.stringify(current) !== JSON.stringify(plan.record) ||
-        JSON.stringify(indexedEntries(writer, source.id)) !== plan.indexed
-      )
-        throw new MargraveError(`installed source differs from the lock: ${source.id}`);
-      return undefined;
-    }
-    if (current !== undefined && (plan.marker === undefined || !matchesLock(current, source) || current.snapshot !== plan.record.snapshot))
-      throw new MargraveError(`installed source differs from the lock: ${source.id}`);
-    if (plan.marker === undefined)
-      await atomicWrite(pendingPath(source.id), `${JSON.stringify({ source, record: plan.record }, null, 2)}\n`);
+    await checkPublication(source, plan, fresh, writer);
+    if (plan.verified) return undefined;
+    if (plan.marker === undefined) await atomicWrite(pendingPath(source.id), `${JSON.stringify(markerFor(source, plan), null, 2)}\n`);
     if (plan.dir !== destination) {
       await mkdir(path.dirname(destination), { recursive: true });
       if (
@@ -454,7 +561,7 @@ export async function restoreLock(lock: LockFile, ctx: Ctx, report: (line: strin
       await publishSource(source, plan);
       report(`${plan.verified ? "already restored" : "restored"} ${source.id}`);
       completed++;
-      if (plan.marker !== undefined || !plan.verified) await clearMarker(source, plan.marker ?? { source, record: plan.record });
+      if (plan.marker !== undefined || !plan.verified) await clearMarker(source, plan.marker ?? markerFor(source, plan));
     }
   } catch (err) {
     if (completed > 0) throw new MargraveError(`restore partially completed: ${err instanceof Error ? err.message : String(err)}`);

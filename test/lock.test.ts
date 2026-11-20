@@ -51,11 +51,17 @@ test("restore retains a malformed pending marker without publishing", async (t) 
   const ctx = { log: (): void => {}, allowUnsafe: false };
   const { id } = await installSource(repo.url, null, ctx);
   const lock = await exportLock([]);
+  const record = catalogRecords(process.env["MARGRAVE_HOME"])[0];
   const destination = await tmp("mg-home-");
   process.env["MARGRAVE_HOME"] = destination;
   const pending = path.join(destination, "restore-pending", `${id}.json`);
   await mkdir(path.dirname(pending), { recursive: true });
-  for (const contents of ["{", "{}\n", JSON.stringify({ source: lock.sources[0], record: null })]) {
+  for (const contents of [
+    "{",
+    "{}\n",
+    JSON.stringify({ source: lock.sources[0], record, original: "bad" }),
+    JSON.stringify({ source: lock.sources[0], record: null }),
+  ]) {
     await writeFile(pending, contents);
     await assert.rejects(
       restoreLock(lock, ctx, () => {}),
@@ -126,6 +132,7 @@ test("restore resumes a pending snapshot and rejects missing or non-directory de
   assert.ok(warnings.some((message) => message.includes("alias stat denied")));
   mock.restoreAll();
   syncBuiltinESMExports();
+  await rm(invalid, { recursive: true });
   const existingMarker = path.join(process.env["MARGRAVE_HOME"], "restore-pending", `${id}.json`);
   await mkdir(path.dirname(existingMarker), { recursive: true });
   const mismatchedRecord = { ...record, snapshot: `${record.snapshot!.slice(0, -16)}0000000000000000` };
@@ -271,6 +278,77 @@ test("restore keeps a competing source record changed before publication", async
   );
   assert.equal(hook.fired(), true);
   assert.equal(JSON.stringify(catalogRecords(home)), competing);
+});
+
+test("recovery refuses a competing source update before publication", async (t) => {
+  const previousHome = process.env["MARGRAVE_HOME"];
+  const previousPath = process.env["PATH"];
+  const home = await tmp("mg-home-");
+  process.env["MARGRAVE_HOME"] = home;
+  process.env["PATH"] = `${await fakeRipwire()}:${previousPath ?? ""}`;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previousHome;
+    if (previousPath === undefined) delete process.env["PATH"];
+    else process.env["PATH"] = previousPath;
+  });
+  const repo = await makeRepo();
+  const ctx = { log: (): void => {}, allowUnsafe: false };
+  const { id } = await installSource(repo.url, null, ctx);
+  const lock = await exportLock([]);
+  await writeFile(path.join(home, "sources", id, "skills", "react-perf", "SKILL.md"), "drift\n");
+  const competing = catalogRecords(home);
+  competing[0]!.installedAt = "competing writer";
+  const hook = changeAtLock(t, 3, () => writeCatalogRecords(home, competing));
+  await assert.rejects(
+    restoreLock(lock, ctx, () => {}),
+    /installed source differs from the lock/u,
+  );
+  assert.equal(hook.fired(), true);
+  assert.deepEqual(catalogRecords(home), competing);
+});
+
+test("lock restore refuses staged edits on either side of the scan", async (t) => {
+  const previousHome = process.env["MARGRAVE_HOME"];
+  const previousPath = process.env["PATH"];
+  process.env["MARGRAVE_HOME"] = await tmp("mg-home-");
+  process.env["PATH"] = `${await fakeRipwire()}:${previousPath ?? ""}`;
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    if (previousHome === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previousHome;
+    if (previousPath === undefined) delete process.env["PATH"];
+    else process.env["PATH"] = previousPath;
+  });
+  const repo = await makeRepo();
+  const ctx = { log: (): void => {}, allowUnsafe: false };
+  const { id } = await installSource(repo.url, null, ctx);
+  const lock = await exportLock([]);
+  for (const mode of ["before", "after"] as const) {
+    process.env["MARGRAVE_HOME"] = await tmp("mg-home-");
+    let scans = 0;
+    let fired = false;
+    const real = fsp.readdir;
+    mock.method(fsp, "readdir", (async (dir: string, ...args: unknown[]) => {
+      if (dir.includes(`${path.sep}staging${path.sep}`) && dir.endsWith(`${path.sep}${id}`)) {
+        if (args.length > 0) scans++;
+        if (!fired && ((mode === "before" && args.length === 0) || (mode === "after" && scans === 2))) {
+          fired = true;
+          await writeFile(path.join(dir, "skills", "react-perf", "SKILL.md"), "changed\n");
+        }
+      }
+      return (real as (...a: unknown[]) => Promise<unknown>)(dir, ...args);
+    }) as typeof fsp.readdir);
+    syncBuiltinESMExports();
+    await assert.rejects(
+      restoreLock(lock, ctx, () => {}),
+      mode === "before" ? /staged skills differ from the lock/u : /installed source differs from the lock/u,
+    );
+    assert.equal(fired, true);
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
 });
 
 test("restore refuses a source installed after preflight", async (t) => {

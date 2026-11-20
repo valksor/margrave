@@ -47,14 +47,20 @@ export function validateRevision(revision: string | undefined): void {
 }
 
 /** Find a skill by qualified id, or by bare name when exactly one source has it. */
-export function resolveSkill(db: DatabaseSync, input: string, revision?: string, allowedSources?: ReadonlySet<string>): IndexEntry {
+export function resolveSkill(
+  db: DatabaseSync,
+  input: string,
+  revision?: string,
+  allowedSources?: ReadonlySet<string>,
+  mcp = false,
+): IndexEntry {
   validateRevision(revision);
   const exact = db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE id = ?`).get(input) as IndexEntry | undefined;
-  if (exact !== undefined && (allowedSources === undefined || allowedSources.has(exact.source))) return resolveDirectory(db, exact);
+  if (exact !== undefined && (allowedSources === undefined || allowedSources.has(exact.source))) return resolveDirectory(db, exact, mcp);
   const byName = (db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE name = ?`).all(input) as unknown as IndexEntry[]).filter(
     (entry) => allowedSources === undefined || allowedSources.has(entry.source),
   );
-  if (byName.length === 1 && byName[0] !== undefined) return resolveDirectory(db, byName[0]);
+  if (byName.length === 1 && byName[0] !== undefined) return resolveDirectory(db, byName[0], mcp);
   if (byName.length > 1) {
     const ids = byName
       .map((s) => `  ${clean(s.id)}`)
@@ -66,7 +72,7 @@ export function resolveSkill(db: DatabaseSync, input: string, revision?: string,
   throw new RequestError(`no skill "${clean(input)}"; run: margrave find "<task>" or margrave list --skills`);
 }
 
-function resolveDirectory(db: DatabaseSync, entry: IndexEntry): IndexEntry {
+function resolveDirectory(db: DatabaseSync, entry: IndexEntry, mcp: boolean): IndexEntry {
   const source = catalogSources(db).find((s) => s.id === entry.source);
   if (source === undefined) throw new MargraveError(`invalid snapshot path for source "${entry.source}"`);
   if (source.kind !== "git") return entry;
@@ -79,7 +85,9 @@ function resolveDirectory(db: DatabaseSync, entry: IndexEntry): IndexEntry {
   try {
     const realRoot = path.join(realpathSync(home()), "snapshots", id, source.snapshot as string);
     if (realpathSync(root) !== realRoot || realpathSync(dir) !== path.join(realRoot, rel)) throw new Error("snapshot path differs");
-  } catch {
+  } catch (err) {
+    if (["ENOENT", "ENOTDIR"].includes((err as NodeJS.ErrnoException).code ?? ""))
+      throw new RequestError(gitDriftMessage(mcp ? "mcp" : "cli"));
     throw new MargraveError(`invalid snapshot path for source "${id}"`);
   }
   return { ...entry, dir };
@@ -215,7 +223,13 @@ export interface LoadResult {
   body: string;
 }
 
-export async function readSelectedFile(entry: IndexEntry, rel: string, revision?: string): Promise<string> {
+function gitDriftMessage(surface: "cli" | "mcp"): string {
+  return surface === "cli"
+    ? "installed Git files differ from the accepted revision. Restore a verified lock or a known-good backup"
+    : "skill files differ from the accepted revision. Ask the store operator to restore a verified copy";
+}
+
+export async function readSelectedFile(entry: IndexEntry, rel: string, revision?: string, gitDrift?: "cli" | "mcp"): Promise<string> {
   if (revision === undefined) return readSkillFile(entry.dir, rel);
   validateRevision(revision);
   if (entry.revision !== revision) throw new RequestError("skill revision changed; search again");
@@ -231,15 +245,21 @@ export async function readSelectedFile(entry: IndexEntry, rel: string, revision?
   const mismatch =
     bytes === undefined || bytes.length !== item.size || `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== item.digest;
   if (mismatch || bytes === undefined) {
+    if (gitDrift !== undefined) throw new RequestError(gitDriftMessage(gitDrift));
     throw new RequestError("skill files changed since indexing; ask the store operator to run margrave reindex, then search again");
   }
   return bytes.toString("utf8");
 }
 
-export async function loadSkill(entry: IndexEntry, sources: readonly SourceRecord[], revision?: string): Promise<LoadResult> {
+export async function loadSkill(
+  entry: IndexEntry,
+  sources: readonly SourceRecord[],
+  revision?: string,
+  gitDrift?: "cli" | "mcp",
+): Promise<LoadResult> {
   const st = revision === undefined ? await lstat(entry.dir).catch(() => null) : true;
   if (st === null) throw new MargraveError(`skill directory ${clean(entry.dir)} is gone; run: margrave reindex`);
-  const text = await readSelectedFile(entry, "SKILL.md", revision);
+  const text = await readSelectedFile(entry, "SKILL.md", revision, gitDrift);
   const { rawFrontmatter, body } = splitSkillMd(text);
   const src = sources.find((s) => s.id === entry.source);
   const snapshotRoot = path.join(home(), "snapshots", entry.source);

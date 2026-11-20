@@ -6,12 +6,11 @@
 // at build, and this module checks only the VERSION stamp it writes) runs when it exists and its VERSION stamp matches. Only without one does `ripwire` from PATH run, and then only at the
 // pinned version or newer.
 //
-// `update` of a git source compares the new copy's findings with the installed copy's findings and
-// refuses only on findings that the installed copy does not have.
+// Git updates compare new findings with the accepted scan recorded in the catalog.
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { open, readFile, realpath } from "node:fs/promises";
+import { lstat, open, readFile, readdir, readlink, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { READ_NO_FOLLOW, isInside } from "./scan.ts";
@@ -22,6 +21,11 @@ export interface ScanOutcome {
   code: number | null;
   /** True when --allow-unsafe overrode a refusal. */
   overridden: boolean;
+  version: string | null;
+  verdict: "clean" | "warn" | "critical" | "failed";
+  keys: [string, number][];
+  files: [string, string][];
+  tree: string | null;
 }
 
 export interface ScanOptions {
@@ -32,10 +36,11 @@ export interface ScanOptions {
   /** Skill directories under the scan root. Findings are grouped by them. */
   skills: readonly { name: string; dir: string }[];
   /**
-   * `update` of a git source only. The installed copy's scan root, or null when there is no installed copy.
+   * `update` of a git source only. The accepted scan, or null when it is unavailable.
    * Left out for `install`, which has nothing to compare against.
    */
-  baselineDir?: string | null;
+  baseline?: ScanOutcome | null;
+  verifyContent?: boolean;
   /** The vendored ripwire to run first. Tests only: the default is the vendored binary in the package root. */
   vendored?: string;
 }
@@ -56,11 +61,12 @@ interface Finding {
   fileHash: string | null;
 }
 
-type ScanResult =
+type ScanResult = (
   | { status: "clean" }
   | { status: "findings"; code: 1 | 2; findings: Finding[]; xml: string }
   /** ripwire missing, exit 3, another exit code, or output that cannot be trusted. */
-  | { status: "failed"; code: number | null; reason: string; detail: string; xml: string | null };
+  | { status: "failed"; code: number | null; reason: string; detail: string; xml: string | null }
+) & { version: string | null };
 
 // ---- running ripwire ----
 
@@ -71,6 +77,7 @@ interface Execed {
   missing: boolean;
   /** Set instead of a scan: the vendored copy is not the pinned version, or ripwire on PATH is older than it or reports none. */
   refusal?: string;
+  version?: string;
 }
 
 /**
@@ -157,7 +164,7 @@ export async function runRipwire(dir: string, vendored: string = VENDORED_RIPWIR
       );
     }
     // A vendored binary that cannot start (a broken interpreter line, for example) is a failure, not an absent ripwire.
-    return { ...(await exec(vendored, dir)), missing: false };
+    return { ...(await exec(vendored, dir)), missing: false, version: PINNED_RIPWIRE };
   }
   const found = await pathVersion(versionTimeoutMs);
   if (found.status === "missing") return { code: "ENOENT", stdout: "", stderr: "", missing: true };
@@ -169,7 +176,7 @@ export async function runRipwire(dir: string, vendored: string = VENDORED_RIPWIR
       `ripwire on PATH reports ${found.version ?? "no version"}, older than the pinned ${PINNED_RIPWIRE}; run: node ${ENSURE_RIPWIRE}, or update ripwire`,
     );
   }
-  return exec("ripwire", dir);
+  return { ...(await exec("ripwire", dir)), version: found.version };
 }
 
 // ---- parsing ----
@@ -299,15 +306,17 @@ async function runScan(dir: string, vendored: string): Promise<ScanResult> {
   try {
     realRoot = await realpath(dir);
   } catch {
-    return { status: "failed", code: null, reason: `cannot resolve the scan root ${dir}`, detail: "", xml: null };
+    return { status: "failed", code: null, reason: `cannot resolve the scan root ${dir}`, detail: "", xml: null, version: null };
   }
   const r = await runRipwire(realRoot, vendored);
+  const version = r.version ?? null;
   const stderr = r.stderr.trim();
   const detail = stderr !== "" ? stderr : r.stdout.trim();
-  if (r.refusal !== undefined) return { status: "failed", code: null, reason: r.refusal, detail: "", xml: null };
-  if (r.code === 0) return { status: "clean" };
-  if (r.missing) return { status: "failed", code: null, reason: `ripwire was not found on PATH or at ${vendored}`, detail, xml: null };
-  if (r.code === 3) return { status: "failed", code: 3, reason: "ripwire could not read the files (exit 3)", detail, xml: null };
+  if (r.refusal !== undefined) return { status: "failed", code: null, reason: r.refusal, detail: "", xml: null, version };
+  if (r.code === 0) return { status: "clean", version };
+  if (r.missing)
+    return { status: "failed", code: null, reason: `ripwire was not found on PATH or at ${vendored}`, detail, xml: null, version };
+  if (r.code === 3) return { status: "failed", code: 3, reason: "ripwire could not read the files (exit 3)", detail, xml: null, version };
   if (r.code !== 1 && r.code !== 2) {
     return {
       status: "failed",
@@ -315,16 +324,17 @@ async function runScan(dir: string, vendored: string): Promise<ScanResult> {
       reason: `ripwire failed (exit ${String(r.code)})`,
       detail,
       xml: null,
+      version,
     };
   }
   const parsed = parseScanXml(r.stdout, r.code);
   if (!parsed.ok) {
-    return { status: "failed", code: r.code, reason: `${parsed.reason} (exit ${r.code})`, detail, xml: r.stdout };
+    return { status: "failed", code: r.code, reason: `${parsed.reason} (exit ${r.code})`, detail, xml: r.stdout, version };
   }
   const cache = new Map<string, FileInfo | null>();
   const findings: Finding[] = [];
   for (const row of parsed.rows) findings.push(await toFinding(row, realRoot, cache));
-  return { status: "findings", code: r.code, findings, xml: r.stdout };
+  return { status: "findings", code: r.code, findings, xml: r.stdout, version };
 }
 
 // ---- comparing ----
@@ -465,49 +475,83 @@ function clipDetail(detail: string): string {
  * `allowUnsafe` overrides a refusal.
  */
 export async function scanWithRipwire(dir: string, opts: ScanOptions): Promise<ScanOutcome> {
+  const before = opts.verifyContent === true ? await scanInventory(dir) : null;
   const res = await runScan(dir, opts.vendored ?? VENDORED_RIPWIRE);
-  if (res.status === "clean") return { code: 0, overridden: false };
+  if (before !== null && before !== (await scanInventory(dir))) throw new MargraveError("staged skills changed during scan");
+  if (opts.baseline === null || opts.baseline?.verdict === "failed" || opts.baseline?.tree === null)
+    opts.log("scan: no accepted baseline. Applying install rules");
+  const base = res.status === "findings" ? toBaseline(res.findings) : toBaseline([]);
+  const outcome: ScanOutcome = {
+    code: res.status === "clean" ? 0 : res.code,
+    overridden: false,
+    version: res.version,
+    verdict: res.status === "clean" ? "clean" : res.status === "failed" ? "failed" : res.code === 1 ? "warn" : "critical",
+    keys: [...base.keys],
+    files: [...base.files],
+    tree: before,
+  };
+  if (res.status === "clean") return outcome;
 
   const reportFile = path.join(reportsRoot(), `${opts.sourceId}.xml`);
   if (res.status === "failed") {
     if (res.xml !== null) await atomicWrite(reportFile, res.xml);
-    return refuseOrOverride(res.reason + clipDetail(res.detail), res.code, opts);
+    return refuseOrOverride(res.reason + clipDetail(res.detail), outcome, opts);
   }
   await atomicWrite(reportFile, res.xml);
 
-  // The baseline scan runs on the installed copy, before the caller swaps anything.
+  // Compare with the recorded accepted scan, never with mutable installed files.
   let cmp: Compared | null = null;
-  if (opts.baselineDir !== undefined) {
-    const base = opts.baselineDir === null ? null : await runScan(opts.baselineDir, opts.vendored ?? VENDORED_RIPWIRE);
-    let why = "the installed copy is missing";
-    if (base?.status === "failed") why = base.reason;
-    if (base?.status === "clean" || base?.status === "findings") {
-      const baseline = toBaseline(base.status === "clean" ? [] : base.findings);
-      cmp = { ...diff(res.findings, baseline), baseline };
-    } else {
-      opts.log(`scan: no baseline (${why}); every finding counts as new`);
-    }
+  if (opts.baseline !== undefined && opts.baseline !== null && opts.baseline.verdict !== "failed" && opts.baseline.tree !== null) {
+    const baseline = { keys: new Map(opts.baseline.keys), files: new Map(opts.baseline.files) };
+    cmp = { ...diff(res.findings, baseline), baseline };
   }
 
   const summary = summarize(res.findings, opts, reportFile, cmp);
   if (cmp === null) {
     if (res.code === 1) {
       opts.log(summary);
-      return { code: 1, overridden: false };
+      return outcome;
     }
-    return refuseOrOverride(`ripwire found CRITICAL findings (exit 2)\n${summary}`, 2, opts);
+    return refuseOrOverride(`ripwire found CRITICAL findings (exit 2)\n${summary}`, outcome, opts);
   }
   if (cmp.fresh.some((f) => f.sev === "critical" || f.key === null)) {
-    return refuseOrOverride(`new critical or unreadable findings that the installed copy does not have\n${summary}`, res.code, opts);
+    return refuseOrOverride(`new critical or unreadable findings that the installed copy does not have\n${summary}`, outcome, opts);
   }
   opts.log(summary);
-  return { code: res.code, overridden: false };
+  return outcome;
 }
 
-function refuseOrOverride(message: string, code: number | null, opts: ScanOptions): ScanOutcome {
+export async function scanInventory(dir: string): Promise<string> {
+  const hash = createHash("sha256");
+  async function visit(root: string, rel: string): Promise<void> {
+    for (const name of (await readdir(root)).sort()) {
+      const file = path.join(root, name);
+      const child = rel === "" ? name : `${rel}/${name}`;
+      const info = await lstat(file);
+      if (info.isDirectory()) {
+        hash.update(JSON.stringify([child, "dir"]));
+        await visit(file, child);
+      } else if (info.isSymbolicLink()) hash.update(JSON.stringify([child, "link", await readlink(file)]));
+      else if (info.isFile()) {
+        const handle = await open(file, READ_NO_FOLLOW);
+        try {
+          const content = createHash("sha256");
+          for await (const chunk of handle.createReadStream({ autoClose: false })) content.update(chunk as Buffer);
+          hash.update(JSON.stringify([child, "file", content.digest("hex")]));
+        } finally {
+          await handle.close();
+        }
+      } else throw new MargraveError("staged skills changed during scan");
+    }
+  }
+  await visit(dir, "");
+  return hash.digest("hex");
+}
+
+function refuseOrOverride(message: string, outcome: ScanOutcome, opts: ScanOptions): ScanOutcome {
   if (opts.allowUnsafe) {
     opts.log(`--allow-unsafe: overriding refusal (${message})`);
-    return { code, overridden: true };
+    return { ...outcome, overridden: true };
   }
   throw new MargraveError(`refused: ${message}\nre-run with --allow-unsafe to override for this one command`);
 }
