@@ -262,6 +262,85 @@ syncBuiltinESMExports();\n`,
   }
 });
 
+test("populated Git catalog survives writer termination at publication and cleanup", async () => {
+  for (const checkpoint of ["before", "after", "cleanup"] as const) {
+    const env = await setup();
+    const repo = await makeRepo();
+    const support = path.join(repo.dir, "skills", "react-perf", "reference.txt");
+    await writeFile(support, "old supporting bytes\n");
+    await git(repo.dir, "add", "-A");
+    await git(repo.dir, "commit", "-qm", "add supporting file");
+    const installed = await mg(env, ["install", repo.url]);
+    assert.equal(installed.code, 0, installed.stderr);
+    const id = sourceId(installed);
+    const old = catalogRecords(env.home)[0]!;
+    const oldCatalog = await snapshot(env.home);
+    const oldSnapshot = path.join(env.home, "snapshots", id, old.snapshot!);
+    await writeSkill(path.join(repo.dir, "skills"), "react-perf", "Updated description", "Updated body.");
+    await writeFile(support, "new supporting bytes\n");
+    await git(repo.dir, "add", "-A");
+    await git(repo.dir, "commit", "-qm", "update skill and supporting file");
+    const scratch = await tmp("mg-interruption-");
+    const preload = path.join(scratch, "kill.mjs");
+    const reached = path.join(scratch, "reached");
+    await writeFile(
+      preload,
+      `import fs from "node:fs/promises";
+import { writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const rename = fs.rename; const rm = fs.rm; let published = false;
+const stop = () => { writeFileSync(${JSON.stringify(reached)}, ${JSON.stringify(checkpoint)}); process.kill(process.pid, "SIGKILL"); };
+fs.rename = async function(from, to) {
+  if (to === ${JSON.stringify(path.join(env.home, "index.db"))}) {
+    if (${JSON.stringify(checkpoint)} === "before") stop();
+    await rename.call(this, from, to); published = true;
+    if (${JSON.stringify(checkpoint)} === "after") stop();
+    return;
+  }
+  return rename.call(this, from, to);
+};
+fs.rm = function(file, ...args) {
+  if (published && ${JSON.stringify(checkpoint)} === "cleanup" && String(file).includes("/.catalog-")) stop();
+  return rm.call(this, file, ...args);
+};
+syncBuiltinESMExports();\n`,
+    );
+    const stopped = await runCli(["update", id], { home: env.home, fakeBin: env.fakeBin, nodeArgs: ["--import", preload] });
+    assert.equal(stopped.code, 1, checkpoint);
+    assert.equal(await readFile(reached, "utf8"), checkpoint);
+    const committed = catalogRecords(env.home)[0]!;
+    if (checkpoint === "before") assert.deepEqual(await snapshot(env.home), oldCatalog);
+    else assert.notEqual(committed.snapshot, old.snapshot);
+    const alias = path.join(env.home, "sources", id);
+    assert.equal(await realpath(alias), checkpoint === "cleanup" ? path.join(env.home, "snapshots", id, committed.snapshot!) : oldSnapshot);
+    assert.ok((await readdir(env.home)).some((name) => name.endsWith(".tmp.owner")));
+
+    const copy = path.join(scratch, "store");
+    await cp(env.home, copy, { recursive: true, verbatimSymlinks: true });
+    const setReadOnly = async (dir: string): Promise<void> => {
+      for (const entry of await readdir(dir, { withFileTypes: true })) {
+        const file = path.join(dir, entry.name);
+        if (entry.isDirectory()) await setReadOnly(file);
+        else if (entry.isFile()) await chmod(file, 0o444);
+      }
+      await chmod(dir, 0o555);
+    };
+    await setReadOnly(copy);
+    assert.deepEqual(await snapshot(copy), await snapshot(env.home));
+    const loaded = await mg({ ...env, home: copy }, ["load", `${id}/react-perf`]);
+    assert.equal(loaded.code, 0, loaded.stderr);
+    assert.match(loaded.stdout, checkpoint === "before" ? /Body of react-perf/u : /Updated body/u);
+    const reference = await mg({ ...env, home: copy }, ["load", `${id}/react-perf`, "--file", "reference.txt"]);
+    assert.equal(reference.code, 0, reference.stderr);
+    assert.equal(reference.stdout, checkpoint === "before" ? "old supporting bytes\n" : "new supporting bytes\n");
+    const repaired = await mg(env, ["reindex"]);
+    assert.equal(repaired.code, 0, repaired.stderr);
+    assert.equal(await realpath(alias), path.join(env.home, "snapshots", id, committed.snapshot!));
+    assert.ok(!(await readdir(env.home)).some((name) => name.startsWith(".catalog-")));
+    assert.equal(await readFile(path.join(oldSnapshot, "skills", "react-perf", "reference.txt"), "utf8"), "old supporting bytes\n");
+  }
+});
+
 test("readers recheck the catalog when pending publication changes", async () => {
   for (const change of ["publish", "cleanup"] as const) {
     const env = await setup();
