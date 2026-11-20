@@ -208,8 +208,14 @@ test("hosted tools have the same names, input schemas, and instructions as the s
 });
 
 test("hosted: with no sources, find_skills answers and the other two tools fail, all with the hosted text", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
   await useHome(t);
   const client = await connectHosted(t);
+  const skills = new SkillsClient(client);
+  assert.deepEqual((await skills.list()).skills, []);
+  const missing = `skill://margrave/source/sha256%3A${"0".repeat(64)}/skill/SKILL.md`;
+  await assert.rejects(skills.get(missing));
+  await assert.rejects(client.readResource({ uri: missing }));
   assert.equal(HOSTED_NO_SOURCES_MESSAGE, "no skills are installed on this server");
   assert.deepEqual(await call(client, "find_skills", { task: "x" }), { isError: false, text: HOSTED_NO_SOURCES_MESSAGE });
   assert.deepEqual(await call(client, "load_skill", { id: "x" }), { isError: true, text: HOSTED_NO_SOURCES_MESSAGE });
@@ -390,6 +396,7 @@ test("hosted: a git source with SKILL.md at the repository root serves no .git f
 });
 
 test("hosted: a store failure returns a generic error and logs the cause", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
   const home = await useHome(t);
   const fakeBin = await fakeRipwire();
   const dir = await tmp("mg-localsrc-");
@@ -400,6 +407,7 @@ test("hosted: a store failure returns a generic error and logs the cause", async
   const client = await connectHosted(t);
   await writeFile(path.join(home, "index.db"), "garbage that is not a database");
   const log = mock.method(console, "error", () => {});
+  await assert.rejects(new SkillsClient(client).list(), /the skill store on this server is not available/u);
 
   assert.equal(HOSTED_SERVER_ERROR, "the skill store on this server is not available; the server log has details");
   for (const [tool, args] of [
@@ -802,4 +810,79 @@ test("production integration releases admission after handler failure", async ()
   for (let i = 0; i < 8; i++) await assert.rejects(app(request()), /dummy failure/u);
   fails = false;
   assert.equal((await app(request())).status, 204);
+});
+
+test("hosted Skills extension scopes manifests and enforces the read bound", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  const home = await useHome(t);
+  const fakeBin = await fakeRipwire();
+  const dir = await tmp("mg-hosted-skills-");
+  const toolkit = await writeSkill(dir, "toolkit", "A hosted toolkit");
+  await mkdir(path.join(toolkit, "assets"));
+  await writeFile(path.join(toolkit, "assets", "sample.bin"), Buffer.from([0, 255, 1]));
+  const oversized = await writeSkill(dir, "oversized", "A large hosted fixture");
+  await writeFile(path.join(oversized, "large.bin"), Buffer.alloc(1024 * 1024 + 1));
+  const installed = await runCli(["install", dir], { home, fakeBin });
+  assert.equal(installed.code, 0, installed.stderr);
+  const source = /^installed (\S+)/mu.exec(installed.stdout)![1]!;
+  const client = await connectHosted(t, [source]);
+  const skills = new SkillsClient(client);
+  await assert.rejects(
+    skills.list({ cursor: "!" }),
+    (err: unknown) => typeof err === "object" && err !== null && "code" in err && err.code === -32602,
+  );
+  const listing = await skills.list();
+  assert.deepEqual(
+    listing.skills.map((s) => s.frontmatter.name),
+    ["toolkit"],
+  );
+  const entry = listing.skills[0]!;
+  assert.deepEqual([...(await skills.read(entry, "assets/sample.bin")).bytes], [0, 255, 1]);
+  const denied = new SkillsClient(await connectHosted(t, []));
+  assert.deepEqual((await denied.list()).skills, []);
+  await assert.rejects(denied.get(entry.uri));
+  await assert.rejects(denied.read(entry, "assets/sample.bin"));
+  await writeFile(path.join(toolkit, "assets", "sample.bin"), Buffer.alloc(1024 * 1024 + 1));
+  await assert.rejects(skills.read(entry, "assets/sample.bin"), /hosted size limit/u);
+});
+
+test("recommendation provenance reflects verified and overridden Git scans", async (t) => {
+  const home = await useHome(t);
+  const fakeBin = await fakeRipwire();
+  const cleanRepo = await makeRepo();
+  const unsafeRepo = await makeRepo();
+  await writeFile(
+    path.join(unsafeRepo.dir, "skills", "react-perf", "SKILL.md"),
+    skillMd("react-perf", "Optimize React", "FAKE-CRIT EXFILTRATE:net-exfil\n"),
+  );
+  await git(unsafeRepo.dir, "add", "-A");
+  await git(unsafeRepo.dir, "commit", "-q", "-m", "critical fixture");
+  const clean = await runCli(["install", cleanRepo.url], { home, fakeBin });
+  assert.equal(clean.code, 0, clean.stderr);
+  const unsafe = await runCli(["install", unsafeRepo.url, "--allow-unsafe"], { home, fakeBin });
+  assert.equal(unsafe.code, 0, unsafe.stderr);
+  const cleanId = /^installed (\S+)/mu.exec(clean.stdout)![1]!;
+  const unsafeId = /^installed (\S+)/mu.exec(unsafe.stdout)![1]!;
+  const client = await connectHosted(t);
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  const skills = new SkillsClient(client);
+  const gitEntry = (await skills.list()).skills.find((entry) => entry.uri.includes(cleanId))!;
+  assert.equal((await skills.read(gitEntry)).verified, true);
+  const response = await client.callTool({ name: "find_skills", arguments: { task: "react-perf" } });
+  const results = (
+    response.structuredContent as { results: { source: string; commit: string; scanVerdict: string; scanOverridden: boolean }[] }
+  ).results;
+  assert.deepEqual(
+    results
+      .map(({ source, scanVerdict, scanOverridden }) => ({ source, scanVerdict, scanOverridden }))
+      .sort((a, b) => a.source.localeCompare(b.source)),
+    [
+      { source: cleanId, scanVerdict: "clean", scanOverridden: false },
+      { source: unsafeId, scanVerdict: "critical", scanOverridden: true },
+    ].sort((a, b) => a.source.localeCompare(b.source)),
+  );
+  assert.ok(results.every((hit) => /^[0-9a-f]{40}$/u.test(hit.commit)));
+  assert.equal(JSON.stringify(response.structuredContent).includes(cleanRepo.dir), false);
+  const cli = await runCli(["find", "react-perf", "--json"], { home, fakeBin });
+  assert.deepEqual((JSON.parse(cli.stdout) as { results: unknown }).results, results);
 });

@@ -211,7 +211,10 @@ test("search relevance and CLI/MCP parity on an installed corpus", async (t) => 
     assert.doesNotMatch(cli.stdout, /load:/u);
     const json = await runCli(["find", query, "--explain", "--json"], { home, fakeBin });
     assert.equal(json.code, 0, json.stderr);
-    assert.deepEqual((JSON.parse(json.stdout) as { results: typeof hits }).results, hits);
+    assert.deepEqual(
+      (JSON.parse(json.stdout) as { results: typeof hits }).results,
+      hits.map((hit) => ({ ...hit, source, commit: null, license: null, scanVerdict: "unknown", scanOverridden: null })),
+    );
   });
   await t.test("recommendations precede weak matches before the limit", () => {
     const hits = findSkills(index, "Investigate elusive semaphore contention Docker", 1, true);

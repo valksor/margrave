@@ -94,12 +94,16 @@ export function extractHeadings(body: string): string[] {
 
 type Parsed = { ok: true; skill: Omit<ScannedSkill, "dir" | "manifest" | "frontmatter" | "revision"> } | { ok: false; reason: string };
 
+export function parseFrontmatter(raw: string): unknown {
+  return YAML.parse(raw);
+}
+
 export function parseSkillMd(text: string): Parsed {
   const { rawFrontmatter, body } = splitSkillMd(text);
   if (rawFrontmatter === null) return { ok: false, reason: "no frontmatter" };
   let fm: unknown;
   try {
-    fm = YAML.parse(rawFrontmatter);
+    fm = parseFrontmatter(rawFrontmatter);
   } catch (err) {
     return { ok: false, reason: `frontmatter is not valid YAML (${(err as Error).message.split("\n")[0]})` };
   }

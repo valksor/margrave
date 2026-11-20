@@ -18,6 +18,7 @@ import { RequestError } from "./store.ts";
 import type { IndexEntry } from "./store.ts";
 import { checkId } from "./sources.ts";
 import { formatSuggestions, searchSkills } from "./search.ts";
+import { attachMargraveSkills } from "./mcp-skills.ts";
 
 export const SERVER_INSTRUCTIONS =
   "This server gives access to installed skills that the agent does not load by default. Before a task in an unfamiliar domain, tool, or framework, call find_skills with the task in plain words. Call load_skill only for a recommended result. Call read_skill_file for a file that the skill names.";
@@ -35,7 +36,7 @@ export const HOSTED_READ_DESCRIPTION = "Read one file inside a skill directory. 
 export const HOSTED_NO_SOURCES_MESSAGE = "no skills are installed on this server";
 export const HOSTED_SERVER_ERROR = "the skill store on this server is not available; the server log has details";
 
-type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
+type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean; structuredContent?: Record<string, unknown> };
 
 const ok = (text: string): ToolResult => ({ content: [{ type: "text", text }] });
 const fail = (err: unknown): ToolResult => ({
@@ -148,9 +149,35 @@ export function createServer(variant: Variant = LOCAL, options: ServerOptions = 
   );
 }
 
-function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | undefined, skillsSh: boolean): McpServer {
-  const server = new McpServer({ name: "margrave", version: version() }, { instructions: SERVER_INSTRUCTIONS });
+const FIND_OUTPUT_SCHEMA = z.object({
+  results: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      description: z.string(),
+      revision: z.string(),
+      score: z.number(),
+      source: z.string(),
+      commit: z.string().nullable(),
+      license: z.string().nullable(),
+      scanVerdict: z.enum(["unknown", "clean", "warn", "critical", "failed"]),
+      scanOverridden: z.boolean().nullable(),
+      recommended: z.boolean().optional(),
+      exact: z.boolean().optional(),
+      matchedTerms: z
+        .object({
+          name: z.array(z.string()),
+          description: z.array(z.string()),
+          headings: z.array(z.string()),
+          body: z.array(z.string()),
+        })
+        .optional(),
+    }),
+  ),
+  suggestions: z.array(z.object({ id: z.string(), source: z.string() })),
+});
 
+function registerFind(server: McpServer, variant: Variant, allowedSources: ReadonlySet<string> | undefined, skillsSh: boolean): void {
   server.registerTool(
     "find_skills",
     {
@@ -160,18 +187,34 @@ function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | und
           ? " On a local miss, this tool sends the task to skills.sh. Offer catalog suggestions to the user. Wait for an explicit request before installation."
           : ""),
       inputSchema: z.object({ task: z.string(), limit: z.number().int().optional(), explain: z.boolean().optional() }),
+      outputSchema: FIND_OUTPUT_SCHEMA,
     },
     async ({ task, limit, explain }) => {
       try {
         const { hits, noSources, suggestions } = await searchSkills(task, limit, explain === true, skillsSh, allowedSources);
-        return ok(
-          (noSources ? variant.noSources : formatFind(hits, variant.findText)) + formatSuggestions(suggestions, !variant.showHostPaths),
-        );
+        return {
+          ...ok(
+            (noSources ? variant.noSources : formatFind(hits, variant.findText)) + formatSuggestions(suggestions, !variant.showHostPaths),
+          ),
+          structuredContent: { results: hits, suggestions: suggestions.map(({ id, source }) => ({ id, source })) },
+        };
       } catch (err) {
         return variant.fail(err);
       }
     },
   );
+}
+
+function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | undefined, skillsSh: boolean): McpServer {
+  const server = new McpServer({ name: "margrave", version: version() }, { instructions: SERVER_INSTRUCTIONS });
+  attachMargraveSkills(
+    server,
+    allowedSources,
+    variant.readLimit,
+    variant.showHostPaths ? undefined : (err) => variant.fail(err).content[0]!.text,
+  );
+
+  registerFind(server, variant, allowedSources, skillsSh);
 
   server.registerTool(
     "load_skill",

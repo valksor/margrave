@@ -123,6 +123,8 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   const corrupt = await call(client, "find_skills", { task: "terraform" });
   assert.equal(corrupt.isError, true);
   assert.match(corrupt.text, /is not a supported margrave catalog/u);
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  await assert.rejects(new SkillsClient(client).list(), /is not a supported margrave catalog/u);
 
   // the server is read-only: only the three tools exist
   assert.equal(tools.length, 3);
@@ -184,6 +186,25 @@ test("a tool whose work rejects with a non-Error value returns that value as tex
   });
   const r = await call(client, "find_skills", { task: "anything" });
   assert.deepEqual(r, { isError: true, text: "boom, not an Error" });
+});
+
+test("Skills discovery reports a catalog close failure", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  const prev = process.env["MARGRAVE_HOME"];
+  process.env["MARGRAVE_HOME"] = await tmp("mg-home-");
+  t.after(() => {
+    mock.restoreAll();
+    if (prev === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prev;
+  });
+  await seedIndex([newEntry("source", "skill")]);
+  const client = await connectInMemory(t);
+  const { close } = DatabaseSync.prototype as unknown as { close: (this: DatabaseSync) => void };
+  mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    close.call(this);
+    throw new Error("catalog close failed");
+  });
+  await assert.rejects(new SkillsClient(client).list(), /catalog close failed/u);
 });
 
 test("MCP in-process: load_skill and read_skill_file work, and every tool turns a failure into a tool error", async (t) => {
@@ -356,5 +377,114 @@ test("stdio serves a client that opens with an older protocol revision", () => {
     assert.equal(response.error, undefined);
     assert.equal(response.result?.protocolVersion, protocolVersion);
     assert.equal(response.result?.serverInfo.name, "margrave");
+  }
+});
+
+test("Skills extension serves verified scoped pages over stdio", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  const home = await tmp("mg-extension-home-");
+  const fakeBin = await fakeRipwire();
+  const dir = await tmp("mg-extension-source-");
+  const skillDir = await writeSkill(dir, "toolkit", "A toolkit for focused checks");
+  const toolkitPath = path.join(skillDir, "SKILL.md");
+  await writeFile(toolkitPath, (await fsp.readFile(toolkitPath, "utf8")).replace("\n---\n", "\nlicense: MIT\nextra: preserved\n---\n"));
+  await mkdir(path.join(skillDir, "references"));
+  await mkdir(path.join(skillDir, "assets"));
+  await writeFile(path.join(skillDir, "references", "checklist.md"), "checklist\n");
+  await writeFile(path.join(skillDir, "references", "plain.txt"), "plain text\n");
+  await writeFile(path.join(skillDir, "assets", "sample.bin"), Buffer.from([0, 255, 1]));
+  await writeSkill(dir, "Bad_Name", "Legacy name");
+  const nonjson = await writeSkill(dir, "nonjson", "Legacy nonfinite metadata");
+  const nonjsonPath = path.join(nonjson, "SKILL.md");
+  await writeFile(nonjsonPath, (await fsp.readFile(nonjsonPath, "utf8")).replace("\n---\n", "\nextra: .inf\n---\n"));
+  const cyclic = await writeSkill(dir, "cyclic", "Legacy cyclic metadata");
+  const cyclicPath = path.join(cyclic, "SKILL.md");
+  await writeFile(cyclicPath, (await fsp.readFile(cyclicPath, "utf8")).replace("\n---\n", "\nextra: &loop [*loop]\n---\n"));
+  for (const [name, extra] of [
+    ["bad-compat", "compatibility: 42"],
+    ["empty-compat", 'compatibility: ""'],
+    ["long-compat", `compatibility: ${"x".repeat(501)}`],
+    ["bad-metadata", "metadata: [value]"],
+    ["bad-values", "metadata:\n  value: 42"],
+  ] as const) {
+    const folder = await writeSkill(dir, name, "Legacy metadata");
+    const file = path.join(folder, "SKILL.md");
+    await writeFile(file, (await fsp.readFile(file, "utf8")).replace("\n---\n", `\n${extra}\n---\n`));
+  }
+  await writeSkill(dir, "long-description", "x".repeat(1025));
+  for (let i = 0; i < 51; i++) await writeSkill(dir, `page-${String(i).padStart(2, "0")}`, "Paging fixture");
+  const installed = await runCli(["install", dir], { home, fakeBin });
+  assert.equal(installed.code, 0, installed.stderr);
+  const source = /^installed (\S+)/mu.exec(installed.stdout)![1]!;
+  const client = new Client({ name: "skills-test", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  await client.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: [CLI, "mcp"],
+      env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home, MARGRAVE_ALLOWED_SOURCES: source },
+    }),
+  );
+  t.after(() => client.close());
+  const skills = new SkillsClient(client);
+  assert.equal(skills.supported, true);
+  assert.equal(skills.directoryRead, false);
+  const all = await skills.list();
+  assert.equal(all.skills.length, 52);
+  assert.equal(all.ttlMs, 0);
+  assert.equal(all.cacheScope, "private");
+  const toolkit = all.skills.find((item) => item.frontmatter.name === "toolkit")!;
+  assert.ok(toolkit);
+  assert.equal(toolkit.frontmatter["extra"], "preserved");
+  assert.equal((await call(client, "load_skill", { id: `${source}/nonjson` })).isError, false);
+  assert.deepEqual((await skills.get(toolkit.uri)).skill, toolkit);
+  assert.equal((await skills.read(toolkit, "references/checklist.md")).text, "checklist\n");
+  assert.equal((await skills.read(toolkit, "references/plain.txt")).text, "plain text\n");
+  assert.deepEqual([...(await skills.read(toolkit, "assets/sample.bin")).bytes], [0, 255, 1]);
+  assert.equal((await skills.read(toolkit)).verified, true);
+  await assert.rejects(
+    skills.list({ cursor: "!" }),
+    (err: unknown) => typeof err === "object" && err !== null && "code" in err && err.code === -32602,
+  );
+  await assert.rejects(skills.get(toolkit.uri.replace(/sha256%3A[0-9a-f]{64}/u, `sha256%3A${"0".repeat(64)}`)), /skill revision changed/u);
+  await assert.rejects(client.readResource({ uri: toolkit.uri.replace("SKILL.md", "missing.md") }));
+  await assert.rejects(client.readResource({ uri: toolkit.uri.replace("SKILL.md", "references/../SKILL.md") }));
+  await assert.rejects(client.readResource({ uri: toolkit.uri.replace("SKILL.md", "%53KILL.md") }));
+  await assert.rejects(client.readResource({ uri: toolkit.uri.replace("SKILL.md", "%FF") }));
+  await assert.rejects(client.readResource({ uri: "skill://other/unknown" }));
+  await assert.rejects(client.readResource({ uri: "skill://margrave/short" }));
+  await assert.rejects(client.readResource({ uri: toolkit.uri.replace(/sha256%3A[0-9a-f]{64}/u, "invalid") }));
+  await assert.rejects(skills.get(toolkit.uri.replace("toolkit/SKILL.md", "missing/SKILL.md")));
+  await assert.rejects(skills.get(toolkit.uri.replace("SKILL.md", "references/checklist.md")));
+  const result = await client.callTool({ name: "find_skills", arguments: { task: "toolkit" } });
+  const structured = result.structuredContent as {
+    results: { source: string; scanVerdict: string; scanOverridden: boolean | null; license: string | null }[];
+  };
+  assert.equal(structured.results[0]?.source, source);
+  assert.equal(structured.results[0]?.scanVerdict, "unknown");
+  assert.equal(structured.results[0]?.scanOverridden, null);
+  assert.equal(structured.results[0]?.license, "MIT");
+  assert.equal(JSON.stringify(structured).includes(dir), false);
+
+  const db = new DatabaseSync(path.join(home, "index.db"));
+  try {
+    db.prepare("UPDATE skills SET frontmatter = ? WHERE id = ?").run("[]", `${source}/toolkit`);
+    assert.equal(
+      (await skills.list()).skills.some((item) => item.frontmatter.name === "toolkit"),
+      false,
+    );
+    db.prepare("UPDATE skills SET frontmatter = ?, manifest = ? WHERE id = ?").run(
+      "name: toolkit\ndescription: Toolkit",
+      JSON.stringify([
+        { path: "SKILL.md", digest: `sha256:${"0".repeat(64)}`, size: 1 },
+        { path: "../escape", digest: `sha256:${"0".repeat(64)}`, size: 1 },
+      ]),
+      `${source}/toolkit`,
+    );
+    assert.equal(
+      (await skills.list()).skills.some((item) => item.frontmatter.name === "toolkit"),
+      false,
+    );
+  } finally {
+    db.close();
   }
 });

@@ -272,6 +272,12 @@ Scoped servers apply this list to search, skill loads, and supporting-file reads
 
 ### Hosted MCP
 
+Modern MCP clients can discover Margrave skills through the MCP Skills extension. The extension lists skill metadata and file digests. Clients read listed files through MCP resources. The three existing tools remain available for ranked search and direct reads. [MCP Skills extension](https://modelcontextprotocol.io/extensions/skills/overview).
+
+The hosted extension lists skills whose manifest files fit the hosted read limit.
+
+Structured search results include the source ID, skill revision, commit, declared license, scan verdict, and override status. Older revisions can have unknown scan provenance. Hosted recommendation metadata omits installation URLs and server paths.
+
 `import { handleHostedMcp } from "margrave/hosted"` gives a `(Request, options?) => Promise<Response>` handler for MCP Streamable HTTP. margrave starts no server. The host app mounts the handler on one route.
 
 Pass `{ allowedSources: ["owner__repo"] }` as the second argument to `handleHostedMcp` to scope a hosted request. An empty array serves no sources. The hosted application chooses this option in trusted server code.

@@ -1,7 +1,17 @@
 import { MAX_LIMIT, clampLimit } from "./bm25.ts";
 import { findSkills, loadContext } from "./skills.ts";
-import type { FindHit } from "./skills.ts";
+import type { Context, FindHit } from "./skills.ts";
 import type { SourceRecord } from "./store.ts";
+import { parseFrontmatter } from "./scan.ts";
+import type { ScanOutcome } from "./safety.ts";
+
+export interface Recommendation extends FindHit {
+  source: string;
+  commit: string | null;
+  license: string | null;
+  scanVerdict: ScanOutcome["verdict"] | "unknown";
+  scanOverridden: boolean | null;
+}
 
 export interface Suggestion {
   id: string;
@@ -65,18 +75,40 @@ async function catalog(task: string, limit: number, installed: Map<string, Sourc
   }
 }
 
+function enrichRecommendations(ctx: Context, hits: FindHit[]): Recommendation[] {
+  const recommendationRow = ctx.db.prepare("SELECT source, frontmatter FROM skills WHERE id = ?");
+  return hits.map((hit) => {
+    const row = recommendationRow.get(hit.id) as {
+      source: string;
+      frontmatter: string;
+    };
+    const source = ctx.sources.find((item) => item.id === row.source);
+    const frontmatter = parseFrontmatter(row.frontmatter);
+    const license = typeof frontmatter === "object" && frontmatter !== null && "license" in frontmatter ? frontmatter.license : null;
+    const scan = source?.kind === "git" && source.scan?.tree != null ? source.scan : undefined;
+    return {
+      ...hit,
+      source: row.source,
+      commit: source?.commit ?? null,
+      license: typeof license === "string" ? license : null,
+      scanVerdict: scan?.verdict ?? "unknown",
+      scanOverridden: scan?.overridden ?? null,
+    };
+  });
+}
+
 export async function searchSkills(
   task: string,
   limit: unknown,
   explain: boolean,
   skillsSh: boolean,
   allowedSources?: ReadonlySet<string>,
-): Promise<{ hits: FindHit[]; noSources: boolean; suggestions: Suggestion[] }> {
+): Promise<{ hits: Recommendation[]; noSources: boolean; suggestions: Suggestion[] }> {
   const ctx = await loadContext();
-  let hits: FindHit[] = [];
+  let hits: Recommendation[] = [];
   if (ctx !== null) {
     try {
-      hits = findSkills(ctx.db, task, limit, explain, allowedSources);
+      hits = enrichRecommendations(ctx, findSkills(ctx.db, task, limit, explain, allowedSources));
     } finally {
       ctx.db.close();
     }
