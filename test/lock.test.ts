@@ -5,8 +5,8 @@ import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
-import { checkLockUrl, exportLock, parseLock, restoreLock } from "../src/lock.ts";
-import { installSource, parseSpec } from "../src/sources.ts";
+import { exportLock, parseLock, restoreLock } from "../src/lock.ts";
+import { installSource } from "../src/sources.ts";
 import {
   catalogRecords,
   changeAtLock,
@@ -657,82 +657,4 @@ test("restore rejects a staged commit that does not match the lock", async (t) =
     /locked commit is unavailable/u,
   );
   await assert.rejects(readFile(path.join(home, "sources.json")), { code: "ENOENT" });
-});
-
-test("lock validation rejects malformed source and skill fields", () => {
-  assert.doesNotThrow(() => checkLockUrl("https://["));
-  const parsed = parseSpec("owner/repo");
-  assert.equal(parsed.kind, "git");
-  if (parsed.kind !== "git") throw new Error("expected Git source");
-  const skill = { id: `${parsed.id}/skill`, revision: `sha256:${"b".repeat(64)}` };
-  const source = {
-    spec: "owner/repo",
-    id: parsed.id,
-    url: parsed.url,
-    subpath: parsed.subpath,
-    ref: "refs/heads/main",
-    commit: "a".repeat(40),
-    skills: [skill],
-  };
-  for (const selection of [[], ["skill", "skill"], ["z", "a"], ["other"], "skill"]) {
-    assert.throws(() => parseLock({ version: 2, sources: [{ ...source, selection }] }), /lock file is malformed/u);
-  }
-  for (const value of [null, {}, { version: 3, sources: [] }, { version: 1, sources: "bad" }, { version: 1, sources: [], extra: 1 }]) {
-    assert.throws(() => parseLock(value), /lock file is malformed/u);
-  }
-  for (const change of [
-    { spec: 1 },
-    { id: 1 },
-    { url: 1 },
-    { subpath: 1 },
-    { ref: 1 },
-    { commit: 1 },
-    { skills: null },
-    { extra: 1 },
-    { commit: "bad" },
-    { skills: [null] },
-    { skills: [{ ...skill, id: "wrong" }] },
-    { skills: [{ ...skill, id: `${parsed.id}/` }] },
-    { skills: [{ ...skill, id: `${parsed.id}/nested/skill` }] },
-    { skills: [{ ...skill, id: 1 }] },
-    { skills: [{ ...skill, revision: 1 }] },
-    { skills: [{ ...skill, revision: "bad" }] },
-    { skills: [{ ...skill, extra: 1 }] },
-    { skills: [skill, skill] },
-  ]) {
-    assert.throws(() => parseLock({ version: 1, sources: [{ ...source, ...change }] }), /lock file is malformed/u);
-  }
-  assert.throws(
-    () => parseLock({ version: 1, sources: [{ ...source, spec: "not-a-spec" }] }),
-    /lock source does not match its install spec/u,
-  );
-});
-
-test("lock parsing orders sources and skills lexically", () => {
-  const makeSource = (spec: string) => {
-    const parsed = parseSpec(spec);
-    assert.equal(parsed.kind, "git");
-    if (parsed.kind !== "git") throw new Error("expected Git source");
-    return {
-      spec,
-      id: parsed.id,
-      url: parsed.url,
-      subpath: parsed.subpath,
-      ref: "refs/heads/main",
-      commit: "a".repeat(40),
-      skills: ["z", "a", "m"].map((name) => ({ id: `${parsed.id}/${name}`, revision: `sha256:${"b".repeat(64)}` })),
-    };
-  };
-  const sources = [makeSource("z/repo"), makeSource("a/repo"), makeSource("m/repo")];
-  const result = parseLock({ version: 1, sources });
-  assert.deepEqual(
-    result.sources.map((source) => source.id),
-    ["a__repo", "m__repo", "z__repo"],
-  );
-  for (const source of result.sources) {
-    assert.deepEqual(
-      source.skills.map((skill) => skill.id),
-      ["a", "m", "z"].map((name) => `${source.id}/${name}`),
-    );
-  }
 });

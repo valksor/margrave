@@ -2,21 +2,25 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
 import { constants } from "node:fs";
-import { chmod, mkdir, mkdtemp, open, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import fsp, { chmod, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { mock } from "node:test";
 import { promisify } from "node:util";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { handleHostedMcp } from "../src/hosted.ts";
 import { buildFieldTokens } from "../src/bm25.ts";
-import { PINNED_RIPWIRE } from "../src/safety.ts";
-import { catalogSources, indexDbFile, insertSkills, putCatalogSources, temporaryCatalog } from "../src/store.ts";
+import { PINNED_RIPWIRE, scanWithRipwire as scan } from "../src/safety.ts";
+import { catalogSources, deleteSourceSkills, indexDbFile, insertSkills, putCatalogSources, temporaryCatalog } from "../src/store.ts";
 import type { NewEntry, SourceRecord } from "../src/store.ts";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const CLI = path.join(ROOT, "src", "cli.ts");
 /** Preload that hides a vendored ripwire from margrave. `runCli` puts it in front of every spawned CLI. */
+// No vendored ripwire for these tests: a developer's real vendor/ripwire must not change what they check.
 export const NO_VENDORED_PRELOAD = path.join(ROOT, "test", "no-vendored-ripwire.ts");
 
 const execFileAsync = promisify(execFile);
@@ -352,3 +356,296 @@ const methods = DatabaseSync.prototype as unknown as {
 };
 export const realExec = methods.exec;
 export const realClose = methods.close;
+
+export interface Env {
+  home: string;
+  fakeBin: string;
+}
+
+export async function cliSetup(): Promise<Env> {
+  return { home: await tmp("mg-home-"), fakeBin: await fakeRipwire() };
+}
+
+export const cliMg = (env: Env, args: string[], extra?: Record<string, string>): Promise<Run> =>
+  runCli(args, { home: env.home, fakeBin: env.fakeBin, ...(extra === undefined ? {} : { extra }) });
+
+export async function cliSnapshot(home: string): Promise<{ sources: string | null; index: string | null }> {
+  const index = await stat(path.join(home, "index.db")).then(
+    () => JSON.stringify(indexRows(home)),
+    () => null,
+  );
+  return { sources: index === null ? null : JSON.stringify(catalogRecords(home)), index };
+}
+
+export function sourceId(r: Run): string {
+  const m = /^installed (\S+) \((\d+) skills\)/mu.exec(r.stdout);
+  assert.ok(m?.[1], `no source id in: ${r.stdout}${r.stderr}`);
+  return m[1];
+}
+
+/** Point MARGRAVE_HOME at `h` for this test only. */
+export function useHome(t: { after: (fn: () => void) => void }, h: string): void {
+  const prev = process.env["MARGRAVE_HOME"];
+  process.env["MARGRAVE_HOME"] = h;
+  t.after(() => {
+    if (prev === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prev;
+  });
+}
+
+export const quiet = { log: (): void => undefined, allowUnsafe: false };
+
+/** Run `fn` in this process with the fake ripwire on PATH, a fresh MARGRAVE_HOME, and no global git config. */
+export async function inStore<T>(t: { after: (fn: () => void) => void }, fn: (home: string) => Promise<T>): Promise<T> {
+  const keys = ["PATH", "MARGRAVE_HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"];
+  const prev = keys.map((k) => process.env[k]);
+  const home = await tmp("mg-home-");
+  process.env["PATH"] = `${await fakeRipwire()}:${process.env["PATH"] ?? ""}`;
+  process.env["MARGRAVE_HOME"] = home;
+  process.env["GIT_CONFIG_GLOBAL"] = "/dev/null";
+  process.env["GIT_CONFIG_NOSYSTEM"] = "1";
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    keys.forEach((k, i) => {
+      if (prev[i] === undefined) delete process.env[k];
+      else process.env[k] = prev[i];
+    });
+  });
+  return fn(home);
+}
+
+/** Make fs.rename reject whenever `fails(from, to, nth)` says so. Other renames run. */
+export function failRename(fails: (from: string, to: string, nth: number) => boolean): void {
+  // Drop an earlier mock first: restoring two stacked mocks in creation order would leave the inner one in place.
+  mock.restoreAll();
+  const real = fsp.rename;
+  let nth = 0;
+  mock.method(fsp, "rename", (from: string, to: string) =>
+    fails(from, to, ++nth) ? Promise.reject(new Error(`mock: cannot rename to ${to}`)) : real(from, to),
+  );
+  syncBuiltinESMExports();
+}
+
+export const passRename = (): void => {
+  mock.restoreAll();
+  syncBuiltinESMExports();
+};
+
+export const read = async (home: string, file: string): Promise<string | null> => {
+  if (file === "sources.json") {
+    try {
+      return JSON.stringify(catalogRecords(home));
+    } catch {
+      return null;
+    }
+  }
+  return readFile(path.join(home, file), "utf8").catch(() => null);
+};
+
+/** Change one catalog source read while preserving the other SQLite operations. */
+export function mockSourcesRead(answer: (nth: number) => { error: unknown } | { empty: true } | undefined): void {
+  mock.restoreAll();
+  const { prepare: real } = DatabaseSync.prototype as unknown as {
+    prepare: (this: DatabaseSync, sql: string) => ReturnType<DatabaseSync["prepare"]>;
+  };
+  let nth = 0;
+  mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql === "SELECT id, record FROM sources ORDER BY position") {
+      const given = answer(++nth);
+      if (given !== undefined && "error" in given) throw given.error;
+      if (given !== undefined && "empty" in given) return { all: () => [] } as unknown as ReturnType<DatabaseSync["prepare"]>;
+    }
+    return real.call(this, sql);
+  });
+}
+
+export async function catalogSetup(): Promise<{
+  home: string;
+  fakeBin: string;
+  dir: string;
+  id: string;
+  mg: (args: string[]) => Promise<Run>;
+}> {
+  const home = await tmp("mg-home-");
+  const fakeBin = await fakeRipwire();
+  const dir = await tmp("mg-localsrc-");
+  await writeSkill(dir, "alpha", "alpha skill for the guard tests");
+  const mg = (args: string[]): Promise<Run> => runCli(args, { home, fakeBin });
+  const inst = await mg(["install", dir]);
+  assert.equal(inst.code, 0, inst.stderr);
+  return { home, fakeBin, dir, id: /^installed (\S+)/mu.exec(inst.stdout)?.[1] ?? "", mg };
+}
+
+export const xml = (attrs: string, rows: string): string => `<skillscan ${attrs}>${rows}</skillscan>`;
+
+export async function scanDir(lines: Record<string, string>): Promise<string> {
+  const dir = await tmp("mg-scan-");
+  for (const [rel, text] of Object.entries(lines)) {
+    await mkdir(path.dirname(path.join(dir, rel)), { recursive: true });
+    await writeFile(path.join(dir, rel), text);
+  }
+  return dir;
+}
+
+export const NO_VENDOR = path.join(tmpdir(), "mg-no-vendored-ripwire", "ripwire");
+
+export const opts = (logs: string[], over: { allowUnsafe?: boolean; baselineDir?: string | null; vendored?: string } = {}) => ({
+  allowUnsafe: over.allowUnsafe ?? false,
+  vendored: over.vendored ?? NO_VENDOR,
+  log: (m: string) => logs.push(m),
+  sourceId: "src",
+  skills: [] as { name: string; dir: string }[],
+  ...(over.baselineDir === undefined ? {} : { baselineDir: over.baselineDir }),
+});
+
+export async function scanWithRipwire(dir: string, options: ReturnType<typeof opts>): ReturnType<typeof scan> {
+  const { baselineDir, ...rest } = options;
+  const baseline =
+    baselineDir === undefined
+      ? undefined
+      : baselineDir === null
+        ? null
+        : await scan(baselineDir, { ...rest, allowUnsafe: true, log: () => {}, verifyContent: true });
+  return scan(dir, { ...rest, ...(baseline === undefined ? {} : { baseline }) });
+}
+
+/**
+ * A ripwire stand-in. `--version` prints `versionLine` and exits `versionExit`. A scan exits 3 and names itself on stderr,
+ * so a test can tell which binary ran. Every call is appended to `<file>.calls`.
+ */
+export async function standIn(name: string, versionLine: string = `ripwire ${PINNED_RIPWIRE} (fake)`, versionExit = 0): Promise<string> {
+  const dir = await tmp("mg-named-");
+  const file = path.join(dir, "ripwire");
+  await writeFile(
+    file,
+    `#!/bin/sh\necho "$*" >> "$0.calls"\nif [ "$1" = "--version" ]; then echo '${versionLine}'; exit ${versionExit}; fi\necho ${name} >&2\nexit 3\n`,
+  );
+  await chmod(file, 0o755);
+  return file;
+}
+
+/** Write the VERSION stamp that scripts/ensure-ripwire.mjs puts next to a vendored binary. */
+export async function stamp(binary: string, text: string = PINNED_RIPWIRE): Promise<string> {
+  await writeFile(path.join(path.dirname(binary), "VERSION"), `${text}\n`);
+  return binary;
+}
+
+/** The arguments of every call that a stand-in got, or [] when it never ran. */
+export async function calls(file: string): Promise<string[]> {
+  try {
+    return (await readFile(`${file}.calls`, "utf8")).trim().split("\n");
+  } catch {
+    return [];
+  }
+}
+
+export async function withPath<T>(value: string, fn: () => Promise<T>): Promise<T> {
+  const prev = process.env["PATH"];
+  process.env["PATH"] = value;
+  try {
+    return await fn();
+  } finally {
+    process.env["PATH"] = prev;
+  }
+}
+
+/** A directory with a `ripwire` that prints the given text and exits as told, or kills itself with a signal. `--version` prints the pinned version. */
+export async function scriptedRipwire(spec: { code?: number; stdout?: string; stderr?: string; signal?: boolean }): Promise<string> {
+  const dir = await tmp("mg-scripted-");
+  await writeFile(path.join(dir, "out.txt"), spec.stdout ?? "");
+  await writeFile(path.join(dir, "err.txt"), spec.stderr ?? "");
+  const tail = spec.signal === true ? "kill -TERM $$" : `exit ${spec.code ?? 0}`;
+  const file = path.join(dir, "ripwire");
+  await writeFile(
+    file,
+    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "ripwire ${PINNED_RIPWIRE} (fake)"; exit 0; fi\nd=$(dirname "$0")\ncat "$d/err.txt" >&2\ncat "$d/out.txt"\n${tail}\n`,
+  );
+  await chmod(file, 0o755);
+  return dir;
+}
+
+/** Run `fn` with the scripted ripwire first on PATH and a fresh MARGRAVE_HOME. */
+export async function withScripted<T>(bin: string, fn: () => Promise<T>): Promise<T> {
+  const prevHome = process.env["MARGRAVE_HOME"];
+  process.env["MARGRAVE_HOME"] = await tmp("mg-home-");
+  try {
+    return await withPath(`${bin}:${process.env["PATH"] ?? ""}`, fn);
+  } finally {
+    if (prevHome === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prevHome;
+  }
+}
+
+export async function names(dir: string): Promise<string[]> {
+  return (await readdir(dir).catch((): string[] => [])).sort();
+}
+
+export async function installLocalDir(env: Env, dir: string): Promise<string> {
+  const r = await cliMg(env, ["install", dir]);
+  assert.equal(r.code, 0, r.stderr);
+  return sourceId(r);
+}
+
+export async function localSource(name: string): Promise<{ dir: string; record: (id: string) => SourceRecord }> {
+  const dir = await tmp("mg-localsrc-");
+  await writeSkill(dir, name, `${name} skill`);
+  return {
+    dir,
+    record: (id) => ({ id, kind: "local", spec: dir, path: dir, subpath: "", ref: null, commit: null, installedAt: "now" }),
+  };
+}
+
+export const readSourceRecords = (home: string): SourceRecord[] => catalogRecords(home);
+
+/** The change for the next three tests: another command removed `id` (rows and record) before this command took the lock. */
+export function removedByAnother(t: { after: (fn: () => void) => void }, home: string, id: string): ReturnType<typeof changeAtLock> {
+  return changeAtLock(t, 1, () => {
+    writeIndexRows(home, (db) => deleteSourceSkills(db, id));
+    writeCatalogRecords(home, []);
+  });
+}
+
+export interface ToolText {
+  isError: boolean;
+  text: string;
+}
+
+export async function call(client: Client, name: string, args: Record<string, unknown>): Promise<ToolText> {
+  const r = (await client.callTool({ name, arguments: args })) as { isError?: boolean; content: { type: string; text: string }[] };
+  return { isError: r.isError === true, text: r.content.map((c) => c.text).join("\n") };
+}
+
+/** A client of handleHostedMcp. The fetch goes straight to the handler, so no network is used. */
+export async function connectHosted(t: { after: (fn: () => Promise<void>) => void }, allowedSources?: readonly string[]): Promise<Client> {
+  const client = new Client({ name: "margrave-test", version: "0.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL("http://test/mcp?allowedSources=all"), {
+      fetch: async (url, init) => {
+        const headers = new Headers(init?.headers);
+        headers.set("allowedSources", "all");
+        const response = await handleHostedMcp(
+          new Request(url, { ...init, headers }),
+          allowedSources === undefined ? {} : { allowedSources },
+        );
+        if (response.ok) assert.match(response.headers.get("content-type") ?? "", /^application\/json\b/u);
+        return response;
+      },
+    }),
+  );
+  t.after(() => client.close());
+  return client;
+}
+
+/** Set MARGRAVE_HOME to a fresh temp dir until the test ends. */
+export async function hostedUseHome(t: { after: (fn: () => void) => void }): Promise<string> {
+  const prev = process.env["MARGRAVE_HOME"];
+  const home = await tmp("mg-home-");
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(() => {
+    mock.restoreAll();
+    if (prev === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = prev;
+  });
+  return home;
+}
