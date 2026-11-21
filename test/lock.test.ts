@@ -9,6 +9,7 @@ import { pathToFileURL } from "node:url";
 import { parseLock, restoreLock } from "../src/lock.ts";
 import { exportLock, indexedEntries, matchesLock, sameInventory, verifyInstalled } from "../src/lock-format.ts";
 import { scanSource } from "../src/scan.ts";
+import { scanInventory } from "../src/safety.ts";
 import { toEntries } from "../src/source-files.ts";
 import { parseSpec } from "../src/source-git.ts";
 import { installSource } from "../src/sources.ts";
@@ -22,6 +23,7 @@ import {
   realExec,
   seedIndex,
   tmp,
+  useHome,
   writeCatalogRecords,
   writeIndexRows,
 } from "./helpers.ts";
@@ -420,7 +422,8 @@ test("lock verification compares the real snapshot, indexed inventory, manifest 
 
 test("an empty store exports and restores an empty lock", async (t) => {
   const previous = process.env["MARGRAVE_HOME"];
-  process.env["MARGRAVE_HOME"] = await tmp("mg-home-");
+  const home = await tmp("mg-home-");
+  process.env["MARGRAVE_HOME"] = home;
   t.after(() => {
     if (previous === undefined) delete process.env["MARGRAVE_HOME"];
     else process.env["MARGRAVE_HOME"] = previous;
@@ -430,6 +433,425 @@ test("an empty store exports and restores an empty lock", async (t) => {
   const output: string[] = [];
   await restoreLock(lock, { log: () => {}, allowUnsafe: false }, (line) => output.push(line));
   assert.deepEqual(output, []);
+  assert.deepEqual(await fsp.readdir(home), []);
+});
+
+async function directRestoreFixture(home: string, selected: boolean) {
+  const spec = pathToFileURL(path.join(home, "nonexistent-repository")).href;
+  const parsed = parseSpec(spec);
+  assert.equal(parsed.kind, "git");
+  const commit = "a".repeat(40);
+  const selection = selected ? ["first", "second"] : null;
+  const record = {
+    ...parsed,
+    spec,
+    ref: "refs/heads/main",
+    commit,
+    snapshot: `${commit}-${"d".repeat(16)}`,
+    installedAt: "2026-01-01T00:00:00.000Z",
+    ...(selection === null ? {} : { selection }),
+  };
+  const dir = path.join(home, "snapshots", record.id, record.snapshot);
+  for (const name of selected ? ["first", "second", "third"] : ["first", "second"]) {
+    await mkdir(path.join(dir, name), { recursive: true });
+    await writeFile(path.join(dir, name, "SKILL.md"), `---\nname: ${name}\ndescription: A skill\n---\n\nContent\n`);
+  }
+  const scan = await scanSource(dir, { followSymlinks: false, boundary: dir, strict: true });
+  assert.equal(scan.skills.length, selected ? 3 : 2);
+  const entries = toEntries(
+    record.id,
+    scan.skills.filter((skill) => selection === null || selection.includes(skill.name)),
+    (d) => path.relative(dir, d),
+  );
+  const lock = parseLock({
+    version: 2,
+    sources: [
+      {
+        spec,
+        id: record.id,
+        url: record.url,
+        subpath: record.subpath,
+        ref: record.ref,
+        commit,
+        selection,
+        skills: entries.map(({ id, revision }) => ({ id, revision })),
+      },
+    ],
+  });
+  return { record, dir, entries, lock };
+}
+
+async function directPending(home: string, fixture: Awaited<ReturnType<typeof directRestoreFixture>>) {
+  const { record, dir, lock } = fixture;
+  const scan = {
+    code: 0,
+    files: [],
+    keys: [],
+    overridden: false,
+    tree: await scanInventory(dir),
+    verdict: "clean" as const,
+    version: null,
+  };
+  const marker = path.join(home, "restore-pending", `${record.id}.json`);
+  const contents = JSON.stringify({ source: lock.sources[0], record: { ...record, scan } });
+  await mkdir(path.dirname(marker), { recursive: true });
+  await writeFile(marker, contents);
+  return { marker, contents, scan };
+}
+
+test("lock restore direct propagates both strict snapshot scan errors", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(async () => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    await rm(home, { recursive: true, force: true });
+  });
+  const fixture = await directRestoreFixture(home, false);
+  const { marker, contents } = await directPending(home, fixture);
+  const real = fsp.readdir;
+  const ctx = { log: (): void => {}, allowUnsafe: false };
+  for (const target of [1, 2]) {
+    let count = 0;
+    const error = new Error(`snapshot listing ${target}`);
+    mock.method(fsp, "readdir", ((p: string, ...args: unknown[]) => {
+      if (p === fixture.dir && (args[0] as { withFileTypes?: boolean } | undefined)?.withFileTypes === true && ++count === target)
+        return Promise.reject(error);
+      return (real as (...a: unknown[]) => unknown)(p, ...args);
+    }) as typeof fsp.readdir);
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(
+        restoreLock(fixture.lock, ctx, () => {}),
+        (err) => err === error,
+      );
+    } finally {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+    assert.equal(count, target);
+    assert.equal(await readFile(marker, "utf8"), contents);
+    assert.equal(existsSync(path.join(home, "index.db")), false);
+    assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+  }
+});
+
+test("lock restore direct rejects duplicates discovered by the second scan", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(async () => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    await rm(home, { recursive: true, force: true });
+  });
+  const fixture = await directRestoreFixture(home, false);
+  await mkdir(path.join(fixture.dir, "z-duplicate"));
+  await writeFile(path.join(fixture.dir, "z-duplicate", "SKILL.md"), await readFile(path.join(fixture.dir, "first", "SKILL.md")));
+  const { marker, contents } = await directPending(home, fixture);
+  const real = fsp.readdir;
+  let count = 0;
+  mock.method(fsp, "readdir", (async (p: string, ...args: unknown[]) => {
+    const entries = await (real as (...a: unknown[]) => Promise<{ name: string }[]>)(p, ...args);
+    if (p === fixture.dir && (args[0] as { withFileTypes?: boolean } | undefined)?.withFileTypes === true && ++count === 1)
+      return entries.filter((entry) => entry.name !== "z-duplicate");
+    return entries;
+  }) as typeof fsp.readdir);
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(
+      restoreLock(fixture.lock, { log: () => {}, allowUnsafe: false }, () => {}),
+      {
+        message: `staged skills differ from the lock: ${fixture.record.id}`,
+      },
+    );
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+  assert.equal(count, 2);
+  assert.equal(await readFile(marker, "utf8"), contents);
+  assert.equal(existsSync(path.join(home, "index.db")), false);
+  assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+});
+
+test("lock restore direct rejects empty, wrong revision, and selected snapshot drift", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(async () => rm(home, { recursive: true, force: true }));
+  for (const mode of ["empty", "revision", "selected"] as const) {
+    const fixture = await directRestoreFixture(home, mode === "selected");
+    if (mode === "empty") {
+      await rm(path.join(fixture.dir, "first"), { recursive: true });
+      await rm(path.join(fixture.dir, "second"), { recursive: true });
+      fixture.lock = parseLock({ version: 2, sources: [{ ...fixture.lock.sources[0]!, skills: [] }] });
+    } else if (mode === "revision") {
+      const source = fixture.lock.sources[0]!;
+      fixture.lock = parseLock({
+        version: 2,
+        sources: [
+          {
+            ...source,
+            skills: source.skills.map((skill, index) => (index === 0 ? { ...skill, revision: `sha256:${"c".repeat(64)}` } : skill)),
+          },
+        ],
+      });
+    }
+    const { marker, contents } = await directPending(home, fixture);
+    if (mode === "selected") await rm(path.join(fixture.dir, "first", "SKILL.md"));
+    await assert.rejects(
+      restoreLock(fixture.lock, { log: () => {}, allowUnsafe: false }, () => {}),
+      {
+        message: `${mode === "selected" ? "installed source differs" : "staged skills differ"} from the lock: ${fixture.record.id}`,
+      },
+    );
+    assert.equal(await readFile(marker, "utf8"), contents);
+    assert.equal(existsSync(path.join(home, "index.db")), false);
+    assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+    await rm(path.join(home, "snapshots"), { recursive: true, force: true });
+    await rm(marker);
+  }
+});
+
+for (const prior of ["null-tree", "failed"] as const)
+  test(`lock restore direct refreshes ${prior} prior scan`, async (t) => {
+    const previousHome = process.env["MARGRAVE_HOME"];
+    const previousPath = process.env["PATH"];
+    const previousExit = process.env["FAKE_RIPWIRE_EXIT"];
+    const bin = await fakeRipwire();
+    process.env["PATH"] = `${bin}:${previousPath ?? ""}`;
+    const home = await tmp("mg-home-");
+    process.env["MARGRAVE_HOME"] = home;
+    t.after(async () => {
+      if (previousHome === undefined) delete process.env["MARGRAVE_HOME"];
+      else process.env["MARGRAVE_HOME"] = previousHome;
+      if (previousPath === undefined) delete process.env["PATH"];
+      else process.env["PATH"] = previousPath;
+      if (previousExit === undefined) delete process.env["FAKE_RIPWIRE_EXIT"];
+      else process.env["FAKE_RIPWIRE_EXIT"] = previousExit;
+      await rm(bin, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    });
+    const fixture = await directRestoreFixture(home, false);
+    const { marker, scan } = await directPending(home, fixture);
+    const priorScan = { ...scan, tree: prior === "null-tree" ? null : scan.tree, verdict: prior === "failed" ? "failed" : "clean" };
+    const record = { ...fixture.record, scan: priorScan };
+    const contents = JSON.stringify({ source: fixture.lock.sources[0], record });
+    await writeFile(marker, contents);
+    const output: string[] = [];
+    process.env["FAKE_RIPWIRE_EXIT"] = "3";
+    await assert.rejects(
+      restoreLock(fixture.lock, { log: () => {}, allowUnsafe: false }, (line) => output.push(line)),
+      /refused: ripwire could not read the files \(exit 3\)/u,
+    );
+    assert.equal(await readFile(marker, "utf8"), contents);
+    assert.equal(existsSync(path.join(home, "index.db")), false);
+    assert.equal(output.length, 0);
+    delete process.env["FAKE_RIPWIRE_EXIT"];
+    await restoreLock(fixture.lock, { log: () => {}, allowUnsafe: false }, (line) => output.push(line));
+    assert.deepEqual(output, [`restored ${fixture.record.id}`]);
+    assert.deepEqual(catalogRecords(home), [record]);
+    assert.deepEqual(
+      indexRows(home).map((row) => row.id),
+      fixture.entries.map((entry) => entry.id),
+    );
+    assert.equal(existsSync(marker), false);
+    assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+  });
+
+test("lock restore direct restages installed rows after git metadata disappears", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  const previousPath = process.env["PATH"];
+  const scanner = await fakeRipwire();
+  const bin = path.join(home, "git-wrapper");
+  await mkdir(bin);
+  process.env["PATH"] = `${scanner}:${previousPath ?? ""}`;
+  const repo = await makeRepo();
+  t.after(async () => {
+    if (previousPath === undefined) delete process.env["PATH"];
+    else process.env["PATH"] = previousPath;
+    await rm(home, { recursive: true, force: true });
+    await rm(scanner, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+  });
+  const ctx = { log: (): void => {}, allowUnsafe: false };
+  const { id } = await installSource(repo.url, null, ctx);
+  const lock = await exportLock([]);
+  const original = catalogRecords(home)[0]!;
+  const db = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+  const rows = indexedEntries(db, id).map((row) => ({ ...row }));
+  db.close();
+  await rm(path.join(home, "snapshots", id, original.snapshot!), { recursive: true });
+  await writeFile(
+    path.join(bin, "git"),
+    '#!/bin/sh\nPATH=${PATH#*:}; export PATH\nif [ "$1" = "-C" ] && [ "$3" = "rev-parse" ] && [ "$4" = "HEAD" ]; then\n  case "$2" in "$MARGRAVE_HOME"/staging/restore-*/*) result=$(git "$@") || exit $?; /bin/rm -rf "$2/.git"; : > "$MARGRAVE_HOME/git-cleanup-observed"; printf "%s\\n" "$result"; exit 0 ;; esac\nfi\nexec git "$@"\n',
+  );
+  await chmod(path.join(bin, "git"), 0o755);
+  process.env["PATH"] = `${bin}:${scanner}:${previousPath ?? ""}`;
+  const output: string[] = [];
+  await restoreLock(lock, ctx, (line) => output.push(line));
+  assert.equal(existsSync(path.join(home, "git-cleanup-observed")), true);
+  assert.deepEqual(output, [`restored ${id}`]);
+  const restored = catalogRecords(home)[0]!;
+  assert.notEqual(restored.snapshot, original.snapshot);
+  assert.equal(existsSync(path.join(home, "snapshots", id, restored.snapshot!)), true);
+  const after = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+  try {
+    assert.deepEqual(
+      indexedEntries(after, id).map((row) => ({ ...row })),
+      rows,
+    );
+  } finally {
+    after.close();
+  }
+  assert.equal(existsSync(path.join(home, "restore-pending", `${id}.json`)), false);
+  assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+});
+
+test("lock restore direct accepts an installed selection and rejects changed identity or revision", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(async () => rm(home, { recursive: true, force: true }));
+  const { record, dir, entries, lock } = await directRestoreFixture(home, true);
+  await seedIndex(entries, [record]);
+  assert.deepEqual(lock.sources[0]!.selection, ["first", "second"]);
+  assert.deepEqual(
+    lock.sources[0]!.skills,
+    entries.map(({ id, revision }) => ({ id, revision })),
+  );
+  assert.deepEqual(
+    indexRows(home).map((row) => row.id),
+    [`${record.id}/first`, `${record.id}/second`],
+  );
+  const catalog = path.join(home, "index.db");
+  const before = await readFile(catalog);
+  const snapshot = await readFile(path.join(dir, "first", "SKILL.md"));
+  const tree = await scanInventory(dir);
+  const ctx = { log: (): void => {}, allowUnsafe: false };
+  const output: string[] = [];
+  await restoreLock(lock, ctx, (line) => output.push(line));
+  assert.deepEqual(output, [`already restored ${record.id}`]);
+  assert.deepEqual(await readFile(catalog), before);
+  assert.deepEqual(catalogRecords(home), [record]);
+  assert.deepEqual(await readFile(path.join(dir, "first", "SKILL.md")), snapshot);
+  assert.equal(await scanInventory(dir), tree);
+  assert.equal(existsSync(path.join(home, "restore-pending", `${record.id}.json`)), false);
+  assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+
+  const other = parseLock({ version: 2, sources: [{ ...lock.sources[0]!, ref: "refs/heads/other" }] });
+  await assert.rejects(
+    restoreLock(other, ctx, (line) => output.push(line)),
+    {
+      message: `installed source differs from the lock: ${record.id}`,
+    },
+  );
+  assert.deepEqual(await readFile(catalog), before);
+  assert.deepEqual(output, [`already restored ${record.id}`]);
+  assert.equal(existsSync(path.join(home, "restore-pending", `${record.id}.json`)), false);
+  assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+
+  const db = new DatabaseSync(catalog);
+  try {
+    db.prepare("UPDATE skills SET hash = ? WHERE id = ?").run(`sha256:${"c".repeat(64)}`, entries[0]!.id);
+  } finally {
+    db.close();
+  }
+  const changed = await readFile(catalog);
+  await assert.rejects(
+    restoreLock(lock, ctx, (line) => output.push(line)),
+    {
+      message: `installed source differs from the lock: ${record.id}`,
+    },
+  );
+  assert.deepEqual(await readFile(catalog), changed);
+  assert.deepEqual(catalogRecords(home), [record]);
+  assert.deepEqual(output, [`already restored ${record.id}`]);
+  assert.equal(existsSync(path.join(home, "restore-pending", `${record.id}.json`)), false);
+  assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+  assert.deepEqual(await readFile(path.join(dir, "first", "SKILL.md")), snapshot);
+  assert.equal(await scanInventory(dir), tree);
+});
+
+test("lock restore direct recovers a pending whole-source snapshot after drift is repaired", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  const previousPath = process.env["PATH"];
+  const bin = path.join(home, "empty-bin");
+  await mkdir(bin);
+  process.env["PATH"] = bin;
+  t.after(async () => {
+    if (previousPath === undefined) delete process.env["PATH"];
+    else process.env["PATH"] = previousPath;
+    await rm(home, { recursive: true, force: true });
+  });
+  const { record, dir, entries, lock } = await directRestoreFixture(home, false);
+  const hidden = path.join(dir, "node_modules", "hidden");
+  await mkdir(hidden, { recursive: true });
+  await writeFile(path.join(hidden, "SKILL.md"), "---\nname: hidden\ndescription: Hidden skill\n---\n\nContent\n");
+  await symlink(hidden, path.join(dir, "linked-hidden"));
+  const scan = {
+    code: 0,
+    files: [],
+    keys: [],
+    overridden: false,
+    tree: await scanInventory(dir),
+    verdict: "clean" as const,
+    version: null,
+  };
+  const scannedRecord = { ...record, scan };
+  const marker = path.join(home, "restore-pending", `${record.id}.json`);
+  await mkdir(path.dirname(marker), { recursive: true });
+  const contents = JSON.stringify({ source: lock.sources[0], record: scannedRecord });
+  await writeFile(marker, contents);
+  const skill = path.join(dir, "first", "SKILL.md");
+  const original = await readFile(skill);
+  await writeFile(skill, Buffer.concat([original, Buffer.from("changed\n")]));
+  const warnings: string[] = [];
+  const ctx = {
+    log: (line: string): void => {
+      warnings.push(line);
+    },
+    allowUnsafe: false,
+  };
+  const output: string[] = [];
+  await assert.rejects(
+    restoreLock(lock, ctx, (line) => output.push(line)),
+    {
+      message: `installed source differs from the lock: ${record.id}`,
+    },
+  );
+  assert.equal(output.length, 0);
+  assert.equal(await readFile(marker, "utf8"), contents);
+  assert.equal(existsSync(path.join(home, "index.db")), false);
+  assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+
+  await writeFile(skill, original);
+  await restoreLock(lock, ctx, (line) => output.push(line));
+  assert.deepEqual(output, [`restored ${record.id}`]);
+  assert.deepEqual(warnings, [
+    `warning: skipped symlink ${path.join(dir, "linked-hidden")} (git sources follow no symlinks)`,
+    `warning: skipped symlink ${path.join(dir, "linked-hidden")} (git sources follow no symlinks)`,
+  ]);
+  assert.deepEqual(
+    indexRows(home).map((row) => row.name),
+    ["first", "second"],
+  );
+  assert.deepEqual(catalogRecords(home), [scannedRecord]);
+  const db = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+  try {
+    assert.deepEqual(
+      indexedEntries(db, record.id).map((row) => ({ ...row })),
+      entries
+        .map(({ id, revision, manifest, dir: entryDir }) => ({ id, revision, manifest, dir: entryDir }))
+        .sort((a, b) => a.id.localeCompare(b.id)),
+    );
+  } finally {
+    db.close();
+  }
+  assert.equal(existsSync(marker), false);
+  assert.deepEqual(await readFile(skill), original);
+  assert.equal(await scanInventory(dir), scan.tree);
+  assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
 });
 
 test("version 2 restores selected skills and version 1 restores the whole source", async (t) => {

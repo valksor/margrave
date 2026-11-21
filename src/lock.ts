@@ -87,8 +87,7 @@ async function scanLockedDirectory(
   } else accepted = await scanWithRipwire(root, { ...ctx, sourceId: source.id, skills: scan.skills, verifyContent: true });
   const checked = await scanSource(root, { followSymlinks: false, boundary: await realpath(dir), strict: true });
   const entries = toEntries(source.id, selectSkills(source.id, scan, source.selection ?? undefined), (d) => d);
-  if (accepted.tree !== null && (await scanInventory(root)) !== accepted.tree)
-    throw new MargraveError(`installed source differs from the lock: ${source.id}`);
+  if ((await scanInventory(root)) !== accepted.tree) throw new MargraveError(`installed source differs from the lock: ${source.id}`);
   if (
     JSON.stringify(toEntries(source.id, scan.skills, (d) => d)) !== JSON.stringify(toEntries(source.id, checked.skills, (d) => d)) ||
     JSON.stringify(scan.duplicates) !== JSON.stringify(checked.duplicates)
@@ -129,9 +128,7 @@ async function stageLockedCommit(
 }
 
 function verifyStagedRows(source: LockedSource, staged: { dir: string; entries: NewEntry[] }, indexed: string): void {
-  const rows = staged.entries
-    .map(({ id, revision, manifest, dir }) => ({ id, revision, manifest, dir: path.relative(staged.dir, dir) }))
-    .sort((a, b) => Number(a.id > b.id) - Number(a.id < b.id));
+  const rows = staged.entries.map(({ id, revision, manifest, dir }) => ({ id, revision, manifest, dir: path.relative(staged.dir, dir) }));
   if (JSON.stringify(rows) !== indexed) throw new MargraveError(`installed source differs from the lock: ${source.id}`);
 }
 
