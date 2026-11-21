@@ -18,6 +18,10 @@ if (process.argv.length > 2) {
       "test/lock-format.test.ts",
       "test/lock.test.ts",
     ],
+    "store-files": [
+      "--test-name-pattern='^(store files |a missing sources|home|a sources.json that cannot be read|every field of a source record|atomic writes)'",
+      "test/store-files.test.ts",
+    ],
     hosted: ["test/hosted.test.ts"],
   };
 
