@@ -12,6 +12,7 @@ if (process.argv.length > 2) {
     "safety-runner": ["test/safety-runner.test.ts", "test/no-vendored-ripwire.test.ts"],
     safety: ["test/safety.test.ts"],
     search: ["test/skills-sh.test.ts"],
+    hosted: ["test/hosted.test.ts"],
   };
 
   for (const [target, tests] of Object.entries(targets)) {
