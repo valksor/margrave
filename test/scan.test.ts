@@ -408,17 +408,25 @@ test("manifests fingerprint sorted paths and binary bytes", async (t) => {
   await writeFile(path.join(dir, "references", "a.bin"), Buffer.from([1, 2]));
   const realOpen = fsp.open;
   let skillOpens = 0;
-  mock.method(fsp, "open", ((p: string, ...args: unknown[]) => {
-    if (p === path.join(dir, "SKILL.md")) skillOpens++;
-    return (realOpen as (...a: unknown[]) => unknown)(p, ...args);
-  }) as typeof fsp.open);
+  let skillHandle: Awaited<ReturnType<typeof realOpen>> | undefined;
+  mock.method(fsp, "open", async (...args: Parameters<typeof realOpen>) => {
+    const handle = await realOpen(...args);
+    if (args[0] === path.join(dir, "SKILL.md")) {
+      skillOpens++;
+      skillHandle = handle;
+    }
+    return handle;
+  });
   syncBuiltinESMExports();
-  t.after(() => {
+  t.after(async () => {
     mock.restoreAll();
     syncBuiltinESMExports();
+    if (skillHandle && skillHandle.fd !== -1) await skillHandle.close();
   });
   const first = await scan();
   assert.equal(skillOpens, 1);
+  assert.ok(skillHandle);
+  assert.equal(skillHandle.fd, -1);
   mock.restoreAll();
   syncBuiltinESMExports();
   assert.notEqual(first.revision, before.revision);

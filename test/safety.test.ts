@@ -659,6 +659,21 @@ test("inventory hashes sorted paths, file bytes, directories, and relative links
   }
 });
 
+test("inventory rejects a FIFO before opening", async (t) => {
+  const dir = await scanDir({});
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  await mkfifo(path.join(dir, "pipe"));
+  const open = t.mock.method(fsp, "open");
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(scanInventory(dir), /staged skills changed during scan/u);
+    assert.equal(open.mock.callCount(), 0);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
 test("inventory rejects a file replaced by a directory before opening", async (t) => {
   const dir = await scanDir({ file: "data" });
   const originalOpen = fsp.open;
