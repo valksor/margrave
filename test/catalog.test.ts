@@ -3,7 +3,21 @@ import fsp, { readFile, chmod, mkdir, readdir, rename, rm, stat, symlink, writeF
 import path from "node:path";
 import test, { mock } from "node:test";
 import { installSource, reindexAll, removeSource, updateSources } from "../src/sources.ts";
-import { readSources, deleteSourceSkills, insertSkills, openIndexRead, temporaryCatalog } from "../src/catalog.ts";
+import {
+  readSources,
+  deleteSourceSkills,
+  insertSkills,
+  openIndexRead,
+  temporaryCatalog,
+  MIGRATION_FTS_SQL,
+  MIGRATION_COMMIT_SQL,
+  SQLITE_READONLY_ROLLBACK,
+  readProbe,
+  openProbed,
+  catalogSources,
+  putCatalogSources,
+} from "../src/catalog.ts";
+import { MargraveError } from "../src/store-files.ts";
 import { writerLock, home as storeHome } from "../src/store.ts";
 import {
   makeRepo,
@@ -159,6 +173,436 @@ const readArgs = (s: { id: string; other: string }): string[][] => [
   ["update"],
   ["remove", s.id],
 ];
+
+async function seedDirectIndex(home: string, entries: Parameters<typeof seedIndex>[0]): Promise<void> {
+  const file = path.join(home, "index.db");
+  const lstat = fsp.lstat;
+  let probes = 0;
+  const bounded = mock.method(fsp, "lstat", ((target: string, ...args: unknown[]) => {
+    if (target === file) assert.ok(++probes <= 10, "too many index probes during setup");
+    return (lstat as (...values: unknown[]) => unknown)(target, ...args);
+  }) as typeof fsp.lstat);
+  syncBuiltinESMExports();
+  try {
+    await seedIndex(entries);
+  } finally {
+    bounded.mock.restore();
+    syncBuiltinESMExports();
+  }
+}
+
+test("catalog read direct openIndexRead rejects missing and invalid files without writes", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const file = path.join(home, "index.db");
+  await assert.rejects(
+    openIndexRead(),
+    (err: unknown) => err instanceof MargraveError && err.message === "index.db is missing. Restore the complete store backup",
+  );
+  assert.deepEqual(await readdir(home), []);
+  await mkdir(file);
+  await assert.rejects(
+    openIndexRead(),
+    (err: unknown) => err instanceof MargraveError && err.message === `${file} is not a regular catalog file`,
+  );
+  assert.deepEqual(await readdir(file), []);
+  assert.deepEqual(await readdir(home), ["index.db"]);
+  await rm(file, { recursive: true });
+  new DatabaseSync(file).close();
+  const empty = await readFile(file);
+  await assert.rejects(
+    openIndexRead(),
+    (err: unknown) => err instanceof MargraveError && err.message === `${file} is not a supported margrave catalog`,
+  );
+  assert.deepEqual(await readFile(file), empty);
+  const invalid = Buffer.from("not a SQLite database ".repeat(8));
+  await writeFile(file, invalid);
+  await assert.rejects(
+    openIndexRead(),
+    (err: unknown) => err instanceof MargraveError && err.message === `${file} is not a supported margrave catalog`,
+  );
+  assert.deepEqual(await readFile(file), invalid);
+  assert.deepEqual(await readdir(home), ["index.db"]);
+});
+
+test("catalog read direct migration SQL builds searchable FTS and commits the version", async (t) => {
+  const home = await tmp("mg-home-");
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const db = new DatabaseSync(path.join(home, "migration.db"));
+  try {
+    db.exec("CREATE TABLE fts(name, description, headings, body); BEGIN IMMEDIATE");
+    db.exec(MIGRATION_FTS_SQL);
+    db.prepare("INSERT INTO fts(rowid, name, description, headings, body) VALUES (?, ?, ?, ?, ?)").run(
+      1,
+      "alpha",
+      "searchable",
+      "heading",
+      "body",
+    );
+    assert.equal(db.prepare("SELECT rowid FROM fts WHERE fts MATCH 'searchable'").get()?.["rowid"], 1);
+    assert.match(String(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'fts'").get()?.["sql"]), /using fts5/iu);
+    assert.deepEqual(
+      db
+        .prepare("PRAGMA table_info(fts)")
+        .all()
+        .map((row) => row["name"]),
+      ["name", "description", "headings", "body"],
+    );
+    db.exec(MIGRATION_COMMIT_SQL);
+    assert.equal(db.prepare("PRAGMA user_version").get()?.["user_version"], 4);
+    assert.equal(db.isTransaction, false);
+  } finally {
+    db.close();
+  }
+});
+
+test("catalog read direct probe accepts empty and supported schemas and rejects damaged schemas", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const file = path.join(home, "index.db");
+  const empty = new DatabaseSync(file);
+  assert.deepEqual(readProbe(empty, file), { version: 0 });
+  empty.exec("CREATE TABLE other(x)");
+  empty.close();
+  const nonempty = await readFile(file);
+  const foreign = new DatabaseSync(file, { readOnly: true });
+  try {
+    assert.throws(
+      () => readProbe(foreign, file),
+      (err: unknown) => err instanceof MargraveError && err.message === `${file} is not a supported margrave catalog`,
+    );
+  } finally {
+    foreign.close();
+  }
+  assert.deepEqual(await readFile(file), nonempty);
+  await rm(file);
+  await seedDirectIndex(home, [newEntry("s", "a")]);
+  const original = await readFile(file);
+  for (const version of [2, 3, 4]) {
+    const db = new DatabaseSync(file, { readBigInts: true });
+    db.exec(`PRAGMA user_version = ${version}`);
+    assert.deepEqual(readProbe(db, file), { version });
+    db.close();
+  }
+  for (const sql of [
+    "PRAGMA user_version = 1",
+    "PRAGMA user_version = 5",
+    "PRAGMA user_version = -1",
+    "ALTER TABLE skills DROP COLUMN description",
+    "ALTER TABLE skills DROP COLUMN manifest",
+    "DROP INDEX skills_source",
+    "DROP TABLE fts; CREATE VIRTUAL TABLE fts USING fts5(name, description, headings)",
+    "DROP TABLE fts; CREATE TABLE fts(name, description, headings, body)",
+    "PRAGMA user_version = 3; DROP TABLE sources",
+  ]) {
+    await writeFile(file, original);
+    const db = new DatabaseSync(file);
+    db.exec(sql);
+    db.close();
+    const before = await readFile(file);
+    const reader = new DatabaseSync(file, { readOnly: true });
+    try {
+      assert.throws(
+        () => readProbe(reader, file),
+        (err: unknown) => err instanceof MargraveError && err.message === `${file} is not a supported margrave catalog`,
+        sql,
+      );
+    } finally {
+      reader.close();
+    }
+    assert.deepEqual(await readFile(file), before, sql);
+  }
+});
+
+test("catalog read direct open errors close only acquired handles and legacy readers close", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const file = path.join(home, "index.db");
+  const close = mock.method(DatabaseSync.prototype, "close");
+  try {
+    assert.throws(
+      () => openProbed(file, { readOnly: true, timeout: 0 }),
+      (err: unknown) => err instanceof MargraveError && err.message.startsWith(`cannot open ${file}: `),
+    );
+    assert.equal(close.mock.callCount(), 0);
+    await seedDirectIndex(home, [newEntry("s", "a")]);
+    const prepareDescriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare");
+    assert.ok(prepareDescriptor?.value);
+    for (const [failure, message] of [
+      [new Error("probe failed"), `cannot open ${file}: probe failed`],
+      [
+        Object.assign(new Error("readonly"), { errcode: SQLITE_READONLY_ROLLBACK }),
+        `${file} has an unfinished v0.2.1 write. Restore a complete backup before migrating`,
+      ],
+    ] as const) {
+      const probe = mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string): ReturnType<
+        DatabaseSync["prepare"]
+      > {
+        if (this.location("main") === file && sql.includes("pragma_user_version")) throw failure;
+        return (prepareDescriptor.value as typeof DatabaseSync.prototype.prepare).call(this, sql);
+      });
+      try {
+        assert.throws(
+          () => openProbed(file, { readOnly: true, timeout: 0 }),
+          (err: unknown) => err instanceof MargraveError && err.message === message,
+        );
+        const handle: unknown = probe.mock.calls.find((call) => call.arguments[0].includes("pragma_user_version"))?.this;
+        assert.ok(handle instanceof DatabaseSync);
+        assert.equal(close.mock.calls.filter((call) => call.this === handle).length, 1);
+        assert.equal(handle.isOpen, false);
+      } finally {
+        probe.mock.restore();
+      }
+    }
+    for (const version of [2, 3]) {
+      const db = new DatabaseSync(file);
+      db.exec(`PRAGMA user_version = ${version}`);
+      db.close();
+      const prepareCalls = mock.method(DatabaseSync.prototype, "prepare");
+      try {
+        await assert.rejects(openIndexRead(), {
+          name: "Error",
+          message: "store upgrade required. Open the store with the current Margrave CLI. See Upgrading in the README.",
+        });
+        const handle = prepareCalls.mock.calls.find((call) => call.arguments[0].includes("pragma_user_version"))?.this;
+        assert.ok(handle instanceof DatabaseSync);
+        assert.equal(close.mock.calls.filter((call) => call.this === handle).length, 1);
+      } finally {
+        prepareCalls.mock.restore();
+      }
+    }
+  } finally {
+    close.mock.restore();
+  }
+});
+
+test("catalog read direct source records validate identity, order, and connection lifecycle", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await seedDirectIndex(home, [newEntry("a", "one"), newEntry("b", "two")]);
+  const file = path.join(home, "index.db");
+  const db = new DatabaseSync(file);
+  const records = catalogSources(db);
+  assert.equal(records.length, 2);
+  putCatalogSources(db, [records[1]!, records[0]!]);
+  assert.deepEqual(catalogSources(db), [records[1], records[0]]);
+  putCatalogSources(db, []);
+  assert.deepEqual(catalogSources(db), []);
+  putCatalogSources(db, records);
+  db.close();
+  const prepare = mock.method(DatabaseSync.prototype, "prepare");
+  const close = mock.method(DatabaseSync.prototype, "close");
+  try {
+    for (const record of [
+      null,
+      JSON.stringify({ id: "a" }),
+      JSON.stringify({ ...records[0]!, kind: "invalid" }),
+      JSON.stringify({ ...records[0]!, id: "different" }),
+      "{",
+    ]) {
+      const writer = new DatabaseSync(file);
+      writer.prepare("UPDATE sources SET record = ? WHERE id = ?").run(record ?? JSON.stringify(records[0]), "a");
+      writer.close();
+      const reader = new DatabaseSync(file, { readOnly: true });
+      try {
+        if (record === null) assert.deepEqual(catalogSources(reader), records);
+        else if (record === "{") assert.throws(() => catalogSources(reader), SyntaxError);
+        else
+          assert.throws(
+            () => catalogSources(reader),
+            (err: unknown) => err instanceof MargraveError && err.message === "cannot upgrade the v0.2.1 catalog: malformed source records",
+          );
+      } finally {
+        reader.close();
+      }
+      assert.equal(close.mock.calls.filter((call) => call.this === reader).length, 1);
+      if (record === null) assert.deepEqual(await readSources(), records);
+      else if (record === "{") await assert.rejects(readSources(), SyntaxError);
+      else
+        await assert.rejects(
+          readSources(),
+          (err: unknown) => err instanceof MargraveError && err.message === "cannot upgrade the v0.2.1 catalog: malformed source records",
+        );
+      const calls = prepare.mock.calls.filter((call) => call.arguments[0] === "SELECT id, record FROM sources ORDER BY position");
+      const handle = calls.at(-1)?.this;
+      assert.ok(handle instanceof DatabaseSync);
+      assert.equal(close.mock.calls.filter((call) => call.this === handle).length, 1);
+    }
+  } finally {
+    prepare.mock.restore();
+    close.mock.restore();
+  }
+});
+
+test("catalog read direct missing index states and publication evidence", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const file = path.join(home, "index.db");
+  const marker = path.join(home, "catalog-published");
+  const name = `.catalog-12345-${"a".repeat(24)}.tmp`;
+  const temp = path.join(home, name);
+  const owner = `${temp}.owner`;
+  const lstat = fsp.lstat;
+  let probes = 0;
+  mock.method(fsp, "lstat", ((target: string, ...args: unknown[]) => {
+    if (target === file) assert.ok(++probes <= 4, "too many index probes");
+    return (lstat as (...values: unknown[]) => unknown)(target, ...args);
+  }) as typeof fsp.lstat);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  assert.deepEqual(await readSources(), []);
+  probes = 0;
+  await writeFile(temp, "pending");
+  await writeFile(owner, "margrave-catalog-v1\n");
+  await writeFile(marker, `pending ${name}\n`);
+  assert.deepEqual(await readSources(), []);
+  await rm(marker);
+  await rm(temp);
+  await rm(owner);
+  await writeFile(path.join(home, "sources.json"), "[]");
+  probes = 0;
+  await assert.rejects(
+    readSources(),
+    (err: unknown) =>
+      err instanceof MargraveError &&
+      err.message === "store upgrade required. Open the store with the current Margrave CLI. See Upgrading in the README.",
+  );
+});
+
+test("catalog read direct rejects invalid pending publication evidence without changing it", async (t) => {
+  const root = await tmp("mg-home-");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  useHome(t, root);
+  const valid = `.catalog-12345-${"a".repeat(24)}.tmp`;
+  const cases = [
+    "marker-directory",
+    "marker-symlink",
+    "prefix",
+    "trailing",
+    "pid",
+    "width",
+    "nonce",
+    "temp-missing",
+    "temp-directory",
+    "owner-missing",
+    "owner-symlink",
+    "owner-content",
+  ];
+  for (const kind of cases) {
+    const home = path.join(root, kind);
+    await mkdir(home);
+    process.env["MARGRAVE_HOME"] = home;
+    const marker = path.join(home, "catalog-published");
+    const file = path.join(home, "index.db");
+    const name =
+      kind === "pid"
+        ? `.catalog-x-${"a".repeat(24)}.tmp`
+        : kind === "width"
+          ? `.catalog-12345-${"a".repeat(23)}.tmp`
+          : kind === "nonce"
+            ? `.catalog-12345-${"g".repeat(24)}.tmp`
+            : valid;
+    const temp = path.join(home, name);
+    const owner = `${temp}.owner`;
+    const text = `${kind === "prefix" ? "extra " : ""}pending ${name}\n${kind === "trailing" ? "extra" : ""}`;
+    if (kind === "marker-directory") await mkdir(marker);
+    else if (kind === "marker-symlink") {
+      await writeFile(path.join(home, "marker-target"), text);
+      await symlink(path.join(home, "marker-target"), marker);
+    } else await writeFile(marker, text);
+    if (kind === "temp-directory") await mkdir(temp);
+    else if (kind !== "temp-missing") await writeFile(temp, "stage");
+    if (kind === "owner-symlink") {
+      await writeFile(path.join(home, "owner-target"), "margrave-catalog-v1\n");
+      await symlink(path.join(home, "owner-target"), owner);
+    } else if (kind !== "owner-missing") await writeFile(owner, kind === "owner-content" ? "wrong\n" : "margrave-catalog-v1\n");
+    const before = await Promise.all(
+      (await readdir(home)).sort().map(async (entry) => {
+        const item = path.join(home, entry);
+        const st = await fsp.lstat(item);
+        return [entry, st.isSymbolicLink() ? await readlink(item) : st.isFile() ? await readFile(item, "utf8") : "directory"];
+      }),
+    );
+    const lstat = fsp.lstat;
+    let probes = 0;
+    let undefinedOwnerProbes = 0;
+    const bounded = mock.method(fsp, "lstat", ((target: string, ...args: unknown[]) => {
+      if (target === file) assert.ok(++probes <= 4, "too many index probes");
+      if (target === path.join(home, "undefined.owner")) undefinedOwnerProbes++;
+      return (lstat as (...values: unknown[]) => unknown)(target, ...args);
+    }) as typeof fsp.lstat);
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(
+        readSources(),
+        (err: unknown) => err instanceof MargraveError && err.message === "index.db is missing. Restore the complete store backup",
+        kind,
+      );
+      assert.equal(undefinedOwnerProbes, 0, kind);
+    } finally {
+      bounded.mock.restore();
+      syncBuiltinESMExports();
+    }
+    const after = await Promise.all(
+      (await readdir(home)).sort().map(async (entry) => {
+        const item = path.join(home, entry);
+        const st = await fsp.lstat(item);
+        return [entry, st.isSymbolicLink() ? await readlink(item) : st.isFile() ? await readFile(item, "utf8") : "directory"];
+      }),
+    );
+    assert.deepEqual(after, before, kind);
+  }
+});
+
+for (const change of ["publish", "disappear"] as const) {
+  test(`catalog read direct observes pending publication ${change} race`, async (t) => {
+    const home = await tmp("mg-home-");
+    useHome(t, home);
+    t.after(() => rm(home, { recursive: true, force: true }));
+    await seedDirectIndex(home, [newEntry("s", "a")]);
+    const file = path.join(home, "index.db");
+    const temp = path.join(home, `.catalog-12345-${"a".repeat(24)}.tmp`);
+    const marker = path.join(home, "catalog-published");
+    await rename(file, temp);
+    await writeFile(`${temp}.owner`, "margrave-catalog-v1\n");
+    await writeFile(marker, `pending ${path.basename(temp)}\n`);
+    const lstat = fsp.lstat;
+    let fired = false;
+    let probes = 0;
+    mock.method(fsp, "lstat", (async (target: string, ...args: unknown[]) => {
+      if (target === file) assert.ok(++probes <= 4, "too many index probes");
+      if (target === temp && !fired) {
+        fired = true;
+        if (change === "publish") await rename(temp, file);
+        else {
+          await rm(marker);
+          await rm(temp);
+        }
+      }
+      return (lstat as (...values: unknown[]) => Promise<unknown>)(target, ...args);
+    }) as typeof fsp.lstat);
+    syncBuiltinESMExports();
+    t.after(() => {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+    });
+    const rows = await readSources();
+    assert.equal(fired, true);
+    assert.equal(probes, change === "publish" ? 4 : 3);
+    assert.deepEqual(
+      rows.map((row) => row.id),
+      change === "publish" ? ["s"] : [],
+    );
+  });
+}
 
 test("Git records without a snapshot are rejected", async (t) => {
   await inStore(t, async (home) => {

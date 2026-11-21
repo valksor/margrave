@@ -86,12 +86,11 @@ interface Probe {
 export function readProbe(db: DatabaseSync, file: string): Probe {
   const counts = db
     .prepare(
-      "SELECT (SELECT user_version FROM pragma_user_version) AS user_version, count(*) AS total, count(CASE WHEN type = 'table' AND name IN ('skills', 'fts') THEN 1 END) AS ours, count(CASE WHEN type = 'index' AND tbl_name = 'skills' AND name IN ('skills_name_lc','skills_id_lc','skills_source') THEN 1 END) AS indexes, (SELECT count(*) FROM pragma_table_info('skills') WHERE name IN ('rowid','id','id_lc','name','name_lc','description','source','dir','hash')) AS base_columns, (SELECT count(*) FROM pragma_table_info('skills') WHERE name IN ('manifest','frontmatter')) AS extra_columns, (SELECT count(*) FROM pragma_table_info('fts') WHERE name IN ('name','description','headings','body')) AS fts_columns, count(CASE WHEN type = 'table' AND name = 'fts' AND lower(sql) LIKE '%using fts5%' THEN 1 END) AS fts FROM sqlite_master",
+      "SELECT (SELECT user_version FROM pragma_user_version) AS user_version, count(*) AS total, count(CASE WHEN type = 'index' AND tbl_name = 'skills' AND name IN ('skills_name_lc','skills_id_lc','skills_source') THEN 1 END) AS indexes, (SELECT count(*) FROM pragma_table_info('skills') WHERE name IN ('rowid','id','id_lc','name','name_lc','description','source','dir','hash')) AS base_columns, (SELECT count(*) FROM pragma_table_info('skills') WHERE name IN ('manifest','frontmatter')) AS extra_columns, (SELECT count(*) FROM pragma_table_info('fts') WHERE name IN ('name','description','headings','body')) AS fts_columns, count(CASE WHEN type = 'table' AND name = 'fts' AND lower(sql) LIKE '%using fts5%' THEN 1 END) AS fts FROM sqlite_master",
     )
     .get() as {
     user_version: number | bigint;
     total: number | bigint;
-    ours: number | bigint;
     indexes: number | bigint;
     base_columns: number | bigint;
     extra_columns: number | bigint;
@@ -103,8 +102,7 @@ export function readProbe(db: DatabaseSync, file: string): Probe {
   if (version === 0 && Number(counts.total) > 0) throw new MargraveError(foreignMessage(file));
   if (
     version !== 0 &&
-    (Number(counts.ours) !== 2 ||
-      Number(counts.indexes) !== 3 ||
+    (Number(counts.indexes) !== 3 ||
       Number(counts.base_columns) !== 9 ||
       Number(counts.fts) !== 1 ||
       Number(counts.fts_columns) !== 4 ||
@@ -113,7 +111,7 @@ export function readProbe(db: DatabaseSync, file: string): Probe {
     throw new MargraveError(foreignMessage(file));
   if (
     version >= 3 &&
-    Number(db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'sources'").get()?.["n"]) !== 1
+    Number(db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'sources'").get()!["n"]) !== 1
   )
     throw new MargraveError(foreignMessage(file));
   return { version };
@@ -136,7 +134,7 @@ export function openProbed(file: string, options: OpenOptions): { db: DatabaseSy
     db = new DatabaseSync(file, options);
     return { db, probe: readProbe(db, file) };
   } catch (err) {
-    if (db?.isOpen === true) db.close();
+    db?.close();
     throw err instanceof MargraveError ? err : openError(file, err, "open");
   }
 }
@@ -154,7 +152,7 @@ function openCurrent(file: string, options: OpenOptions): DatabaseSync {
 export function catalogSources(db: DatabaseSync): SourceRecord[] {
   const rows = db.prepare("SELECT id, record FROM sources ORDER BY position").all() as { id: string; record: string }[];
   const values: unknown[] = rows.map((row) => JSON.parse(row.record) as unknown);
-  if (!values.every(validSource) || values.some((value, index) => value.id !== rows[index]?.id))
+  if (!values.every(validSource) || values.some((value, index) => value.id !== rows[index]!.id))
     throw new MargraveError("cannot upgrade the v0.2.1 catalog: malformed source records");
   return values;
 }
