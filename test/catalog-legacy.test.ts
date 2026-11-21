@@ -1,11 +1,621 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { mkdir, readFile, readdir, readlink, rename, rm, writeFile } from "node:fs/promises";
+import nativeFs, { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import fs from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, readlink, rename, rm, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { CLI, copyLegacyStoreFixture, catalogRecords, fakeRipwire, indexRows, makeRepo, runCli, tmp } from "./helpers.ts";
+import { READ_TIMEOUT_MS, SCHEMA_VERSION, SQLITE_READONLY_ROLLBACK, WRITE_TIMEOUT_MS, unfinishedWriteMessage } from "../src/catalog.ts";
+import {
+  checkLegacyJournalMode,
+  copyLegacyCatalog,
+  lockLegacyCatalog,
+  openLegacyCatalog,
+  probeMigrationCatalog,
+} from "../src/catalog-legacy.ts";
+import { MargraveError } from "../src/store-files.ts";
+import { CLI, copyLegacyStoreFixture, catalogRecords, fakeRipwire, indexRows, makeRepo, runCli, tmp, useHome } from "./helpers.ts";
+
+async function directHome(t: { after: (fn: () => void | Promise<void>) => void }): Promise<string> {
+  const parent = await tmp();
+  t.after(async () => rm(parent, { recursive: true, force: true }));
+  const home = path.join(parent, "store");
+  useHome(t, home);
+  return home;
+}
+
+test("catalog legacy direct opens and probes missing, legacy, current and journal catalogs", async (t) => {
+  const home = await directHome(t);
+  assert.equal(await openLegacyCatalog(), null);
+  assert.equal(await probeMigrationCatalog(), "missing");
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const setup = new DatabaseSync(file);
+  setup.exec("CREATE TABLE sources(id TEXT PRIMARY KEY, record TEXT NOT NULL, position INTEGER NOT NULL); PRAGMA user_version = 3");
+  setup.close();
+  const opened = await openLegacyCatalog();
+  assert.ok(opened);
+  try {
+    assert.equal(opened.version, 3);
+    assert.equal(opened.db.prepare("PRAGMA busy_timeout").get()?.["timeout"], READ_TIMEOUT_MS);
+    assert.throws(() => opened.db.exec("CREATE TABLE direct_write_test(n INTEGER)"));
+  } finally {
+    opened.db.close();
+  }
+  const close = t.mock.method(DatabaseSync.prototype, "close");
+  const prepareDescriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare");
+  const execDescriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "exec");
+  assert.ok(prepareDescriptor?.value);
+  assert.ok(execDescriptor?.value);
+  let probes = 0;
+  const probe = t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (this.location("main") === file && sql.startsWith("SELECT (SELECT user_version")) {
+      probes++;
+      assert.throws(
+        () => (execDescriptor.value as typeof DatabaseSync.prototype.exec).call(this, "CREATE TABLE direct_write_test(n INTEGER)"),
+        {
+          code: "ERR_SQLITE_ERROR",
+          errcode: 8,
+        },
+      );
+    }
+    return (prepareDescriptor.value as typeof DatabaseSync.prototype.prepare).call(this, sql);
+  });
+  assert.equal(await probeMigrationCatalog(), "legacy");
+  assert.equal(probes, 1);
+  assert.equal(close.mock.callCount(), 1);
+  probe.mock.restore();
+  close.mock.restore();
+  const current = new DatabaseSync(file);
+  current.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  current.close();
+  const currentOpen = await openLegacyCatalog();
+  assert.ok(currentOpen);
+  assert.equal(currentOpen.version, SCHEMA_VERSION);
+  currentOpen.db.close();
+  assert.equal(await probeMigrationCatalog(), "current");
+  await writeFile(`${file}-journal`, "journal");
+  const prepare = t.mock.method(DatabaseSync.prototype, "prepare");
+  await assert.rejects(openLegacyCatalog(), {
+    message: `${file} has an unfinished v0.2.1 write. Restore a complete backup before migrating`,
+  });
+  assert.equal(prepare.mock.callCount(), 0);
+  prepare.mock.restore();
+  const legacy = new DatabaseSync(file);
+  legacy.exec("PRAGMA user_version = 3");
+  legacy.close();
+  await writeFile(`${file}-journal`, Buffer.alloc(512));
+  assert.equal(await probeMigrationCatalog(), "journal");
+});
+
+test("catalog legacy direct checks delete mode and sidecars", async (t) => {
+  const home = await directHome(t);
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const db = new DatabaseSync(file, { readOnly: true });
+  t.after(() => db.close());
+  await checkLegacyJournalMode(db);
+  for (const suffix of ["-wal", "-shm"]) {
+    await writeFile(`${file}${suffix}`, "sidecar");
+    await assert.rejects(checkLegacyJournalMode(db), { message: unfinishedWriteMessage(file) });
+    await rm(`${file}${suffix}`);
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare");
+  assert.ok(descriptor?.value);
+  const mock = t.mock.method(db, "prepare", (sql: string) => {
+    const prepare = descriptor.value as typeof DatabaseSync.prototype.prepare;
+    if (sql === "PRAGMA journal_mode") return prepare.call(db, "SELECT 'wal' AS journal_mode");
+    return prepare.call(db, sql);
+  });
+  await assert.rejects(checkLegacyJournalMode(db), { message: unfinishedWriteMessage(file) });
+  mock.mock.restore();
+});
+
+test("catalog legacy direct locks a read-only reader and returns a writer transaction", async (t) => {
+  const home = await directHome(t);
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const descriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "exec");
+  assert.ok(descriptor?.value);
+  const readers = new Set<DatabaseSync>();
+  const begin = t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const exec = descriptor.value as typeof DatabaseSync.prototype.exec;
+    if (sql === "BEGIN" && this.location("main") === file) {
+      readers.add(this);
+      assert.throws(() => exec.call(this, "CREATE TABLE direct_write_test(n INTEGER)"));
+    }
+    return exec.call(this, sql);
+  });
+  const close = t.mock.method(DatabaseSync.prototype, "close");
+  const locked = await lockLegacyCatalog();
+  try {
+    assert.equal(locked.version, 2);
+    assert.equal(locked.db.isTransaction, true);
+    assert.equal(typeof locked.db.prepare("PRAGMA user_version").get()?.["user_version"], "bigint");
+    assert.equal(locked.db.prepare("PRAGMA busy_timeout").get()?.["timeout"], BigInt(WRITE_TIMEOUT_MS));
+    assert.equal(readers.size, 1);
+    assert.equal(close.mock.calls.filter((call) => call.this instanceof DatabaseSync && readers.has(call.this)).length, 1);
+  } finally {
+    locked.db.close();
+    close.mock.restore();
+    begin.mock.restore();
+  }
+});
+
+test("catalog legacy direct copies bytes and metadata into an owned catalog", async (t) => {
+  const home = await directHome(t);
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const before = await readFile(file);
+  const original = await lstat(file);
+  const copy = await copyLegacyCatalog();
+  try {
+    assert.deepEqual(await readFile(copy.file), before);
+    const copied = await lstat(copy.file);
+    assert.equal(copied.uid, original.uid);
+    assert.equal(copied.gid, original.gid);
+    assert.equal(copied.mode, original.mode);
+    assert.equal(copy.db.prepare("PRAGMA user_version").get()?.["user_version"], 2n);
+    assert.equal(copy.db.prepare("PRAGMA busy_timeout").get()?.["timeout"], BigInt(READ_TIMEOUT_MS));
+    assert.equal(copy.db.prepare("PRAGMA journal_mode").get()?.["journal_mode"], "delete");
+    assert.equal(await readFile(`${copy.file}.owner`, "utf8"), "margrave-catalog-v1\n");
+  } finally {
+    copy.db.close();
+    await rm(copy.file, { force: true });
+    await rm(`${copy.file}.owner`, { force: true });
+  }
+});
+
+test("catalog legacy direct probe preserves errors and closes acquired handles", async (t) => {
+  const home = await directHome(t);
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const descriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare");
+  assert.ok(descriptor?.value);
+  const close = t.mock.method(DatabaseSync.prototype, "close");
+  const specific = new MargraveError("specific probe failure");
+  let failure: Error = specific;
+  const handles = new Set<DatabaseSync>();
+  let createJournal = false;
+  let removeJournal = false;
+  const prepare = t.mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (this.location("main") === file && sql.startsWith("SELECT (SELECT user_version")) {
+      handles.add(this);
+      if (createJournal) writeFileSync(`${file}-journal`, "journal");
+      if (removeJournal) rmSync(`${file}-journal`);
+      throw failure;
+    }
+    return (descriptor.value as typeof DatabaseSync.prototype.prepare).call(this, sql);
+  });
+  await assert.rejects(probeMigrationCatalog(), (err) => err === specific);
+  assert.equal(close.mock.calls.filter((call) => call.this instanceof DatabaseSync && handles.has(call.this)).length, 1);
+  handles.clear();
+  failure = new Error("plain probe failure");
+  await assert.rejects(probeMigrationCatalog(), { message: `cannot open ${file}: plain probe failure` });
+  assert.equal(close.mock.calls.filter((call) => call.this instanceof DatabaseSync && handles.has(call.this)).length, 1);
+  handles.clear();
+  await writeFile(`${file}-journal`, "journal");
+  assert.equal(await probeMigrationCatalog(), "journal");
+  assert.equal(close.mock.calls.filter((call) => call.this instanceof DatabaseSync && handles.has(call.this)).length, 1);
+  handles.clear();
+  await rm(`${file}-journal`);
+  await writeFile(`${file}-journal`, Buffer.alloc(512));
+  removeJournal = true;
+  assert.equal(await probeMigrationCatalog(), "journal");
+  assert.equal(close.mock.calls.filter((call) => call.this instanceof DatabaseSync && handles.has(call.this)).length, 1);
+  handles.clear();
+  removeJournal = false;
+  createJournal = true;
+  assert.equal(await probeMigrationCatalog(), "journal");
+  assert.equal(close.mock.calls.filter((call) => call.this instanceof DatabaseSync && handles.has(call.this)).length, 1);
+  prepare.mock.restore();
+  close.mock.restore();
+});
+
+test("catalog legacy direct lock closes handles on injected failures", async (t) => {
+  const home = await directHome(t);
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const descriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "exec");
+  assert.ok(descriptor?.value);
+  const close = t.mock.method(DatabaseSync.prototype, "close");
+  const readers = new Set<DatabaseSync>();
+  const writers = new Set<DatabaseSync>();
+  let now = 0;
+  const clock = t.mock.method(Date, "now", () => (now += WRITE_TIMEOUT_MS));
+  let target = "BEGIN IMMEDIATE";
+  let failure = new Error("injected lock failure");
+  const mock = t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (this.location("main") === file) {
+      if (sql === "BEGIN") readers.add(this);
+      if (sql === "BEGIN IMMEDIATE") writers.add(this);
+      if (sql === target) throw failure;
+    }
+    return (descriptor.value as typeof DatabaseSync.prototype.exec).call(this, sql);
+  });
+  await assert.rejects(lockLegacyCatalog(), (err) => err === failure);
+  assert.equal(close.mock.calls.filter((call) => call.this instanceof DatabaseSync && readers.has(call.this)).length, 1);
+  assert.equal(close.mock.calls.filter((call) => call.this instanceof DatabaseSync && writers.has(call.this)).length, 1);
+  readers.clear();
+  writers.clear();
+  target = `PRAGMA busy_timeout = ${WRITE_TIMEOUT_MS}`;
+  failure = new Error("injected timeout setup failure");
+  await assert.rejects(lockLegacyCatalog(), (err) => err === failure);
+  assert.equal(close.mock.calls.filter((call) => call.this instanceof DatabaseSync && readers.has(call.this)).length, 1);
+  assert.equal(close.mock.calls.filter((call) => call.this instanceof DatabaseSync && writers.has(call.this)).length, 1);
+  target = "BEGIN";
+  failure = Object.assign(new Error("rollback"), { errcode: SQLITE_READONLY_ROLLBACK });
+  await assert.rejects(lockLegacyCatalog(), { message: unfinishedWriteMessage(file) });
+  clock.mock.restore();
+  mock.mock.restore();
+  close.mock.restore();
+});
+
+test("catalog legacy direct lock closes no handle when reader opening fails", async (t) => {
+  let now = 0;
+  const clock = t.mock.method(Date, "now", () => (now += WRITE_TIMEOUT_MS));
+  t.after(() => clock.mock.restore());
+  const home = await directHome(t);
+  await mkdir(home, { recursive: true });
+  const file = path.join(home, "index.db");
+  const close = t.mock.method(DatabaseSync.prototype, "close");
+  try {
+    await assert.rejects(lockLegacyCatalog(), { code: "ERR_SQLITE_ERROR", errcode: 14 });
+    assert.equal(close.mock.callCount(), 0);
+    await assert.rejects(lstat(file), { code: "ENOENT" });
+  } finally {
+    close.mock.restore();
+  }
+});
+
+test("catalog legacy direct retries busy before deadline and stops at deadline", async (t) => {
+  const home = await directHome(t);
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const descriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "exec");
+  assert.ok(descriptor?.value);
+  let attempts = 0;
+  let failCount = 1;
+  const mock = t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && this.location("main") === file) {
+      attempts++;
+      if (attempts > 3) throw new Error("unexpected repeated attempt");
+      if (attempts <= failCount) throw Object.assign(new Error("busy"), { errcode: 5 });
+    }
+    return (descriptor.value as typeof DatabaseSync.prototype.exec).call(this, sql);
+  });
+  const now = 1000;
+  const clock = t.mock.method(Date, "now", () => now);
+  try {
+    const locked = await lockLegacyCatalog();
+    assert.equal(attempts, 2);
+    assert.equal(locked.db.isTransaction, true);
+    locked.db.close();
+    attempts = 0;
+    failCount = 3;
+    let calls = 0;
+    clock.mock.mockImplementation(() => (calls++ === 0 ? now : now + WRITE_TIMEOUT_MS));
+    await assert.rejects(lockLegacyCatalog(), { message: "another Margrave writer holds the legacy catalog lock. Try the command again" });
+    assert.equal(attempts, 1);
+    attempts = 0;
+    failCount = 1;
+    calls = 0;
+    clock.mock.mockImplementation(() => (calls++ === 0 ? now : now + WRITE_TIMEOUT_MS - 1));
+    const beforeDeadline = await lockLegacyCatalog();
+    assert.equal(attempts, 2);
+    assert.equal(beforeDeadline.db.isTransaction, true);
+    beforeDeadline.db.close();
+  } finally {
+    clock.mock.restore();
+    mock.mock.restore();
+  }
+});
+
+test("catalog legacy direct copy rejects changed metadata and cleans up", async (t) => {
+  const home = await directHome(t);
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const before = await readFile(file);
+  const descriptor = Object.getOwnPropertyDescriptor(fs, "lstat");
+  assert.ok(descriptor?.value);
+  for (const field of ["type", "uid", "gid", "mode"] as const) {
+    const mock = t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+      const stat = await (descriptor.value as typeof fs.lstat)(...args);
+      if (typeof args[0] !== "string" || !args[0].startsWith(path.join(home, ".catalog-")) || !args[0].endsWith(".tmp")) return stat;
+      return new Proxy(stat, {
+        get(target, key, receiver) {
+          if (field === "type" && key === "isFile") return () => false;
+          if (key === field) return Number(Reflect.get(target, key, receiver)) + 1;
+          return Reflect.get(target, key, receiver);
+        },
+      });
+    });
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(copyLegacyCatalog(), { message: "catalog copy did not preserve access metadata" });
+    } finally {
+      mock.mock.restore();
+      syncBuiltinESMExports();
+    }
+    assert.deepEqual(await readFile(file), before);
+    assert.equal(
+      (await readdir(home)).some((name) => name.startsWith(".catalog-")),
+      false,
+    );
+  }
+});
+
+test("catalog legacy direct validates journals before and after the writer lock", async (t) => {
+  let now = 0;
+  const clock = t.mock.method(Date, "now", () => (now += WRITE_TIMEOUT_MS));
+  t.after(() => clock.mock.restore());
+  const home = await directHome(t);
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const journal = `${file}-journal`;
+  const content = Buffer.alloc(512);
+  const hash = createHash("sha256").update(content).digest("hex");
+  const statDescriptor = Object.getOwnPropertyDescriptor(fs, "lstat");
+  assert.ok(statDescriptor?.value);
+  let journalStats = 0;
+  const execDescriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "exec");
+  assert.ok(execDescriptor?.value);
+  let writerAttempts = 0;
+  const earlyExec = t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && this.location("main") === file) writerAttempts++;
+    return (execDescriptor.value as typeof DatabaseSync.prototype.exec).call(this, sql);
+  });
+  const stat = t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+    if (args[0] === journal && journalStats++ === 0) return (statDescriptor.value as typeof fs.lstat)(home, args[1]);
+    return (statDescriptor.value as typeof fs.lstat)(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(lockLegacyCatalog(hash), { message: unfinishedWriteMessage(file) });
+    assert.equal(writerAttempts, 0);
+  } finally {
+    earlyExec.mock.restore();
+    stat.mock.restore();
+    syncBuiltinESMExports();
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "exec");
+  assert.ok(descriptor?.value);
+  let late: "file" | "directory" = "file";
+  const begin = t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = (descriptor.value as typeof DatabaseSync.prototype.exec).call(this, sql);
+    if (sql === "BEGIN IMMEDIATE" && this.location("main") === file) {
+      if (late === "directory") mkdirSync(journal);
+      else writeFileSync(journal, content);
+    }
+    return result;
+  });
+  late = "directory";
+  await assert.rejects(lockLegacyCatalog(hash), { message: unfinishedWriteMessage(file) });
+  await rm(journal, { recursive: true });
+  late = "file";
+  const streamDescriptor = Object.getOwnPropertyDescriptor(nativeFs, "createReadStream");
+  assert.ok(streamDescriptor?.value);
+  let journalReads = 0;
+  const stream = t.mock.method(nativeFs, "createReadStream", (...args: Parameters<typeof nativeFs.createReadStream>) => {
+    if (args[0] === journal) journalReads++;
+    return (streamDescriptor.value as typeof nativeFs.createReadStream)(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(lockLegacyCatalog(), { message: unfinishedWriteMessage(file) });
+    assert.equal(journalReads, 0);
+  } finally {
+    stream.mock.restore();
+    syncBuiltinESMExports();
+  }
+  await rm(journal);
+  await assert.rejects(lockLegacyCatalog("wrong hash"), { message: unfinishedWriteMessage(file) });
+  await rm(journal);
+  const accepted = await lockLegacyCatalog(hash);
+  assert.equal(accepted.db.isTransaction, true);
+  accepted.db.close();
+  await rm(journal, { force: true });
+  begin.mock.restore();
+  await writeFile(journal, content);
+  const beforeWriter = await lockLegacyCatalog(hash);
+  assert.equal(beforeWriter.db.isTransaction, true);
+  beforeWriter.db.close();
+  await rm(journal, { force: true });
+});
+
+test("catalog legacy direct closes the copy when SQLite setup fails", async (t) => {
+  const home = await directHome(t);
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const before = await readFile(file);
+  const failure = new Error("copy setup failure");
+  const descriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "exec");
+  assert.ok(descriptor?.value);
+  const copies = new Set<DatabaseSync>();
+  const close = t.mock.method(DatabaseSync.prototype, "close");
+  const mock = t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "PRAGMA journal_mode = DELETE" && this.location("main")?.startsWith(path.join(home, ".catalog-"))) {
+      copies.add(this);
+      throw failure;
+    }
+    return (descriptor.value as typeof DatabaseSync.prototype.exec).call(this, sql);
+  });
+  await assert.rejects(copyLegacyCatalog(), (err) => err === failure);
+  assert.equal(copies.size, 1);
+  assert.equal(close.mock.calls.filter((call) => call.this instanceof DatabaseSync && copies.has(call.this)).length, 1);
+  assert.deepEqual(await readFile(file), before);
+  assert.equal(
+    (await readdir(home)).some((name) => name.startsWith(".catalog-")),
+    false,
+  );
+  mock.mock.restore();
+  close.mock.restore();
+});
+
+test("catalog legacy direct probe closes no handle when opening fails", async (t) => {
+  const home = await directHome(t);
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const saved = `${file}.saved`;
+  const descriptor = Object.getOwnPropertyDescriptor(fs, "lstat");
+  assert.ok(descriptor?.value);
+  let replaced = false;
+  const close = t.mock.method(DatabaseSync.prototype, "close");
+  const stat = t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+    if (args[0] === `${file}-journal` && !replaced) {
+      replaced = true;
+      await rename(file, saved);
+      await mkdir(file);
+    }
+    return (descriptor.value as typeof fs.lstat)(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(probeMigrationCatalog(), { message: /^cannot open .*index\.db:/u });
+    assert.equal(close.mock.callCount(), 0);
+  } finally {
+    stat.mock.restore();
+    syncBuiltinESMExports();
+    close.mock.restore();
+    if (replaced) {
+      await rm(file, { recursive: true });
+      await rename(saved, file);
+    }
+  }
+});
+
+test("catalog legacy direct refuses a sidecar appearing after the writer begins", async (t) => {
+  let now = 0;
+  const clock = t.mock.method(Date, "now", () => (now += WRITE_TIMEOUT_MS));
+  t.after(() => clock.mock.restore());
+  const home = await directHome(t);
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const descriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "exec");
+  assert.ok(descriptor?.value);
+  const exec = t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = (descriptor.value as typeof DatabaseSync.prototype.exec).call(this, sql);
+    if (sql === "BEGIN IMMEDIATE" && this.location("main") === file) writeFileSync(`${file}-shm`, "late sidecar");
+    return result;
+  });
+  try {
+    await assert.rejects(lockLegacyCatalog(), { message: unfinishedWriteMessage(file) });
+  } finally {
+    exec.mock.restore();
+    await rm(`${file}-shm`, { force: true });
+  }
+});
+
+test("catalog legacy direct validates journal owners with and without getuid", async (t) => {
+  let now = 0;
+  const clock = t.mock.method(Date, "now", () => (now += WRITE_TIMEOUT_MS));
+  t.after(() => clock.mock.restore());
+  const home = await directHome(t);
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const journal = `${file}-journal`;
+  const content = "owner test journal";
+  const hash = createHash("sha256").update(content).digest("hex");
+  const getuidDescriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+  const ownUid = process.getuid?.();
+  const catalogUid = (ownUid ?? (await lstat(file)).uid) + 10001;
+  const unknownUid = Math.max(catalogUid, ownUid ?? catalogUid) + 1;
+  assert.notEqual(unknownUid, ownUid);
+  assert.notEqual(unknownUid, catalogUid);
+  let journalUid = catalogUid;
+  const execDescriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "exec");
+  const statDescriptor = Object.getOwnPropertyDescriptor(fs, "lstat");
+  assert.ok(execDescriptor?.value);
+  assert.ok(statDescriptor?.value);
+  const exec = t.mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    const result = (execDescriptor.value as typeof DatabaseSync.prototype.exec).call(this, sql);
+    if (sql === "BEGIN IMMEDIATE" && this.location("main") === file) writeFileSync(journal, content);
+    return result;
+  });
+  const stat = t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+    const result = await (statDescriptor.value as typeof fs.lstat)(...args);
+    if (args[0] !== file && args[0] !== journal) return result;
+    return new Proxy(result, {
+      get(target, key, receiver) {
+        if (key === "uid") return args[0] === file ? catalogUid : journalUid;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+  });
+  syncBuiltinESMExports();
+  try {
+    const accepted = await lockLegacyCatalog(hash);
+    assert.equal(accepted.db.isTransaction, true);
+    accepted.db.close();
+    await rm(journal, { force: true });
+    assert.ok(ownUid !== undefined);
+    journalUid = ownUid;
+    const processOwned = await lockLegacyCatalog(hash);
+    assert.equal(processOwned.db.isTransaction, true);
+    processOwned.db.close();
+    await rm(journal, { force: true });
+    journalUid = unknownUid;
+    await assert.rejects(lockLegacyCatalog(hash), { message: unfinishedWriteMessage(file) });
+    await rm(journal, { force: true });
+    Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+    journalUid = catalogUid;
+    const withoutGetuid = await lockLegacyCatalog(hash);
+    assert.equal(withoutGetuid.db.isTransaction, true);
+    withoutGetuid.db.close();
+    await rm(journal, { force: true });
+    journalUid = unknownUid;
+    await assert.rejects(lockLegacyCatalog(hash), { message: unfinishedWriteMessage(file) });
+  } finally {
+    if (getuidDescriptor === undefined) Reflect.deleteProperty(process, "getuid");
+    else Object.defineProperty(process, "getuid", getuidDescriptor);
+    stat.mock.restore();
+    syncBuiltinESMExports();
+    exec.mock.restore();
+    await rm(journal, { force: true });
+  }
+});
+
+test("catalog legacy direct copy preserves failure when source or cleanup files disappear", async (t) => {
+  const home = await directHome(t);
+  await copyLegacyStoreFixture(home);
+  const file = path.join(home, "index.db");
+  const saved = `${file}.saved`;
+  const before = await readFile(file);
+  const descriptor = Object.getOwnPropertyDescriptor(fs, "lstat");
+  assert.ok(descriptor?.value);
+  let removeSource = true;
+  const failure = new Error("copy disappeared");
+  const stat = t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+    const result = await (descriptor.value as typeof fs.lstat)(...args);
+    if (args[0] === file && removeSource) {
+      removeSource = false;
+      await rename(file, saved);
+    } else if (typeof args[0] === "string" && args[0].startsWith(path.join(home, ".catalog-")) && args[0].endsWith(".tmp")) {
+      await rm(args[0]);
+      await rm(`${args[0]}.owner`);
+      throw failure;
+    }
+    return result;
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(copyLegacyCatalog(), /cp/u);
+    await rename(saved, file);
+    await assert.rejects(copyLegacyCatalog(), (err) => err === failure);
+    assert.deepEqual(await readFile(file), before);
+    assert.equal(
+      (await readdir(home)).some((name) => name.startsWith(".catalog-")),
+      false,
+    );
+  } finally {
+    stat.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
 
 test("schema 3 catalog setup failure keeps the original for retry", async () => {
   const parent = await tmp();

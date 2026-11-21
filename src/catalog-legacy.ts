@@ -1,5 +1,6 @@
 import { lstat, rm } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   READ_TIMEOUT_MS,
   SCHEMA_VERSION,
@@ -47,7 +48,7 @@ export async function probeMigrationCatalog(): Promise<"current" | "missing" | "
 
 export async function checkLegacyJournalMode(db: DatabaseSync): Promise<void> {
   const file = indexDbFile();
-  const mode = db.prepare("PRAGMA journal_mode").get()?.["journal_mode"];
+  const mode = db.prepare("PRAGMA journal_mode").get()!["journal_mode"];
   if (mode !== "delete" || (await lstatIfExists(`${file}-wal`)) !== null || (await lstatIfExists(`${file}-shm`)) !== null)
     throw new MargraveError(unfinishedWriteMessage(file));
 }
@@ -56,42 +57,49 @@ export async function checkLegacyJournalMode(db: DatabaseSync): Promise<void> {
 export async function lockLegacyCatalog(verifiedJournal?: string): Promise<{ db: DatabaseSync; version: number }> {
   const file = indexDbFile();
   const deadline = Date.now() + WRITE_TIMEOUT_MS;
-  for (;;) {
-    let reader: DatabaseSync | undefined;
-    let writer: DatabaseSync | undefined;
-    try {
-      reader = new DatabaseSync(file, { readOnly: true, timeout: 0 });
-      reader.exec("BEGIN");
-      reader.prepare("PRAGMA user_version").get();
-      await checkLegacyJournalMode(reader);
-      const beforeJournal = await lstatIfExists(`${file}-journal`);
-      if (beforeJournal !== null && !beforeJournal.isFile()) throw new MargraveError(unfinishedWriteMessage(file));
-      writer = new DatabaseSync(file, { readBigInts: true, timeout: 0 });
-      writer.exec("BEGIN IMMEDIATE");
-      const afterJournal = await lstatIfExists(`${file}-journal`);
-      const catalogOwner = (await lstat(file)).uid;
-      if (
-        afterJournal !== null &&
-        (verifiedJournal === undefined ||
-          !afterJournal.isFile() ||
-          (afterJournal.uid !== process.getuid?.() && afterJournal.uid !== catalogOwner) ||
-          (await hashFile(`${file}-journal`)) !== verifiedJournal)
-      )
-        throw new MargraveError(unfinishedWriteMessage(file));
-      const version = readProbe(writer, file).version;
-      await checkLegacyJournalMode(writer);
-      reader.close();
-      writer.exec(WRITE_TIMEOUT_SQL);
-      return { db: writer, version };
-    } catch (err) {
-      if (writer?.isOpen === true) writer.close();
-      if (reader?.isOpen === true) reader.close();
-      const code = (err as { errcode?: number }).errcode;
-      if (code === SQLITE_READONLY_ROLLBACK) throw new MargraveError(unfinishedWriteMessage(file));
-      if (code !== 5) throw err;
-      if (Date.now() >= deadline) throw new MargraveError("another Margrave writer holds the legacy catalog lock. Try the command again");
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
+  return lockLegacyCatalogUntil(file, deadline, verifiedJournal);
+}
+
+async function lockLegacyCatalogUntil(
+  file: string,
+  deadline: number,
+  verifiedJournal?: string,
+): Promise<{ db: DatabaseSync; version: number }> {
+  let reader: DatabaseSync | undefined;
+  let writer: DatabaseSync | undefined;
+  try {
+    reader = new DatabaseSync(file, { readOnly: true, timeout: 0 });
+    reader.exec("BEGIN");
+    reader.prepare("PRAGMA user_version").get();
+    await checkLegacyJournalMode(reader);
+    const beforeJournal = await lstatIfExists(`${file}-journal`);
+    if (beforeJournal !== null && !beforeJournal.isFile()) throw new MargraveError(unfinishedWriteMessage(file));
+    writer = new DatabaseSync(file, { readBigInts: true, timeout: 0 });
+    writer.exec("BEGIN IMMEDIATE");
+    const afterJournal = await lstatIfExists(`${file}-journal`);
+    const catalogOwner = (await lstat(file)).uid;
+    if (
+      afterJournal !== null &&
+      (verifiedJournal === undefined ||
+        !afterJournal.isFile() ||
+        (afterJournal.uid !== process.getuid?.() && afterJournal.uid !== catalogOwner) ||
+        (await hashFile(`${file}-journal`)) !== verifiedJournal)
+    )
+      throw new MargraveError(unfinishedWriteMessage(file));
+    const version = readProbe(writer, file).version;
+    await checkLegacyJournalMode(writer);
+    reader.close();
+    writer.exec(WRITE_TIMEOUT_SQL);
+    return { db: writer, version };
+  } catch (err) {
+    writer?.close();
+    if (reader?.isOpen === true) reader.close();
+    const code = (err as { errcode?: number }).errcode;
+    if (code === SQLITE_READONLY_ROLLBACK) throw new MargraveError(unfinishedWriteMessage(file));
+    if (code !== 5) throw err;
+    if (Date.now() >= deadline) throw new MargraveError("another Margrave writer holds the legacy catalog lock. Try the command again");
+    await delay(25);
+    return lockLegacyCatalogUntil(file, deadline, verifiedJournal);
   }
 }
 
@@ -108,7 +116,7 @@ export async function copyLegacyCatalog(): Promise<{ db: DatabaseSync; file: str
     db.exec("PRAGMA journal_mode = DELETE");
     return { db, file };
   } catch (err) {
-    if (db?.isOpen === true) db.close();
+    db?.close();
     await rm(file, { force: true });
     await rm(`${file}.owner`, { force: true });
     throw err;

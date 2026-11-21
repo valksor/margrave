@@ -11,6 +11,7 @@ if (process.argv.length > 2) {
     "skill-files": ["test/guard.test.ts"],
     "safety-runner": ["test/safety-runner.test.ts", "test/no-vendored-ripwire.test.ts"],
     safety: ["test/safety.test.ts"],
+    "catalog-legacy": ["--test-timeout=2000", "--test-name-pattern='^catalog legacy direct '", "test/catalog-legacy.test.ts"],
     search: ["test/skills-sh.test.ts"],
     skills: ["test/index.test.ts", "test/guard.test.ts", "test/text.test.ts"],
     "lock-format": [
