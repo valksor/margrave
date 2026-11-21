@@ -93,14 +93,14 @@ test("lock pending direct validates markers before touching sources", async (t) 
     restoreLock(lock, ctx, () => {}),
     { code: "EEXIST" },
   );
-  assert.equal(existsSync(marker), false);
+  assert.deepEqual(await fsp.readdir(path.dirname(marker)), []);
   assert.equal(await readFile(sentinel, "utf8"), "sentinel");
   await mkdir(marker);
   await assert.rejects(
     restoreLock(lock, ctx, () => {}),
     { code: "EISDIR" },
   );
-  assert.equal((await fsp.stat(marker)).isDirectory(), true);
+  assert.deepEqual(await fsp.readdir(marker), []);
   assert.equal(await readFile(sentinel, "utf8"), "sentinel");
   await rm(marker, { recursive: true });
 
@@ -1072,7 +1072,7 @@ test("lock restore direct rejects duplicates discovered by the second scan", asy
     mock.restoreAll();
     syncBuiltinESMExports();
   }
-  assert.equal(count, 2);
+  assert.equal(count, 4);
   assert.equal(await readFile(marker, "utf8"), contents);
   assert.equal(existsSync(path.join(home, "index.db")), false);
   assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
@@ -1760,8 +1760,8 @@ test("lock restore refuses staged edits on either side of the scan", async (t) =
     const real = fsp.readdir;
     mock.method(fsp, "readdir", (async (dir: string, ...args: unknown[]) => {
       if (dir.includes(`${path.sep}staging${path.sep}`) && dir.endsWith(`${path.sep}${id}`)) {
-        if (args.length > 0) scans++;
-        if (!fired && ((mode === "before" && args.length === 0) || (mode === "after" && scans === 2))) {
+        scans++;
+        if (!fired && ((mode === "before" && scans === 1) || (mode === "after" && scans === 4))) {
           fired = true;
           await writeFile(path.join(dir, "skills", "react-perf", "SKILL.md"), "changed\n");
         }

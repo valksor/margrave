@@ -8,7 +8,7 @@
 //
 // Git updates compare new findings with the accepted scan recorded in the catalog.
 import { createHash } from "node:crypto";
-import { lstat, open, readdir, readlink, realpath } from "node:fs/promises";
+import { open, readdir, readlink, realpath } from "node:fs/promises";
 import path from "node:path";
 import { READ_NO_FOLLOW, isInside } from "./scan.ts";
 import { MargraveError, atomicWrite, reportsRoot } from "./store.ts";
@@ -331,17 +331,20 @@ export async function scanWithRipwire(dir: string, opts: ScanOptions): Promise<S
 export async function scanInventory(dir: string): Promise<string> {
   const hash = createHash("sha256");
   async function visit(root: string, rel: string): Promise<void> {
-    for (const name of (await readdir(root)).sort()) {
+    const entries = await readdir(root, { withFileTypes: true });
+    const byName = new Map(entries.map((entry) => [entry.name, entry]));
+    for (const name of [...byName.keys()].sort()) {
+      const entry = byName.get(name)!;
       const file = path.join(root, name);
       const child = rel === "" ? name : `${rel}/${name}`;
-      const info = await lstat(file);
-      if (info.isDirectory()) {
+      if (entry.isDirectory()) {
         hash.update(JSON.stringify([child, "dir"]));
         await visit(file, child);
-      } else if (info.isSymbolicLink()) hash.update(JSON.stringify([child, "link", await readlink(file)]));
-      else if (info.isFile()) {
+      } else if (entry.isSymbolicLink()) hash.update(JSON.stringify([child, "link", await readlink(file)]));
+      else if (entry.isFile()) {
         const handle = await open(file, READ_NO_FOLLOW);
         try {
+          if (!(await handle.stat()).isFile()) throw new MargraveError("staged skills changed during scan");
           const content = createHash("sha256");
           for await (const chunk of handle.createReadStream({ autoClose: false })) content.update(chunk as Buffer);
           hash.update(JSON.stringify([child, "file", content.digest("hex")]));

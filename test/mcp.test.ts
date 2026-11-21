@@ -660,7 +660,8 @@ test("Skills extension serves verified scoped pages over stdio", async (t) => {
   await assert.rejects(client.readResource({ uri: toolkit.uri.replace("SKILL.md", "missing.md") }));
   await assert.rejects(client.readResource({ uri: toolkit.uri.replace("SKILL.md", "references/../SKILL.md") }));
   await assert.rejects(client.readResource({ uri: toolkit.uri.replace("SKILL.md", "%53KILL.md") }));
-  await assert.rejects(client.readResource({ uri: toolkit.uri.replace("SKILL.md", "%FF") }));
+  const [, , , uriSource, uriRevision, uriSkill] = toolkit.uri.split("/");
+  await assert.rejects(client.readResource({ uri: `skill://margrave/${uriSource}/${uriRevision}/${uriSkill}/%FF` }));
   await assert.rejects(client.readResource({ uri: "skill://other/unknown" }));
   await assert.rejects(client.readResource({ uri: "skill://margrave/short" }));
   await assert.rejects(client.readResource({ uri: toolkit.uri.replace(/sha256%3A[0-9a-f]{64}/u, "invalid") }));
@@ -1159,7 +1160,7 @@ test("MCP Skills direct reads exact resources and rejects noncanonical URIs", as
     `${root}/%`,
     `${root}/%FF`,
     `${root}/%53KILL.md`,
-    `${root.replace("%3A", "%3a")}/SKILL.md`,
+    `skill://margrave/source/sha256%3a${revision.slice("sha256:".length)}/example/SKILL.md`,
     `skill://margrave/source/${encodeURIComponent(`x${revision}`)}/example/SKILL.md`,
     `skill://margrave/source/${encodeURIComponent(`${revision}x`)}/example/SKILL.md`,
     `skill://margrave/source/${encodeURIComponent(stale)}/example`,

@@ -199,7 +199,7 @@ test("migration recovery journal direct accepts either owner and rejects another
   const f = await fixture(t);
   const bytes = header();
   await writeFile(f.journal, bytes);
-  const owner = (await nativeLstat(f.journal)).uid;
+  const owner = process.getuid!();
   const catalogOwner = owner + 1;
   let journalOwner = owner;
   let opens = 0;

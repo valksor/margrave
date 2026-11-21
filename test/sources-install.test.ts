@@ -276,7 +276,7 @@ test("sources install direct publishes selected Git snapshots and accepts manage
       scanSpy.mock.restore();
       syncBuiltinESMExports();
     }
-    assert.equal(scans, 2);
+    assert.equal(scans, 4);
     assert.deepEqual(result, { id, skills: [`${id}/react-perf`] });
     assert.equal(removals.length, 1);
     assert.deepEqual(removals[0]!.options, { recursive: true, force: true });
@@ -494,7 +494,7 @@ test("sources install direct rejects duplicate-only staged scan changes and pres
         p.startsWith(path.join(home, "staging") + path.sep) &&
         p.endsWith(`${path.sep}repo`) &&
         (options as { withFileTypes?: boolean })?.withFileTypes === true &&
-        ++seen === 2
+        ++seen === 4
       ) {
         const dir = path.join(p, "zz-duplicate");
         await mkdir(dir);
@@ -509,7 +509,7 @@ test("sources install direct rejects duplicate-only staged scan changes and pres
       spy.mock.restore();
       syncBuiltinESMExports();
     }
-    assert.equal(seen, 2);
+    assert.equal(seen, 4);
     assert.deepEqual(catalogRecords(home), records);
     assert.deepEqual(indexRows(home), rows);
     assert.equal(await readlink(alias), link);

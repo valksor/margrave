@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import childProcess, { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { existsSync } from "node:fs";
 import fs, { chmod, link, lstat, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
@@ -17,8 +17,10 @@ import {
   migrationRecordSchema,
   sha256,
   verifyBackupFiles,
+  verifyBackupChild,
+  sameFileIdentity,
 } from "../src/migration-backup.ts";
-import { hasDirectoryAcl, hostedUseHome, tmp } from "./helpers.ts";
+import { hasDirectoryAcl, hostedUseHome, mkfifo, tmp } from "./helpers.ts";
 
 const digest = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
 
@@ -59,6 +61,17 @@ async function fixture(t: TestContext) {
   };
   await writeFile(manifestFile, JSON.stringify(manifest), { mode: 0o600 });
   return { home, backup, catalog, manifestFile, archive, manifest };
+}
+
+async function runVerifierChild(backup: string, catalog: string): Promise<void> {
+  const directory = await lstat(backup, { bigint: true });
+  const cwd = process.cwd();
+  process.chdir(backup);
+  try {
+    await verifyBackupChild([directory.dev.toString(), directory.ino.toString(), catalog, ""]);
+  } finally {
+    process.chdir(cwd);
+  }
 }
 
 test("migration backup verify direct hashes text, binary, empty and missing files", async (t) => {
@@ -149,6 +162,223 @@ test("migration backup verify direct accepts private backup versions and missing
   }
   await rm(f.manifestFile);
   assert.equal(await verifyBackupFiles(f.backup), null);
+  await rm(f.catalog);
+  assert.equal(await verifyBackupFiles(f.backup), null);
+  await writeFile(f.manifestFile, JSON.stringify(f.manifest), { mode: 0o600 });
+  await assert.rejects(verifyBackupFiles(f.backup), { code: "ENOENT" });
+});
+
+test("migration backup verifier propagates a non-missing catalog stat failure", async (t) => {
+  const f = await fixture(t);
+  const original = fs.lstat;
+  const failure = new Error("catalog stat failed");
+  mock.method(fs, "lstat", (async (...args: Parameters<typeof fs.lstat>) => {
+    if (args[0] === f.catalog) throw failure;
+    return original(...args);
+  }) as typeof fs.lstat);
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(runVerifierChild(f.backup, f.catalog), (err: unknown) => err === failure);
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
+test("migration backup verifier propagates a manifest read failure", async (t) => {
+  const f = await fixture(t);
+  const original = fs.open;
+  const failure = new Error("manifest read failed");
+  mock.method(fs, "open", (async (...args: Parameters<typeof fs.open>) => {
+    const handle = await original(...args);
+    if (args[0] === "manifest.json") mock.method(handle, "readFile", () => Promise.reject(failure));
+    return handle;
+  }) as typeof fs.open);
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(runVerifierChild(f.backup, f.catalog), (err: unknown) => err === failure);
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
+test("migration backup verifier rejects substituted directory identities", async (t) => {
+  const f = await fixture(t);
+  const dir = await lstat(f.backup, { bigint: true });
+  const cwd = process.cwd();
+  process.chdir(f.backup);
+  try {
+    for (const [device, inode] of [
+      [dir.dev + 1n, dir.ino],
+      [dir.dev, dir.ino + 1n],
+    ]) {
+      await assert.rejects(verifyBackupChild([String(device), String(inode), f.catalog, ""]), /invalid directory/u);
+    }
+  } finally {
+    process.chdir(cwd);
+  }
+});
+
+test("migration backup verifier rejects incomplete arguments and a foreign catalog before filesystem access", async (t) => {
+  const f = await fixture(t);
+  let accesses = 0;
+  mock.method(fs, "lstat", (() => {
+    accesses++;
+    throw new Error("unexpected filesystem access");
+  }) as typeof fs.lstat);
+  mock.method(fs, "open", (() => {
+    accesses++;
+    throw new Error("unexpected filesystem access");
+  }) as typeof fs.open);
+  syncBuiltinESMExports();
+  try {
+    for (const args of [[], ["1", "2", f.catalog], ["1", "2", f.catalog, "", "extra"], ["1", "2", path.join(f.home, "other.db"), ""]])
+      await assert.rejects(verifyBackupChild(args), { message: "invalid directory" });
+    assert.equal(accesses, 0);
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
+test("standalone CLI dispatches the internal verifier", async (t) => {
+  const f = await fixture(t);
+  const preload = path.join(f.home, "sea-preload.mjs");
+  await writeFile(
+    preload,
+    `import { registerHooks } from "node:module"; registerHooks({ resolve(specifier, context, next) { return specifier === "node:sea" ? { url: "data:text/javascript,export%20const%20isSea%20%3D%20()%20%3D%3E%20true", shortCircuit: true } : next(specifier, context); } });\n`,
+  );
+  const dir = await lstat(f.backup, { bigint: true });
+  const cli = path.resolve(import.meta.dirname, "../src/cli.ts");
+  const output = execFileSync(
+    process.execPath,
+    ["--import", preload, cli, "--internal-verify-backup", String(dir.dev), String(dir.ino), f.catalog, ""],
+    { cwd: f.backup, encoding: "utf8" },
+  );
+  assert.equal((JSON.parse(output) as { kind: string }).kind, "ok");
+  assert.throws(
+    () =>
+      execFileSync(
+        process.execPath,
+        ["--import", preload, cli, "--internal-verify-backup", String(dir.dev + 1n), String(dir.ino), f.catalog, ""],
+        {
+          cwd: f.backup,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      ),
+    { status: 1 },
+  );
+});
+
+test("migration backup verifier reads the opened member after its path is replaced", async (t) => {
+  for (const member of ["manifest.json", "store.tar"]) {
+    const f = await fixture(t);
+    const originalOpen = fs.open;
+    let replaced = false;
+    mock.method(fs, "open", (async (...args: Parameters<typeof fs.open>) => {
+      const handle = await originalOpen(...args);
+      if (args[0] === member) {
+        await fs.rename(path.join(f.backup, member), path.join(f.backup, `${member}.old`));
+        await writeFile(path.join(f.backup, member), "replacement", { mode: 0o600 });
+        replaced = true;
+      }
+      return handle;
+    }) as typeof fs.open);
+    syncBuiltinESMExports();
+    try {
+      await runVerifierChild(f.backup, f.catalog);
+      assert.equal(replaced, true);
+    } finally {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+  }
+});
+
+test("migration backup verifier rejects FIFO members without reading them", async (t) => {
+  const f = await fixture(t);
+  for (const member of [f.manifestFile, f.archive]) {
+    const saved = `${member}.saved`;
+    await fs.rename(member, saved);
+    await mkfifo(member);
+    try {
+      await assert.rejects(withCatDeadline(verifyBackupFiles(f.backup)), { message: `invalid backup: ${f.backup}` });
+    } finally {
+      await rm(member);
+      await fs.rename(saved, member);
+    }
+  }
+});
+
+test("migration backup verifier keeps the SQLite writer lock when the archive is a catalog hard link", async (t) => {
+  const f = await fixture(t);
+  await rm(f.catalog);
+  const db = new DatabaseSync(f.catalog);
+  db.exec("CREATE TABLE sample (value TEXT)");
+  await chmod(f.catalog, 0o600);
+  const bytes = await fs.readFile(f.catalog);
+  await rm(f.archive);
+  await link(f.catalog, f.archive);
+  await writeFile(f.manifestFile, JSON.stringify({ ...f.manifest, archiveSha256: digest(bytes) }));
+  const probe = `import { DatabaseSync } from "node:sqlite";
+import { once } from "node:events";
+const db = new DatabaseSync(process.argv[1], { timeout: 0 });
+try { db.exec("BEGIN IMMEDIATE"); process.exit(2); } catch (err) { if (err.errcode !== 5) throw err; }
+process.stdout.write("busy\\n");
+await once(process.stdin, "data");
+db.exec("BEGIN IMMEDIATE");
+db.close();`;
+  db.exec("BEGIN IMMEDIATE");
+  let child: ReturnType<typeof childProcess.spawn> | undefined;
+  try {
+    assert.ok(await verifyBackupFiles(f.backup));
+    child = childProcess.spawn(process.execPath, ["--input-type=module", "-e", probe, f.catalog], { stdio: ["pipe", "pipe", "pipe"] });
+    const [output] = await Promise.race([
+      once(child.stdout!, "data"),
+      once(child, "exit").then(() => {
+        throw new Error("lock probe exited before reporting busy");
+      }),
+    ]);
+    assert.equal(String(output), "busy\n");
+  } finally {
+    db.close();
+    child?.stdin?.end("retry\n");
+  }
+  const [code] = await once(child, "close");
+  assert.equal(code, 0);
+});
+
+test("migration backup verifier does not inherit Node startup settings", async (t) => {
+  const f = await fixture(t);
+  const preload = path.join(f.home, "preload.cjs");
+  const marker = path.join(f.home, "preload-ran");
+  await writeFile(preload, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`);
+  const previous = process.env["NODE_OPTIONS"];
+  process.env["NODE_OPTIONS"] = `--require=${preload} --import=${preload}`;
+  try {
+    assert.ok(await verifyBackupFiles(f.backup));
+    assert.equal(existsSync(marker), false);
+  } finally {
+    if (previous === undefined) delete process.env["NODE_OPTIONS"];
+    else process.env["NODE_OPTIONS"] = previous;
+  }
+});
+
+test("migration backup verifier rejects failed and malformed child results", async (t) => {
+  const f = await fixture(t);
+  const executable = path.join(f.home, "verifier");
+  const descriptor = Object.getOwnPropertyDescriptor(process, "execPath")!;
+  try {
+    Object.defineProperty(process, "execPath", { ...descriptor, value: executable });
+    for (const body of ["exit 1", "printf invalid", "printf '{}' "]) {
+      await writeFile(executable, `#!/bin/sh\n${body}\n`, { mode: 0o700 });
+      await assert.rejects(verifyBackupFiles(f.backup), { message: `invalid backup: ${f.backup}` });
+    }
+  } finally {
+    Object.defineProperty(process, "execPath", descriptor);
+  }
 });
 
 test("migration backup verify direct rejects path, file type and mode faults", async (t) => {
@@ -182,55 +412,57 @@ test("migration backup verify direct rejects path, file type and mode faults", a
 
 test("migration backup verify direct rejects owner faults on each fixture path", async (t) => {
   const f = await fixture(t);
-  const original = fs.lstat;
-  for (const target of [f.backup, f.manifestFile, f.archive]) {
-    mock.method(fs, "lstat", (async (...args: Parameters<typeof fs.lstat>) => {
-      const stat = await original(...args);
-      if (args[0] === target) Object.defineProperty(stat, "uid", { value: Number(process.getuid?.()) + 1 });
-      return stat;
-    }) as typeof fs.lstat);
+  const originalOpen = fs.open;
+  for (const target of ["manifest.json", "store.tar"]) {
+    mock.method(fs, "open", (async (...args: Parameters<typeof fs.open>) => {
+      const handle = await originalOpen(...args);
+      if (args[0] === target) {
+        const stat = handle.stat.bind(handle);
+        mock.method(handle, "stat", (async (...statArgs: Parameters<typeof handle.stat>) => {
+          const result = await stat(...statArgs);
+          Object.defineProperty(result, "uid", { value: BigInt(process.getuid!() + 1) });
+          return result;
+        }) as typeof handle.stat);
+        if (target === "manifest.json") mock.method(handle, "readFile", () => Promise.reject(new Error("read before validation")));
+        else
+          mock.method(handle, "createReadStream", () => {
+            throw new Error("read before validation");
+          });
+      }
+      return handle;
+    }) as typeof fs.open);
     syncBuiltinESMExports();
     try {
-      await assert.rejects(verifyBackupFiles(f.backup), { message: `invalid backup: ${f.backup}` });
+      await assert.rejects(runVerifierChild(f.backup, f.catalog), /invalid (manifest|archive)/u);
     } finally {
       mock.restoreAll();
       syncBuiltinESMExports();
     }
   }
-});
-
-test("migration backup verify direct rejects unavailable owner at directory and file checks", async (t) => {
-  const f = await fixture(t);
-  const descriptor = Object.getOwnPropertyDescriptor(process, "getuid")!;
   const originalStat = fs.lstat;
-  const paths: unknown[] = [];
-  let disableOwnerAfterArchive = false;
-  let toggled = false;
   mock.method(fs, "lstat", (async (...args: Parameters<typeof fs.lstat>) => {
-    paths.push(args[0]);
-    const stat = await originalStat(...args);
-    if (disableOwnerAfterArchive && args[0] === f.archive) {
-      Object.defineProperty(process, "getuid", { ...descriptor, value: undefined });
-      toggled = true;
-    }
-    return stat;
+    const result = await originalStat(...args);
+    if (args[0] === f.backup) Object.defineProperty(result, "uid", { value: BigInt(process.getuid!() + 1) });
+    return result;
   }) as typeof fs.lstat);
   syncBuiltinESMExports();
   try {
-    Object.defineProperty(process, "getuid", { ...descriptor, value: undefined });
     await assert.rejects(verifyBackupFiles(f.backup), { message: `invalid backup: ${f.backup}` });
-    assert.deepEqual(paths, [f.backup]);
-    Object.defineProperty(process, "getuid", descriptor);
-    paths.length = 0;
-    disableOwnerAfterArchive = true;
-    await assert.rejects(verifyBackupFiles(f.backup), { message: `invalid backup: ${f.backup}` });
-    assert.equal(toggled, true);
-    assert.ok(paths.includes(f.manifestFile));
-    assert.ok(paths.includes(f.archive));
   } finally {
-    Object.defineProperty(process, "getuid", descriptor);
     mock.restoreAll();
     syncBuiltinESMExports();
+  }
+});
+
+test("migration backup verify direct rejects unavailable owner at directory checks", async (t) => {
+  const f = await fixture(t);
+  const descriptor = Object.getOwnPropertyDescriptor(process, "getuid")!;
+  try {
+    Object.defineProperty(process, "getuid", { ...descriptor, value: undefined });
+    await assert.rejects(verifyBackupFiles(f.backup), { message: `invalid backup: ${f.backup}` });
+    await assert.rejects(runVerifierChild(f.backup, f.catalog), /invalid directory/u);
+  } finally {
+    Object.defineProperty(process, "getuid", descriptor);
   }
 });
 
@@ -261,56 +493,15 @@ test("migration backup verify direct handles catalog hardlinks and both identity
   await rm(f.manifestFile);
   await link(f.catalog, f.manifestFile);
   await assert.rejects(verifyBackupFiles(f.backup), { message: `invalid backup: ${f.backup}` });
-  const originalStat = fs.lstat;
-  for (const field of ["dev", "ino"] as const) {
-    mock.method(fs, "lstat", (async (...args: Parameters<typeof fs.lstat>) => {
-      const stat = await originalStat(...args);
-      if (args[0] === f.manifestFile && args[1]?.bigint === true) Object.defineProperty(stat, field, { value: BigInt(stat[field]) + 1n });
-      return stat;
-    }) as typeof fs.lstat);
-    syncBuiltinESMExports();
-    try {
-      await assert.rejects(verifyBackupFiles(f.backup), SyntaxError);
-    } finally {
-      mock.restoreAll();
-      syncBuiltinESMExports();
-    }
-  }
   await rm(f.manifestFile);
   await writeFile(f.manifestFile, JSON.stringify({ ...f.manifest, archiveSha256: digest("live catalog") }), { mode: 0o600 });
   await rm(f.archive);
   await link(f.catalog, f.archive);
-  const originalSpawn = childProcess.spawn;
-  const calls: unknown[][] = [];
-  mock.method(childProcess, "spawn", ((...args: Parameters<typeof childProcess.spawn>) => {
-    calls.push(args);
-    return originalSpawn(...args);
-  }) as typeof childProcess.spawn);
-  syncBuiltinESMExports();
-  try {
-    assert.ok(await verifyBackupFiles(f.backup));
-    assert.deepEqual(calls, [["/bin/cat", [f.archive], { stdio: ["ignore", "pipe", "pipe"] }]]);
-  } finally {
-    mock.restoreAll();
-    syncBuiltinESMExports();
-  }
-  for (const field of ["dev", "ino"] as const) {
-    mock.method(fs, "lstat", (async (...args: Parameters<typeof fs.lstat>) => {
-      const stat = await originalStat(...args);
-      if (args[0] === f.archive && args[1]?.bigint === true) Object.defineProperty(stat, field, { value: BigInt(stat[field]) + 1n });
-      return stat;
-    }) as typeof fs.lstat);
-    mock.method(childProcess, "spawn", (() => {
-      throw new Error("unexpected cat");
-    }) as typeof childProcess.spawn);
-    syncBuiltinESMExports();
-    try {
-      assert.ok(await verifyBackupFiles(f.backup));
-    } finally {
-      mock.restoreAll();
-      syncBuiltinESMExports();
-    }
-  }
+  assert.ok(await verifyBackupFiles(f.backup));
+  const catalog = await lstat(f.catalog, { bigint: true });
+  assert.equal(sameFileIdentity(catalog, { dev: catalog.dev + 1n, ino: catalog.ino }), false);
+  assert.equal(sameFileIdentity(catalog, { dev: catalog.dev, ino: catalog.ino + 1n }), false);
+  assert.equal(sameFileIdentity(catalog, catalog), true);
 });
 
 test("migration backup verify direct validates prepared record encoding", () => {
@@ -362,7 +553,7 @@ test(
       assert.notEqual(listing.split("\n").slice(1).join("\n").trim(), "");
       await assert.rejects(verifyBackupFiles(f.backup), { message: `invalid backup: ${f.backup}` });
       Object.defineProperty(process, "platform", { ...descriptor, value: "linux" });
-      assert.deepEqual(await verifyBackupFiles(f.backup), { manifest: f.manifest, owner: (await lstat(f.backup)).uid });
+      await assert.doesNotReject(runVerifierChild(f.backup, f.catalog));
       assert.equal(execFileSync("/bin/ls", ["-lde", f.backup], { encoding: "utf8" }), listing);
     } finally {
       Object.defineProperty(process, "platform", descriptor);

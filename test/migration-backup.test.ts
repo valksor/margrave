@@ -6,6 +6,7 @@ import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import test, { mock } from "node:test";
 import { backupMigrationStore, writeMigrationRecord, lockLegacyCatalog, readLegacySources } from "../src/store.ts";
+import { READ_NO_FOLLOW } from "../src/skill-files.ts";
 import { copyLegacyStoreFixture, tmp, hostedUseHome as useHome, runCli } from "./helpers.ts";
 
 test("legacy backup preserves catalog and registered snapshot", async (t) => {
@@ -51,21 +52,50 @@ test("legacy backup preserves catalog and registered snapshot", async (t) => {
   const link = path.join("sources", source.id);
   assert.equal(await readlink(path.join(restored, link)), await readlink(path.join(home, link)));
   const snapshot = path.join("snapshots", source.id, source.snapshot!);
-  async function compareTree(relative: string): Promise<void> {
+  async function compareFiles(original: string, copied: string): Promise<void> {
+    const originalHandle = await fs.open(original, READ_NO_FOLLOW);
+    try {
+      const copiedHandle = await fs.open(copied, READ_NO_FOLLOW);
+      try {
+        const before = await originalHandle.stat();
+        const after = await copiedHandle.stat();
+        assert.ok(before.isFile() && after.isFile());
+        assert.equal(after.mode, before.mode);
+        assert.equal(after.uid, before.uid);
+        assert.equal(after.gid, before.gid);
+        assert.deepEqual(await copiedHandle.readFile(), await originalHandle.readFile());
+      } finally {
+        await copiedHandle.close();
+      }
+    } finally {
+      await originalHandle.close();
+    }
+  }
+  async function compareTree(relative: string, kind: "directory" | "link" | "file"): Promise<void> {
     const original = path.join(home, relative);
     const copied = path.join(restored, relative);
+    if (kind === "file") {
+      await compareFiles(original, copied);
+      return;
+    }
     const [before, after] = await Promise.all([lstat(original), lstat(copied)]);
     assert.equal(after.mode, before.mode);
     assert.equal(after.uid, before.uid);
     assert.equal(after.gid, before.gid);
-    if (before.isSymbolicLink()) assert.equal(await readlink(copied), await readlink(original));
-    else if (before.isDirectory()) {
-      const names = (await readdir(original)).sort();
-      assert.deepEqual((await readdir(copied)).sort(), names);
-      for (const name of names) await compareTree(path.join(relative, name));
-    } else assert.deepEqual(await readFile(copied), await readFile(original));
+    if (kind === "link") {
+      assert.ok(before.isSymbolicLink() && after.isSymbolicLink());
+      assert.equal(await readlink(copied), await readlink(original));
+    } else {
+      assert.ok(before.isDirectory() && after.isDirectory());
+      const entries = await readdir(original, { withFileTypes: true });
+      assert.deepEqual((await readdir(copied)).sort(), entries.map((entry) => entry.name).sort());
+      for (const entry of entries) {
+        assert.ok(entry.isDirectory() || entry.isSymbolicLink() || entry.isFile());
+        await compareTree(path.join(relative, entry.name), entry.isDirectory() ? "directory" : entry.isSymbolicLink() ? "link" : "file");
+      }
+    }
   }
-  await compareTree(snapshot);
+  await compareTree(snapshot, "directory");
   const archivedSources = JSON.parse(await readFile(path.join(restored, "sources.json"), "utf8")) as typeof sources;
   assert.deepEqual(
     archivedSources.map(({ id, ref, commit }) => [id, ref, commit]),

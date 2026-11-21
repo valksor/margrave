@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import childProcess, { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import fs, { cp, lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
@@ -115,9 +115,13 @@ test("migration recovery record direct rejects non-file and malformed prepared m
   assert.ok(after.isDirectory());
   assert.equal(after.dev, directory.dev);
   assert.equal(after.ino, directory.ino);
+  assert.deepEqual(await fs.readdir(f.source), []);
   assert.deepEqual(await readFile(f.index), f.indexBytes);
   assert.deepEqual(await readFile(f.manifestFile), f.manifestBytes);
-  await rm(f.source, { recursive: true });
+});
+
+test("migration recovery record direct rejects malformed prepared markers", async (t) => {
+  const f = await fixture(t);
   const malformed = Buffer.from(JSON.stringify({ kind: "margrave-store-migration" }));
   await writeFile(f.source, malformed);
   await assert.rejects(recoverMigrationRecord(), f.invalid);
@@ -248,13 +252,35 @@ test("migration recovery record direct extracts verified members and closes nati
   for (const [i, member] of ["./index.db", "./sources.json"].entries()) {
     const [command, args, options] = calls[i]!;
     assert.equal(command, "/usr/bin/tar");
-    assert.deepEqual(args, ["-xOf", path.join(f.backup, "store.tar"), member]);
+    assert.deepEqual(args, ["-xOf", path.join(scratch, "store.tar"), member]);
     assert.deepEqual(options?.stdio, ["ignore", opened[i]!.fd, "pipe"]);
     assert.ok(Object.hasOwn(options?.env ?? {}, "TAR_OPTIONS"));
     assert.equal(options?.env?.["TAR_OPTIONS"], undefined);
     assert.equal(options?.env?.["MARGRAVE_TEST_INHERITED"], "preserved");
   }
   await f.preserved();
+});
+
+test("migration recovery extracts the verified copy after the backup archive is replaced", async (t) => {
+  const f = await fixture(t);
+  const originalSpawn = childProcess.spawn;
+  let replaced = false;
+  mock.method(childProcess, "spawn", ((...args: Parameters<typeof childProcess.spawn>) => {
+    if (args[0] === "/usr/bin/tar" && !replaced) {
+      writeFileSync(path.join(f.backup, "store.tar"), "replacement");
+      replaced = true;
+    }
+    return originalSpawn(...args);
+  }) as typeof childProcess.spawn);
+  syncBuiltinESMExports();
+  try {
+    assert.deepEqual(await recoverMigrationRecord(), { backup: f.backup, sources: f.sources });
+    assert.equal(replaced, true);
+    assert.equal(await readFile(path.join(f.backup, "store.tar"), "utf8"), "replacement");
+    assert.equal((await readdir(f.parent)).filter((name) => name.startsWith(".margrave-upgrade-tmp-")).length, 0);
+  } finally {
+    restoreMocks();
+  }
 });
 
 test("migration recovery record direct handles scratch ACL by platform", { skip: process.platform !== "darwin" }, async (t) => {
@@ -395,7 +421,7 @@ test("migration recovery record direct rejects changed extracted member bytes", 
     );
     assert.equal(calls.length, 2);
     for (const [i, member] of ["./index.db", "./sources.json"].entries()) {
-      assert.deepEqual(calls[i]![1], ["-xOf", path.join(f.backup, "store.tar"), member]);
+      assert.deepEqual(calls[i]![1], ["-xOf", path.join(path.dirname(opened[i]!.file), "store.tar"), member]);
       assert.deepEqual(calls[i]![2]?.stdio, ["ignore", opened[i]!.fd, "pipe"]);
     }
     await f.preserved();

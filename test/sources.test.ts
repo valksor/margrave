@@ -64,8 +64,9 @@ test("Git install and update refuse staged changes before the scanner reads", as
     const real = fsp.readdir;
     const inject = (): void => {
       let fired = false;
+      let scans = 0;
       mock.method(fsp, "readdir", (async (dir: string, ...args: unknown[]) => {
-        if (!fired && dir.includes(`${path.sep}staging${path.sep}`) && dir.endsWith(`${path.sep}repo`) && args.length === 0) {
+        if (!fired && dir.includes(`${path.sep}staging${path.sep}`) && dir.endsWith(`${path.sep}repo`) && ++scans === 2) {
           fired = true;
           await writeFile(path.join(dir, "skills", "react-perf", "SKILL.md"), "changed\n");
         }

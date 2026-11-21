@@ -619,7 +619,9 @@ test("inventory hashes sorted paths, file bytes, directories, and relative links
   const originalOpen = fsp.open;
   const streams: unknown[] = [];
   const closed = new Set<string>();
-  t.mock.method(fsp, "readdir", async (p: Parameters<typeof fsp.readdir>[0]) => (await originalReadDir(p)).sort().reverse());
+  t.mock.method(fsp, "readdir", async (p: Parameters<typeof fsp.readdir>[0]) =>
+    (await originalReadDir(p, { withFileTypes: true })).reverse(),
+  );
   t.mock.method(
     fsp,
     "open",
@@ -651,6 +653,23 @@ test("inventory hashes sorted paths, file bytes, directories, and relative links
     assert.equal(await scanInventory(dir), hash(tuples.map((tuple) => JSON.stringify(tuple)).join("")));
     assert.deepEqual(streams, [{ autoClose: false }, { autoClose: false }, { autoClose: false }]);
     assert.deepEqual(closed, new Set([path.join(dir, "a"), path.join(dir, "nested/data"), path.join(dir, "z")]));
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
+test("inventory rejects a file replaced by a directory before opening", async (t) => {
+  const dir = await scanDir({ file: "data" });
+  const originalOpen = fsp.open;
+  t.mock.method(fsp, "open", async (file: Parameters<typeof fsp.open>[0], flags: Parameters<typeof fsp.open>[1]) => {
+    await fsp.unlink(file);
+    await fsp.mkdir(file);
+    return originalOpen(file, flags);
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(scanInventory(dir), /staged skills changed during scan/u);
   } finally {
     t.mock.restoreAll();
     syncBuiltinESMExports();

@@ -107,7 +107,6 @@ test("migration backup publication direct records the verified version 2 backup"
     assert.deepEqual(calls, [
       [path.join(store, "index.db"), { bigint: true }],
       [path.join(store, "sources.json"), { bigint: true }],
-      [path.join(store, "index.db"), { bigint: true }],
     ]);
   } finally {
     observer.mock.restore();
@@ -184,17 +183,22 @@ test("migration backup publication direct archives a version 3 store without a s
   const inventory: unknown[] = [[".", "directory", root.uid.toString(), root.gid.toString(), root.mode.toString(), null]];
   for (const name of ["catalog-published", "index.db"]) {
     const file = path.join(store, name);
-    const stat = await lstat(file, { bigint: true });
-    inventory.push([
-      name,
-      "file",
-      stat.uid.toString(),
-      stat.gid.toString(),
-      stat.mode.toString(),
-      stat.mtimeNs.toString(),
-      stat.ctimeNs.toString(),
-      digest(await readFile(file)),
-    ]);
+    const handle = await fs.open(file, "r");
+    try {
+      const stat = await handle.stat({ bigint: true });
+      inventory.push([
+        name,
+        "file",
+        stat.uid.toString(),
+        stat.gid.toString(),
+        stat.mode.toString(),
+        stat.mtimeNs.toString(),
+        stat.ctimeNs.toString(),
+        digest(await handle.readFile()),
+      ]);
+    } finally {
+      await handle.close();
+    }
   }
   const inventorySha256 = digest(JSON.stringify([inventory, [[".", null, null, null]]]));
   assert.deepEqual(manifest, {

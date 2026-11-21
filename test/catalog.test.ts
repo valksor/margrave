@@ -1057,11 +1057,20 @@ test("catalog read direct rejects invalid pending publication evidence without c
       await symlink(path.join(home, "owner-target"), owner);
     } else if (kind !== "owner-missing") await writeFile(owner, kind === "owner-content" ? "wrong\n" : "margrave-catalog-v1\n");
     const before = await Promise.all(
-      (await readdir(home)).sort().map(async (entry) => {
-        const item = path.join(home, entry);
-        const st = await fsp.lstat(item);
-        return [entry, st.isSymbolicLink() ? await readlink(item) : st.isFile() ? await readFile(item, "utf8") : "directory"];
-      }),
+      (await readdir(home, { withFileTypes: true }))
+        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+        .map(async (entry) => {
+          const item = path.join(home, entry.name);
+          if (entry.isSymbolicLink()) return [entry.name, await readlink(item)];
+          if (!entry.isFile()) return [entry.name, "directory"];
+          const handle = await fsp.open(item, "r");
+          try {
+            assert.ok((await handle.stat()).isFile());
+            return [entry.name, await handle.readFile("utf8")];
+          } finally {
+            await handle.close();
+          }
+        }),
     );
     const lstat = fsp.lstat;
     let probes = 0;
@@ -1084,11 +1093,20 @@ test("catalog read direct rejects invalid pending publication evidence without c
       syncBuiltinESMExports();
     }
     const after = await Promise.all(
-      (await readdir(home)).sort().map(async (entry) => {
-        const item = path.join(home, entry);
-        const st = await fsp.lstat(item);
-        return [entry, st.isSymbolicLink() ? await readlink(item) : st.isFile() ? await readFile(item, "utf8") : "directory"];
-      }),
+      (await readdir(home, { withFileTypes: true }))
+        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+        .map(async (entry) => {
+          const item = path.join(home, entry.name);
+          if (entry.isSymbolicLink()) return [entry.name, await readlink(item)];
+          if (!entry.isFile()) return [entry.name, "directory"];
+          const handle = await fsp.open(item, "r");
+          try {
+            assert.ok((await handle.stat()).isFile());
+            return [entry.name, await handle.readFile("utf8")];
+          } finally {
+            await handle.close();
+          }
+        }),
     );
     assert.deepEqual(after, before, kind);
   }

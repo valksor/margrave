@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // margrave CLI. Exit codes: 0 ok, 1 error, 2 usage.
 import { parseArgs } from "node:util";
+import { isSea } from "node:sea";
+import { verifyBackupChild } from "./migration-backup.ts";
 import { exportLock, readLock, restoreLock } from "./lock.ts";
 import { runMcp, version } from "./mcp.ts";
 import {
@@ -328,13 +330,15 @@ process.stdout.on("error", (e: NodeJS.ErrnoException) => {
   if (e.code !== "EPIPE") throw e;
 });
 
-run(process.argv.slice(2)).catch((e: unknown) => {
-  const msg = e instanceof Error ? e.message : String(e);
-  if (e instanceof UsageError) {
-    err(`margrave: ${msg}\nrun: margrave --help`);
-    process.exitCode = 2;
-  } else {
-    err(`margrave: ${msg}`);
-    process.exitCode = 1;
-  }
-});
+(isSea() && process.argv[2] === "--internal-verify-backup" ? verifyBackupChild(process.argv.slice(3)) : run(process.argv.slice(2))).catch(
+  (e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (e instanceof UsageError) {
+      err(`margrave: ${msg}\nrun: margrave --help`);
+      process.exitCode = 2;
+    } else {
+      err(`margrave: ${msg}`);
+      process.exitCode = 1;
+    }
+  },
+);

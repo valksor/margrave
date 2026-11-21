@@ -2,12 +2,16 @@ import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import type { BigIntStats } from "node:fs";
-import { lstat, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, open, readdir, readlink, realpath, rename, rm, writeFile } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
+import { isSea } from "node:sea";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { z } from "zod";
 import type { SourceRecord } from "./store-files.ts";
 import { MargraveError, atomicWrite, home, indexDbFile, isSha256, lstatIfExists, sourcesFile, validSource } from "./store-files.ts";
+import { READ_NO_FOLLOW } from "./skill-files.ts";
 export const execFileAsync = promisify(execFile);
 export const sha256 = (bytes: string | Buffer): string => createHash("sha256").update(bytes).digest("hex");
 
@@ -53,29 +57,135 @@ function hashCatalogIdentity(
   return sameFileIdentity(stat, catalog) ? hashLiveCatalog(file) : hashFile(file);
 }
 
-export async function verifyBackupFiles(backup: string): Promise<{ manifest: z.infer<typeof backupManifestSchema>; owner: number } | null> {
+export async function verifyBackupFiles(
+  backup: string,
+  copy?: string,
+): Promise<{ manifest: z.infer<typeof backupManifestSchema>; owner: number } | null> {
   const invalid = (): Error => new Error(`invalid backup: ${backup}`);
-  const dir = await lstat(backup);
-  if (!dir.isDirectory() || (dir.mode & 0o077) !== 0 || dir.uid !== process.getuid?.()) throw invalid();
-  if (process.platform === "darwin") {
-    const { stdout } = await execFileAsync("/bin/ls", ["-lde", backup]);
-    if (stdout.trimEnd().includes("\n")) throw invalid();
+  const dir = await lstat(backup, { bigint: true });
+  if (!dir.isDirectory() || (dir.mode & 0o077n) !== 0n || dir.uid !== BigInt(process.getuid?.() ?? -1)) throw invalid();
+  const args = ["--internal-verify-backup", dir.dev.toString(), dir.ino.toString(), path.resolve(indexDbFile()), copy ?? ""];
+  const executable = process.execPath;
+  if (!isSea()) args.unshift(fileURLToPath(import.meta.url));
+  const env: NodeJS.ProcessEnv = { MARGRAVE_HOME: home() };
+  if (process.env["NODE_V8_COVERAGE"] !== undefined) env["NODE_V8_COVERAGE"] = process.env["NODE_V8_COVERAGE"];
+  let value: unknown;
+  try {
+    const result = await execFileAsync(executable, args, { cwd: path.resolve(backup), env });
+    value = JSON.parse(result.stdout) as unknown;
+  } catch {
+    throw invalid();
   }
-  const manifestFile = path.join(backup, "manifest.json");
-  const archiveFile = path.join(backup, "store.tar");
-  if ((await lstatIfExists(manifestFile)) === null) return null;
-  const stats = await Promise.all([lstat(manifestFile), lstat(archiveFile)]);
-  if (stats.some((st) => !st.isFile() || (st.mode & 0o077) !== 0 || st.uid !== process.getuid?.())) throw invalid();
-  const [catalog, manifestStat, archiveStat] = await Promise.all([
-    lstat(indexDbFile(), { bigint: true }),
-    lstat(manifestFile, { bigint: true }),
-    lstat(archiveFile, { bigint: true }),
-  ]);
-  if (sameFileIdentity(manifestStat, catalog)) throw invalid();
-  const manifest = parseBackupManifest(JSON.parse(await readFile(manifestFile, "utf8")) as unknown);
-  const archiveHash = await hashCatalogIdentity(archiveFile, archiveStat, catalog);
-  if (manifest === null || manifest.archiveSha256 !== archiveHash) throw invalid();
-  return { manifest, owner: dir.uid };
+  const result = z
+    .union([
+      z.strictObject({ kind: z.literal("missing") }),
+      z.strictObject({ kind: z.literal("syntax"), message: z.string() }),
+      z.strictObject({ kind: z.literal("catalog-missing") }),
+      z.strictObject({ kind: z.literal("error"), code: z.literal("ENOENT"), file: z.literal("store.tar") }),
+      z.strictObject({ kind: z.literal("ok"), manifest: backupManifestSchema, owner: z.number() }),
+    ])
+    .safeParse(value);
+  if (!result.success) throw invalid();
+  if (result.data.kind === "missing") return null;
+  if (result.data.kind === "syntax") throw new SyntaxError(result.data.message);
+  if (result.data.kind === "catalog-missing") {
+    const err = new Error(`ENOENT: no such file or directory, lstat '${indexDbFile()}'`) as NodeJS.ErrnoException;
+    err.code = "ENOENT";
+    throw err;
+  }
+  if (result.data.kind === "error") {
+    const err = new Error(`ENOENT: no such file or directory, open '${path.join(backup, result.data.file)}'`) as NodeJS.ErrnoException;
+    err.code = "ENOENT";
+    throw err;
+  }
+  return { manifest: result.data.manifest, owner: result.data.owner };
+}
+
+async function verifyBackupArchive(archive: FileHandle, expected: string, copy: string | undefined): Promise<void> {
+  const destination = copy ? await open(copy, "wx", 0o600) : undefined;
+  try {
+    const digest = createHash("sha256");
+    for await (const chunk of archive.createReadStream({ autoClose: false })) {
+      digest.update(chunk as Buffer);
+      if (destination !== undefined) await destination.writeFile(chunk as Buffer);
+    }
+    if (digest.digest("hex") !== expected) throw new Error("invalid archive digest");
+  } finally {
+    await destination?.close();
+  }
+}
+
+export async function verifyBackupChild(args: string[]): Promise<void> {
+  const [device, inode, catalogPath, copy] = args;
+  if (args.length !== 4 || catalogPath !== indexDbFile()) throw new Error("invalid directory");
+  const dir = await lstat(".", { bigint: true });
+  if (
+    !dir.isDirectory() ||
+    dir.dev.toString() !== device ||
+    dir.ino.toString() !== inode ||
+    (dir.mode & 0o077n) !== 0n ||
+    dir.uid !== BigInt(process.getuid?.() ?? -1)
+  )
+    throw new Error("invalid directory");
+  if (process.platform === "darwin") {
+    const { stdout } = await execFileAsync("/bin/ls", ["-lde", "."], { env: {} });
+    if (stdout.trimEnd().includes("\n")) throw new Error("invalid directory ACL");
+  }
+  let manifestHandle;
+  try {
+    manifestHandle = await open("manifest.json", READ_NO_FOLLOW);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      process.stdout.write(JSON.stringify({ kind: "missing" }));
+      return;
+    }
+    throw err;
+  }
+  try {
+    const stat = await manifestHandle.stat({ bigint: true });
+    if (!stat.isFile() || (stat.mode & 0o077n) !== 0n || stat.uid !== dir.uid) throw new Error("invalid manifest");
+    let archive;
+    try {
+      archive = await open("store.tar", READ_NO_FOLLOW);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      process.stdout.write(JSON.stringify({ kind: "error", code: "ENOENT", file: "store.tar" }));
+      return;
+    }
+    try {
+      const archiveStat = await archive.stat({ bigint: true });
+      if (!archiveStat.isFile() || (archiveStat.mode & 0o077n) !== 0n || archiveStat.uid !== dir.uid) throw new Error("invalid archive");
+      let catalog;
+      try {
+        catalog = await lstat(catalogPath, { bigint: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        process.stdout.write(JSON.stringify({ kind: "catalog-missing" }));
+        return;
+      }
+      if (sameFileIdentity(stat, catalog)) throw new Error("invalid manifest");
+      let raw: unknown;
+      try {
+        raw = JSON.parse(await manifestHandle.readFile("utf8")) as unknown;
+      } catch (err) {
+        if (!(err instanceof SyntaxError)) throw err;
+        process.stdout.write(JSON.stringify({ kind: "syntax", message: err.message }));
+        return;
+      }
+      const manifest = parseBackupManifest(raw);
+      if (manifest === null) throw new Error("invalid manifest");
+      await verifyBackupArchive(archive, manifest.archiveSha256, copy);
+      process.stdout.write(JSON.stringify({ kind: "ok", manifest, owner: Number(dir.uid) }));
+    } finally {
+      await archive.close();
+    }
+  } finally {
+    await manifestHandle.close();
+  }
+}
+
+if (!isSea() && import.meta.main && process.argv[2] === "--internal-verify-backup") {
+  await verifyBackupChild(process.argv.slice(3));
 }
 
 export async function hashFile(file: string): Promise<string> {

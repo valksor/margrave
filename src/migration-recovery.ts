@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import type { BigIntStats, Stats } from "node:fs";
+import type { Stats } from "node:fs";
 import { copyFile, lstat, mkdtemp, open, readFile, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -201,34 +201,27 @@ export async function recoverMigrationRecord(): Promise<{
   if (!parsed.success || parsed.data.store !== store) throw invalid();
   const record = parsed.data;
   const backup = path.join(path.dirname(store), record.backup);
-  let preflight: { catalog: BigIntStats; archive: string; checked: Awaited<ReturnType<typeof verifyBackupFiles>> };
-  try {
-    const catalog = await lstat(indexDbFile(), { bigint: true });
-    if (!catalog.isFile() || catalog.dev.toString() !== record.catalogDevice || catalog.ino.toString() !== record.catalogInode)
-      throw invalid();
-    const archive = path.join(backup, "store.tar");
-    const checked = await verifyBackupFiles(backup);
-    preflight = { catalog, archive, checked };
-  } catch (err) {
-    throw normalize(err);
-  }
-  const { catalog, archive, checked } = preflight;
-  if (checked === null) throw invalid();
-  const { manifest, owner } = checked;
-  if (
-    manifest.store !== store ||
-    manifest.from !== 2 ||
-    manifest.indexSha256 !== record.indexSha256 ||
-    manifest.sourcesSha256 !== record.sourcesSha256
-  )
-    throw invalid();
-  const key = sha256(JSON.stringify([store, 2, record.indexSha256, record.sourcesSha256, manifest.inventorySha256]));
-  if (!record.backup.startsWith(`.margrave-upgrade-v2-${key}-`)) throw invalid();
   let scratch: string | undefined;
   let held: DatabaseSync | undefined;
   try {
     scratch = await mkdtemp(path.join(path.dirname(store), ".margrave-upgrade-tmp-"));
     if (process.platform === "darwin") await execFileAsync("/bin/chmod", ["-N", scratch]);
+    const catalog = await lstat(indexDbFile(), { bigint: true });
+    if (!catalog.isFile() || catalog.dev.toString() !== record.catalogDevice || catalog.ino.toString() !== record.catalogInode)
+      throw invalid();
+    const archive = path.join(scratch, "store.tar");
+    const checked = await verifyBackupFiles(backup, archive);
+    if (checked === null) throw invalid();
+    const { manifest, owner } = checked;
+    if (
+      manifest.store !== store ||
+      manifest.from !== 2 ||
+      manifest.indexSha256 !== record.indexSha256 ||
+      manifest.sourcesSha256 !== record.sourcesSha256
+    )
+      throw invalid();
+    const key = sha256(JSON.stringify([store, 2, record.indexSha256, record.sourcesSha256, manifest.inventorySha256]));
+    if (!record.backup.startsWith(`.margrave-upgrade-v2-${key}-`)) throw invalid();
     await extractBackupMember(archive, "./index.db", path.join(scratch, "original.db"));
     await extractBackupMember(archive, "./sources.json", path.join(scratch, "sources.json"));
     if (

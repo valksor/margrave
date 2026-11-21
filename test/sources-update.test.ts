@@ -311,7 +311,7 @@ test("sources update direct publishes a new Git revision and retains its old sna
     scanSpy.mock.restore();
     syncBuiltinESMExports();
   }
-  assert.equal(scans, 2);
+  assert.equal(scans, 4);
   assert.equal(removals.length, 1);
   assert.deepEqual(removals[0]!.options, { recursive: true, force: true });
   const clone = path.dirname(removals[0]!.path);

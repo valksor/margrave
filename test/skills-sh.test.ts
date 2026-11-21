@@ -381,7 +381,7 @@ test("CLI, stdio and hosted opt in through trusted configuration", async (t) => 
   await writeFile(fetchLog, "");
   await writeFile(
     preload,
-    `import { appendFileSync } from "node:fs"; globalThis.fetch = async (input) => { appendFileSync(${JSON.stringify(fetchLog)}, "fetch\\n"); if (new URL(input).searchParams.get("q") !== "terraform modules") throw new Error("wrong query"); return Response.json({ skills: [{ source: "owner/repo", skillId: "skill" }] }); };\n`,
+    `import { appendFileSync } from "node:fs"; globalThis.fetch = async (input) => { appendFileSync(process.env.FETCH_LOG, "fetch\\n"); if (new URL(input).searchParams.get("q") !== "terraform modules") throw new Error("wrong query"); return Response.json({ skills: [{ source: "owner/repo", skillId: "skill" }] }); };\n`,
   );
   t.after(async () => {
     globalThis.fetch = originalFetch;
@@ -389,7 +389,7 @@ test("CLI, stdio and hosted opt in through trusted configuration", async (t) => 
     else process.env["MARGRAVE_HOME"] = previous;
     await rm(home, { recursive: true, force: true });
   });
-  const extra = { MARGRAVE_SKILLS_SH: "1" };
+  const extra = { MARGRAVE_SKILLS_SH: "1", FETCH_LOG: fetchLog };
   const nodeArgs = ["--import", preload];
   const enabled = await runCli(["find", "private-prompt-marker", "--json", "--catalog-query", "terraform modules"], {
     home,
@@ -401,7 +401,7 @@ test("CLI, stdio and hosted opt in through trusted configuration", async (t) => 
   assert.equal((JSON.parse(enabled.stdout) as { suggestions: { id: string }[] }).suggestions[0]?.id, "owner/repo/skill");
   const disabled = await runCli(["find", "private-prompt-marker", "--json", "--catalog-query", "terraform modules"], {
     home,
-    extra: { MARGRAVE_SKILLS_SH: "0" },
+    extra: { MARGRAVE_SKILLS_SH: "0", FETCH_LOG: fetchLog },
     nodeArgs,
   });
   assert.equal("suggestions" in (JSON.parse(disabled.stdout) as object), false);
