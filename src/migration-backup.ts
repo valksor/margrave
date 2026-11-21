@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
+import type { BigIntStats } from "node:fs";
 import { lstat, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -40,6 +41,18 @@ function parseBackupManifest(value: unknown): z.infer<typeof backupManifestSchem
   return result.success ? result.data : null;
 }
 
+export function sameFileIdentity(a: Pick<BigIntStats, "dev" | "ino">, b: Pick<BigIntStats, "dev" | "ino">): boolean {
+  return a.dev === b.dev && a.ino === b.ino;
+}
+
+function hashCatalogIdentity(
+  file: string,
+  stat: Pick<BigIntStats, "dev" | "ino">,
+  catalog: Pick<BigIntStats, "dev" | "ino">,
+): Promise<string> {
+  return sameFileIdentity(stat, catalog) ? hashLiveCatalog(file) : hashFile(file);
+}
+
 export async function verifyBackupFiles(backup: string): Promise<{ manifest: z.infer<typeof backupManifestSchema>; owner: number } | null> {
   const invalid = (): Error => new Error(`invalid backup: ${backup}`);
   const dir = await lstat(backup);
@@ -58,11 +71,9 @@ export async function verifyBackupFiles(backup: string): Promise<{ manifest: z.i
     lstat(manifestFile, { bigint: true }),
     lstat(archiveFile, { bigint: true }),
   ]);
-  if (manifestStat.dev === catalog.dev && manifestStat.ino === catalog.ino) throw invalid();
+  if (sameFileIdentity(manifestStat, catalog)) throw invalid();
   const manifest = parseBackupManifest(JSON.parse(await readFile(manifestFile, "utf8")) as unknown);
-  const archiveHash = await (archiveStat.dev === catalog.dev && archiveStat.ino === catalog.ino
-    ? hashLiveCatalog(archiveFile)
-    : hashFile(archiveFile));
+  const archiveHash = await hashCatalogIdentity(archiveFile, archiveStat, catalog);
   if (manifest === null || manifest.archiveSha256 !== archiveHash) throw invalid();
   return { manifest, owner: dir.uid };
 }
@@ -98,50 +109,42 @@ async function syncPath(file: string): Promise<void> {
   }
 }
 
+function parseDirectoryPaxRecord(payload: Buffer, at: number, pax: Map<string, Buffer>): number {
+  const space = payload.indexOf(32, at);
+  const lengthText = payload.toString("ascii", at, space);
+  if (!/^[0-9]+$/u.test(lengthText)) throw new Error("invalid pax record");
+  const end = at + Number(lengthText);
+  if (payload[end - 1] !== 10) throw new Error("invalid pax record");
+  const record = payload.subarray(space + 1, end - 1);
+  const equals = record.indexOf(61);
+  if (equals < 0) throw new Error("invalid pax record");
+  pax.set(record.subarray(0, equals).toString("utf8"), record.subarray(equals + 1));
+  return end;
+}
+
 /** Read only the directory ACL records from a pax archive, in member order. */
 async function directoryAcls(archive: string, directories: readonly string[]): Promise<unknown[]> {
   const handle = await open(archive, "r");
   const result: unknown[] = [];
-  let offset = 0;
   let pax = new Map<string, Buffer>();
   const read = async (length: number, position: number): Promise<Buffer> => {
     const bytes = Buffer.alloc(length);
     if ((await handle.read(bytes, 0, length, position)).bytesRead !== length) throw new Error("truncated metadata archive");
     return bytes;
   };
-  const text = (bytes: Buffer): string => bytes.toString("utf8").replace(/\0.*$/su, "");
+  const text = (bytes: Buffer): string => bytes.toString("utf8").replace(/\0.*/su, "");
   try {
-    for (;;) {
-      const header = await read(512, offset);
-      offset += 512;
-      if (header.every((byte) => byte === 0)) break;
+    let header: Buffer;
+    let size = 0;
+    for (let offset = 0; !(header = await read(512, offset)).every((byte) => byte === 0); offset += 512 + Math.ceil(size / 512) * 512) {
       const sizeText = text(header.subarray(124, 136)).trim();
       if (!/^[0-7]+$/u.test(sizeText)) throw new Error("invalid metadata archive size");
-      const size = Number.parseInt(sizeText, 8);
+      size = Number.parseInt(sizeText, 8);
       const type = header[156];
       if (type === 120) {
-        const payload = await read(size, offset);
+        const payload = await read(size, offset + 512);
         pax = new Map();
-        for (let at = 0; at < payload.length;) {
-          const space = payload.indexOf(32, at);
-          if (space < 0) throw new Error("invalid pax record");
-          const lengthText = payload.subarray(at, space).toString("ascii");
-          if (!/^[0-9]+$/u.test(lengthText)) throw new Error("invalid pax record");
-          const length = Number(lengthText);
-          const end = at + length;
-          const equals = payload.indexOf(61, space + 1);
-          if (
-            !Number.isSafeInteger(length) ||
-            end > payload.length ||
-            end <= space + 2 ||
-            equals < 0 ||
-            equals >= end - 1 ||
-            payload[end - 1] !== 10
-          )
-            throw new Error("invalid pax record");
-          pax.set(payload.subarray(space + 1, equals).toString("utf8"), payload.subarray(equals + 1, end - 1));
-          at = end;
-        }
+        for (let at = 0; at < payload.length; at = parseDirectoryPaxRecord(payload, at, pax));
       } else if (type === 53) {
         const prefix = text(header.subarray(345, 500));
         const name = pax.get("path")?.toString("utf8") ?? `${prefix === "" ? "" : `${prefix}/`}${text(header.subarray(0, 100))}`;
@@ -153,7 +156,6 @@ async function directoryAcls(archive: string, directories: readonly string[]): P
         ]);
         pax = new Map();
       } else throw new Error("unexpected metadata archive member");
-      offset += Math.ceil(size / 512) * 512;
     }
     if (result.length !== directories.length) throw new Error("metadata archive members do not match");
     return result;
@@ -237,11 +239,7 @@ async function backupInventory(store: string, sources: readonly SourceRecord[]):
       st.gid.toString(),
       st.mode.toString(),
       ...(type === "directory" ? [] : [st.mtimeNs.toString(), st.ctimeNs.toString()]),
-      type === "file"
-        ? await (st.dev === catalog.dev && st.ino === catalog.ino ? hashLiveCatalog(file) : hashFile(file))
-        : type === "symlink"
-          ? await readlink(file)
-          : null,
+      type === "file" ? await hashCatalogIdentity(file, st, catalog) : type === "symlink" ? await readlink(file) : null,
     ]);
   }
   const acls = await directoryAclInventory(store, directories);
@@ -259,12 +257,7 @@ export async function backupMigrationStore(from: 2 | 3, sources: readonly Source
     const indexSha256 = await hashLiveCatalog(catalogPath);
     const sourcesPath = path.join(store, "sources.json");
     const sourceStat = (await lstatIfExists(sourcesPath)) === null ? null : await lstat(sourcesPath, { bigint: true });
-    const sourcesSha256 =
-      sourceStat === null
-        ? null
-        : await (sourceStat.dev === catalogStat.dev && sourceStat.ino === catalogStat.ino
-            ? hashLiveCatalog(sourcesPath)
-            : hashFile(sourcesPath));
+    const sourcesSha256 = sourceStat === null ? null : await hashCatalogIdentity(sourcesPath, sourceStat, catalogStat);
     const key = sha256(JSON.stringify([store, from, indexSha256, sourcesSha256, inventory.digest]));
     const parent = path.dirname(store);
     const prefix = `.margrave-upgrade-v${from}-${key}-`;
@@ -338,16 +331,19 @@ export async function writeMigrationRecord(backup: string): Promise<void> {
   const catalog = await lstat(indexDbFile(), { bigint: true });
   const indexSha256 = await hashLiveCatalog(indexDbFile());
   const sourceStat = await lstat(sourcesFile(), { bigint: true });
-  const sourcesSha256 = await (sourceStat.dev === catalog.dev && sourceStat.ino === catalog.ino
-    ? hashLiveCatalog(sourcesFile())
-    : hashFile(sourcesFile()));
-  const manifest = (await verifyBackupFiles(backup).catch(() => null))?.manifest ?? null;
+  const sourcesSha256 = await hashCatalogIdentity(sourcesFile(), sourceStat, catalog);
+  let checked: Awaited<ReturnType<typeof verifyBackupFiles>>;
+  try {
+    checked = await verifyBackupFiles(backup);
+  } catch {
+    checked = null;
+  }
   if (
-    manifest === null ||
-    manifest.store !== store ||
-    manifest.from !== 2 ||
-    manifest.indexSha256 !== indexSha256 ||
-    manifest.sourcesSha256 !== sourcesSha256
+    checked === null ||
+    checked.manifest.store !== store ||
+    checked.manifest.from !== 2 ||
+    checked.manifest.indexSha256 !== indexSha256 ||
+    checked.manifest.sourcesSha256 !== sourcesSha256
   )
     throw new MargraveError(
       `cannot verify the interrupted Margrave upgrade at ${store}. Restore a complete backup. See Upgrading in the README.`,

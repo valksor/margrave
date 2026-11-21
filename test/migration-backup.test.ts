@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync } from "node:child_process";
+import nativeFs from "node:fs";
 import fs, { chmod, link as hardlink, lstat, mkdir, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
@@ -97,6 +98,7 @@ test("legacy backup validates selected file types and completed backups", async 
     process.env["MARGRAVE_HOME"] = home;
     const sources = await readLegacySources();
     const source = sources[0]!;
+    let reason: string;
     if (scenario === "missing-alias") {
       await rm(path.join(home, "sources"), { recursive: true });
       await backupMigrationStore(2, sources);
@@ -105,22 +107,29 @@ test("legacy backup validates selected file types and completed backups", async 
     if (scenario === "bad-snapshots") {
       await rm(path.join(home, "snapshots"), { recursive: true });
       await writeFile(path.join(home, "snapshots"), "not a directory");
+      reason = `not a directory: ${path.join(home, "snapshots")}`;
     } else if (scenario === "bad-sources") {
       await rm(path.join(home, "sources"), { recursive: true });
       await writeFile(path.join(home, "sources"), "not a directory");
+      reason = `not a directory: ${path.join(home, "sources")}`;
     } else if (scenario === "bad-alias") {
       await rm(path.join(home, "sources", source.id));
       await writeFile(path.join(home, "sources", source.id), "not a link");
+      reason = `not a symbolic link: ${path.join(home, "sources", source.id)}`;
     } else if (scenario === "bad-catalog") {
       await rm(path.join(home, "index.db"));
       await mkdir(path.join(home, "index.db"));
+      reason = `not a regular file: ${path.join(home, "index.db")}`;
     } else if (scenario === "special") {
       execFileSync("/usr/bin/mkfifo", [path.join(home, "snapshots", source.id, source.snapshot!, "fifo")]);
+      reason = `unsupported file type: ${path.join(home, "snapshots", source.id, source.snapshot!, "fifo")}`;
     } else if (scenario === "special-catalog") {
       await rm(path.join(home, "index.db"));
       execFileSync("/usr/bin/mkfifo", [path.join(home, "index.db")]);
+      reason = `unsupported file type: ${path.join(home, "index.db")}`;
     } else if (scenario === "bad-record") {
       source.id = "../invalid";
+      reason = "invalid source record";
     } else if (scenario === "abandoned") {
       const backup = await backupMigrationStore(2, sources);
       const abandoned = `${backup.slice(0, -6)}abcdef`;
@@ -132,7 +141,10 @@ test("legacy backup validates selected file types and completed backups", async 
       const backup = await backupMigrationStore(2, sources);
       if (scenario === "changed-source-list") {
         await writeFile(path.join(home, "sources.json"), "[]\n");
-        await assert.rejects(writeMigrationRecord(backup), /cannot verify the interrupted Margrave upgrade/u);
+        await assert.rejects(
+          writeMigrationRecord(backup),
+          new Error(`cannot verify the interrupted Margrave upgrade at ${home}. Restore a complete backup. See Upgrading in the README.`),
+        );
         continue;
       }
       if (scenario === "backup-mode") await chmod(backup, 0o755);
@@ -144,8 +156,47 @@ test("legacy backup validates selected file types and completed backups", async 
         manifest.store = "/another-store";
         await writeFile(manifestFile, JSON.stringify(manifest));
       } else await writeFile(path.join(backup, "store.tar"), "corrupt");
+      reason = `invalid backup: ${backup}`;
     }
-    await assert.rejects(backupMigrationStore(2, sources), /cannot back up the Margrave store/u, scenario);
+    const fifo =
+      scenario === "special"
+        ? path.join(home, "snapshots", source.id, source.snapshot!, "fifo")
+        : scenario === "special-catalog"
+          ? path.join(home, "index.db")
+          : undefined;
+    let observed = false;
+    if (fifo !== undefined) {
+      const spawnOriginal = childProcess.spawn;
+      const createReadStreamOriginal = nativeFs.createReadStream;
+      mock.method(childProcess, "spawn", ((...args: Parameters<typeof childProcess.spawn>) => {
+        if (args[0] === "/bin/cat" && Array.isArray(args[1]) && args[1][0] === fifo) {
+          observed = true;
+          throw new Error(`unexpected FIFO open: ${fifo}`);
+        }
+        return spawnOriginal(...args);
+      }) as typeof childProcess.spawn);
+      mock.method(nativeFs, "createReadStream", ((...args: Parameters<typeof nativeFs.createReadStream>) => {
+        if (args[0] === fifo) {
+          observed = true;
+          throw new Error(`unexpected FIFO open: ${fifo}`);
+        }
+        return createReadStreamOriginal(...args);
+      }) as typeof nativeFs.createReadStream);
+      syncBuiltinESMExports();
+    }
+    try {
+      await assert.rejects(
+        backupMigrationStore(2, sources),
+        new Error(`cannot back up the Margrave store at ${home}: ${reason}`),
+        scenario,
+      );
+      assert.equal(observed, false, scenario);
+    } finally {
+      if (fifo !== undefined) {
+        mock.restoreAll();
+        syncBuiltinESMExports();
+      }
+    }
   }
 });
 
