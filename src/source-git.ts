@@ -13,7 +13,7 @@ export function sanitizeId(s: string): string {
 }
 
 export function checkId(id: string): string {
-  if (id === "" || id === "." || id === ".." || !ID_RE.test(id)) {
+  if (id === "." || id === ".." || !ID_RE.test(id)) {
     throw new UsageError(`cannot derive a valid source id (got "${id}")`);
   }
   return id;
@@ -31,7 +31,7 @@ function stripGit(s: string): string {
 }
 
 function gitUrlId(spec: string): string {
-  let host = "";
+  let host: string;
   let rawPath: string;
   if (spec.startsWith("git@")) {
     const m = /^git@([^:/]+):(.+)$/u.exec(spec);
@@ -108,7 +108,8 @@ export function localId(realPath: string): string {
 }
 
 const GIT_ENV_PROTOCOLS = "https:ssh:git:file";
-export const qualifiedRef = (ref: string): boolean => /^refs\/(heads|tags)\//u.test(ref);
+export const qualifiedRef = (ref: string | null): ref is `refs/heads/${string}` | `refs/tags/${string}` =>
+  /^refs\/(heads|tags)\//u.test(String(ref));
 
 export function git(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -138,7 +139,7 @@ export function git(args: string[]): Promise<string> {
 }
 
 export async function gitClone(url: string, ref: string | null, dest: string): Promise<string> {
-  const qualified = ref !== null && qualifiedRef(ref);
+  const qualified = qualifiedRef(ref);
   const args = ["clone", "--depth", "1"];
   if (ref !== null && !qualified) args.push("--branch", ref);
   args.push("--", url, dest);
@@ -151,7 +152,7 @@ export async function gitClone(url: string, ref: string | null, dest: string): P
 }
 
 export async function installedRef(clone: string, ref: string | null): Promise<string> {
-  if (ref !== null && qualifiedRef(ref)) return ref;
+  if (qualifiedRef(ref)) return ref;
   if (ref === null) return (await git(["-C", clone, "symbolic-ref", "HEAD"])).trim();
   return git(["-C", clone, "symbolic-ref", "-q", "HEAD"])
     .then((head) => head.trim())
@@ -191,8 +192,8 @@ export async function remoteRefs(url: string, ref: string): Promise<Map<string, 
   const found = new Map<string, string>();
   const peeled = new Map<string, string>();
   for (const line of output.trim().split("\n")) {
-    const [sha, name] = line.split("\t");
-    if (sha === undefined || name === undefined) continue;
+    const [sha, name] = line.split("\t") as [string, string?];
+    if (name === undefined) continue;
     if (name.endsWith("^{}")) peeled.set(name.slice(0, -3), sha);
     else if (names.includes(name)) found.set(name, sha);
   }

@@ -1,9 +1,25 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { homedir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { checkRef, parseSpec, sanitizeId, installSource, updateSources } from "../src/sources.ts";
-import { localId } from "../src/source-git.ts";
+import {
+  checkId,
+  git as sourceGit,
+  gitClone,
+  installedRef,
+  localId,
+  qualifiedRef,
+  remoteRefs,
+  trackingRef,
+  validateGitRef,
+  validateUpdateRef,
+  validateUpdateRefSyntax,
+} from "../src/source-git.ts";
+import type { SourceRecord } from "../src/store-files.ts";
 import { MargraveError, UsageError } from "../src/store.ts";
 import {
   git,
@@ -222,4 +238,244 @@ test("install of a git source without git on PATH, and with a git that fails sil
   assert.equal(silent.code, 1);
   assert.match(silent.stderr, /^margrave: command failed: git clone [^\n]*\nCommand failed: git clone [^\n]*\n$/u);
   assert.deepEqual(await names(path.join(env.home, "staging")), []);
+});
+
+test("source Git direct validates IDs and refs", () => {
+  for (const id of ["a", "a-b_C.9", "-valid-"]) assert.equal(checkId(id), id);
+  for (const id of ["", ".", "..", "bad/name", "bad name"]) {
+    assert.throws(() => checkId(id), { name: "Error", message: `cannot derive a valid source id (got "${id}")` });
+  }
+  for (const ref of ["", "--synthetic-option"]) {
+    assert.throws(() => checkRef(ref), { message: `refused --ref "${ref}": must not be empty or start with "-"` });
+  }
+  assert.equal(checkRef("branch-"), "branch-");
+});
+
+test("source Git direct reports exact malformed specs", () => {
+  const shape = (spec: string) =>
+    `unrecognized source "${spec}": use owner/repo, a git URL (https://, git@, file://), or a path starting with ./ ../ / or ~`;
+  const chars = (spec: string) => `unrecognized source "${spec}": use owner/repo[/sub/path] with letters, digits, ".", "_", "-"`;
+  for (const [spec, message] of [
+    ["", "source spec is empty"],
+    ["--synthetic-option", 'refused spec "--synthetic-option": must not start with "-"'],
+    ["~someone/repo", 'unsupported spec "~someone/repo": only ~ and ~/path are expanded'],
+    ["owner//repo", shape("owner//repo")],
+    ["single", shape("single")],
+    ["owner/repo/..", 'refused spec "owner/repo/..": ".." is not allowed'],
+    ["owner/repo/.", chars("owner/repo/.")],
+    ["owner/bad name", chars("owner/bad name")],
+    ["owner/.git", 'unrecognized source "owner/.git"'],
+    ["owner/git@host:repo", chars("owner/git@host:repo")],
+    ["owner/https://host/repo", shape("owner/https://host/repo")],
+  ] as const)
+    assert.throws(() => parseSpec(spec), { message });
+});
+
+test("source Git direct parses URL and shorthand boundaries", () => {
+  for (const [url, id] of [
+    ["https://example.test/repo.git///", "example.test__repo"],
+    ["git@example.test:repo.git///", "example.test__repo"],
+    ["https://example.test", "example.test"],
+    ["https://example.test/repo.git \n", "example.test__repo"],
+  ] as const)
+    assert.deepEqual(parseSpec(url), { kind: "git", url, subpath: "", id });
+  assert.deepEqual(parseSpec("owner/repo-///"), {
+    kind: "git",
+    url: "https://github.com/owner/repo-.git",
+    subpath: "",
+    id: "owner__repo-",
+  });
+  for (const spec of ["git@:bad/git@good:repo", "git@host:repo\nmore"]) {
+    assert.throws(() => parseSpec(spec), { message: `cannot parse git URL "${spec}"` });
+  }
+});
+
+test("source Git direct recognizes only leading qualified refs", () => {
+  for (const ref of ["refs/heads/main", "refs/tags/v1"]) assert.equal(qualifiedRef(ref), true);
+  for (const ref of [null, "main", "refs/remotes/main", "prefix/refs/heads/main"]) assert.equal(qualifiedRef(ref), false);
+});
+
+type GitResult = { stdout?: string; stderr?: string; error?: Error; throws?: Error };
+type GitOptions = { encoding: string; maxBuffer: number; env: NodeJS.ProcessEnv };
+type GitCallback = (error: Error | null, stdout: string, stderr: string) => void;
+
+async function withSyntheticGit(
+  t: import("node:test").TestContext,
+  results: GitResult[],
+  run: (calls: string[][]) => Promise<void>,
+): Promise<void> {
+  const calls: string[][] = [];
+  const previousMarker = process.env["SOURCE_GIT_TEST_MARKER"];
+  process.env["SOURCE_GIT_TEST_MARKER"] = "inherited-synthetic-marker";
+  const mock = t.mock.method(childProcess, "execFile", ((
+    file: string,
+    args: string[],
+    options: GitOptions,
+    callback: GitCallback,
+  ): ChildProcess => {
+    assert.equal(file, "git");
+    assert.equal(options.encoding, "utf8");
+    assert.equal(options.maxBuffer, 16 * 1024 * 1024);
+    assert.equal(options.env["GIT_ALLOW_PROTOCOL"], "https:ssh:git:file");
+    assert.equal(options.env["GIT_TERMINAL_PROMPT"], "0");
+    assert.equal(options.env["SOURCE_GIT_TEST_MARKER"], "inherited-synthetic-marker");
+    calls.push(args);
+    const result = results.shift();
+    assert.ok(result, "unexpected git invocation");
+    if (result.throws) throw result.throws;
+    queueMicrotask(() => callback(result.error ?? null, result.stdout ?? "", result.stderr ?? ""));
+    return {} as ChildProcess;
+  }) as typeof childProcess.execFile);
+  syncBuiltinESMExports();
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      run(calls),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("synthetic Git calls did not settle within 500 ms")), 500);
+      }),
+    ]);
+    assert.equal(results.length, 0, "unused synthetic git results");
+  } finally {
+    clearTimeout(timer);
+    mock.mock.restore();
+    syncBuiltinESMExports();
+    if (previousMarker === undefined) delete process.env["SOURCE_GIT_TEST_MARKER"];
+    else process.env["SOURCE_GIT_TEST_MARKER"] = previousMarker;
+  }
+}
+
+const directSource: SourceRecord = {
+  id: "synthetic",
+  kind: "git",
+  spec: "synthetic",
+  url: "https://example.test/repo",
+  subpath: "",
+  ref: "refs/tags/v1",
+  commit: null,
+  installedAt: "synthetic",
+};
+
+test("source Git direct executes and reports process failures", async (t) => {
+  const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+  const failed = Object.assign(new Error("fallback error"), { code: 2 });
+  const sync = new Error("synchronous failure");
+  await withSyntheticGit(
+    t,
+    [
+      { stdout: " output \n" },
+      { error: missing },
+      { error: failed, stderr: "  detail \n" },
+      { error: failed, stderr: " \n" },
+      { throws: sync },
+    ],
+    async (calls) => {
+      assert.equal(await sourceGit(["status", "--short"]), " output \n");
+      await assert.rejects(sourceGit(["one"]), { message: "git was not found on PATH (command: git one)", cause: missing });
+      await assert.rejects(sourceGit(["two"]), { message: "command failed: git two\ndetail", cause: failed });
+      await assert.rejects(sourceGit(["three"]), { message: "command failed: git three\nfallback error", cause: failed });
+      await assert.rejects(sourceGit(["four"]), (err: unknown) => err === sync);
+      assert.deepEqual(calls, [["status", "--short"], ["one"], ["two"], ["three"], ["four"]]);
+    },
+  );
+});
+
+test("source Git direct clones short and qualified refs", async (t) => {
+  const url = "https://example.test/repo";
+  const dest = "/synthetic/clone";
+  for (const ref of [null, "branch", "refs/heads/main", "refs/tags/v1"]) {
+    const qualified = ref !== null && ref.startsWith("refs/");
+    const expected = [["clone", "--depth", "1", ...(ref !== null && !qualified ? ["--branch", ref] : []), "--", url, dest]];
+    if (qualified) expected.push(["-C", dest, "fetch", "--depth", "1", "origin", ref], ["-C", dest, "checkout", "--detach", "FETCH_HEAD"]);
+    expected.push(["-C", dest, "rev-parse", "HEAD"]);
+    await withSyntheticGit(
+      t,
+      expected.map((_, i) => ({ stdout: i === expected.length - 1 ? "  abc123 \n" : "" })),
+      async (calls) => {
+        assert.equal(await gitClone(url, ref, dest), "abc123");
+        assert.deepEqual(calls, expected);
+      },
+    );
+  }
+});
+
+test("source Git direct resolves installed refs", async (t) => {
+  await withSyntheticGit(
+    t,
+    [{ stdout: " refs/heads/main \n" }, { stdout: " refs/heads/branch \n" }, { error: new Error("detached") }],
+    async (calls) => {
+      assert.equal(await installedRef("/clone", null), "refs/heads/main");
+      assert.equal(await installedRef("/clone", "refs/tags/v1"), "refs/tags/v1");
+      assert.equal(await installedRef("/clone", "branch"), "refs/heads/branch");
+      assert.equal(await installedRef("/clone", "v1"), "refs/tags/v1");
+      assert.deepEqual(calls, [
+        ["-C", "/clone", "symbolic-ref", "HEAD"],
+        ["-C", "/clone", "symbolic-ref", "-q", "HEAD"],
+        ["-C", "/clone", "symbolic-ref", "-q", "HEAD"],
+      ]);
+    },
+  );
+});
+
+test("source Git direct validates update refs and process errors", async (t) => {
+  const invalid = Object.assign(new Error("bad ref"), { code: 1 });
+  const other = Object.assign(new Error("other failure"), { code: 2 });
+  const sync = Object.assign(new Error("sync failure"), { code: 1 });
+  const noCause = new MargraveError("no cause");
+  const message = "update --ref requires a fully qualified Git branch or tag";
+  await withSyntheticGit(
+    t,
+    [{}, { error: invalid }, {}, { error: invalid }, { error: invalid }, { error: other }, { throws: sync }, { throws: noCause }],
+    async (calls) => {
+      await validateUpdateRef(null, undefined);
+      await assert.rejects(validateUpdateRef("refs/heads/main", undefined), { message: "update --ref requires one Git source" });
+      await assert.rejects(validateUpdateRef("refs/heads/main", { ...directSource, kind: "local" }), {
+        message: "update --ref requires one Git source",
+      });
+      await validateUpdateRef("refs/heads/main", directSource);
+      await assert.rejects(validateUpdateRefSyntax("short"), { message });
+      await assert.rejects(validateUpdateRefSyntax("refs/heads/bad..ref"), { message });
+      await validateUpdateRefSyntax("refs/tags/good");
+      await assert.rejects(validateGitRef("bad"), { message: "command failed: git check-ref-format bad\nbad ref" });
+      await assert.rejects(validateGitRef("bad-custom", "custom message"), { message: "custom message" });
+      await assert.rejects(validateGitRef("other"), { message: "command failed: git check-ref-format other\nother failure", cause: other });
+      await assert.rejects(validateGitRef("sync"), (err: unknown) => err === sync);
+      await assert.rejects(validateGitRef("no-cause"), (err: unknown) => err === noCause);
+      assert.deepEqual(
+        calls,
+        ["refs/heads/main", "refs/heads/bad..ref", "refs/tags/good", "bad", "bad-custom", "other", "sync", "no-cause"].map((ref) => [
+          "check-ref-format",
+          ref,
+        ]),
+      );
+    },
+  );
+});
+
+test("source Git direct reads remote and tracking refs", async (t) => {
+  const url = "https://example.test/repo";
+  const ref = "refs/tags/v1";
+  const query = ["ls-remote", "--", url, ref, `${ref}^{}`];
+  await withSyntheticGit(
+    t,
+    [
+      { stdout: `base\t${ref}\npeeled\t${ref}^{}\nignored\trefs/tags/other\nmalformed\n` },
+      { stdout: "" },
+      { stdout: `peeled\t${ref}^{}\n` },
+      { error: new Error("remote failure") },
+      {},
+      { stdout: `  sha\t${ref} \n` },
+      {},
+      { stdout: "" },
+    ],
+    async (calls) => {
+      assert.deepEqual(await remoteRefs(url, ref), new Map([[ref, "peeled"]]));
+      assert.deepEqual(await remoteRefs(url, ref), new Map());
+      assert.deepEqual(await remoteRefs(url, ref), new Map());
+      await assert.rejects(remoteRefs(url, ref), { message: "cannot read remote tracking ref" });
+      assert.equal(await trackingRef(directSource), "sha");
+      await assert.rejects(trackingRef(directSource), { message: "remote tracking ref was not found" });
+      assert.deepEqual(calls, [query, query, query, query, ["check-ref-format", ref], query, ["check-ref-format", ref], query]);
+    },
+  );
 });
