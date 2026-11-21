@@ -1,7 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { BODY_TOKEN_LIMIT, MAX_QUERY_TERMS, buildFieldTokens, clampLimit, queryTerms, tokenize } from "../src/bm25.ts";
+import {
+  BODY_TOKEN_LIMIT,
+  FIELD_WEIGHTS,
+  MAX_QUERY_TERMS,
+  buildFieldTokens,
+  clampLimit,
+  hasRecommendationEvidence,
+  queryTerms,
+  tokenize,
+} from "../src/bm25.ts";
+
+test("ranking weights match the documented BM25 policy", () => {
+  assert.deepEqual(FIELD_WEIGHTS, { name: 3, description: 2, headings: 1, body: 0.3 });
+});
 
 test("Unicode terms normalize identically in the query and FTS vocabulary", () => {
   const terms = queryTerms("pieturzīmes हिन्दी 資料 TESTING");
@@ -25,8 +38,22 @@ test("tokenizer lowercases, splits on non-alphanumerics, drops stopwords", () =>
   assert.deepEqual(tokenize("The Quick-Brown FOX, and the dog!"), ["quick", "brown", "fox", "dog"]);
 });
 
+test("tokenizer drops common search filler words", () => {
+  const words = [
+    "Is in on at to of or if it be as by we do no so up an my me us",
+    "The and for with use used using when into from your that this you are not any its",
+    "How why what which will can get set via per out new one two all but",
+    "Has have had was were them then than over under before after",
+  ].join(" ");
+  assert.deepEqual(tokenize(words), []);
+});
+
 test("tokenizer keeps two-letter tech tokens and drops one-letter tokens", () => {
   assert.deepEqual(tokenize("go js x ci"), ["go", "js", "ci"]);
+});
+
+test("tokenizer drops a one-letter ASCII stem", () => {
+  assert.deepEqual(tokenize("AED"), []);
 });
 
 test("tokenizer maps e-final and y-final base words to the same stem as their inflections", () => {
@@ -60,7 +87,7 @@ test("note and noted keep a token that is not a stopword", () => {
 
 test("a stopword is dropped before stemming and again after it", () => {
   assert.deepEqual(tokenize("used using use"), [], "stopword before stemming");
-  assert.deepEqual(tokenize("uses gets setting"), [], "stem is a stopword: us, get, set");
+  assert.deepEqual(tokenize("uses gets setting usedness usee"), [], "stem is a stopword: us, get, set, used, use");
 });
 
 test("tokenizer stems -ing, -ed, -es, -s consistently", () => {
@@ -111,4 +138,30 @@ test("clampLimit defaults to 5 and clamps to 1..25", () => {
   assert.equal(clampLimit(-3), 1);
   assert.equal(clampLimit(10), 10);
   assert.equal(clampLimit("100"), 25);
+});
+
+test("a single query term requires a name match in the recommendation rule", () => {
+  const matched = { name: [], description: ["react"], headings: ["react"], body: ["react"] };
+  assert.equal(hasRecommendationEvidence(["react"], matched), false);
+  assert.equal(hasRecommendationEvidence(["react"], { ...matched, name: ["react"] }), true);
+});
+
+test("matching all query terms qualifies even when all matches are in the body", () => {
+  const terms = ["react", "docker", "sqlite", "git"];
+  const matched = { name: [], description: [], headings: [], body: terms };
+  assert.equal(hasRecommendationEvidence(terms, matched), true);
+  assert.equal(hasRecommendationEvidence(terms, { ...matched, body: terms.slice(0, 3) }), false);
+});
+
+test("a partial recommendation needs two prominent terms and one third of the query", () => {
+  const terms = ["react", "docker", "sqlite", "git", "json", "yaml", "node"];
+  const matched = { name: [], description: ["react"], headings: ["docker"], body: [] };
+  assert.equal(hasRecommendationEvidence(terms.slice(0, 5), matched), true);
+  assert.equal(hasRecommendationEvidence(terms.slice(0, 6), matched), true);
+  assert.equal(hasRecommendationEvidence(terms, matched), false);
+});
+
+test("duplicate field hits and body hits do not count as distinct prominent terms", () => {
+  const matched = { name: ["react"], description: ["react"], headings: [], body: ["docker"] };
+  assert.equal(hasRecommendationEvidence(["react", "docker", "sqlite"], matched), false);
 });
