@@ -66,6 +66,14 @@ if (process.argv.length > 2) {
       "test/migration-backup-publication.test.ts",
       "test/migration-backup.test.ts",
     ],
+    "migration-recovery": [
+      "--test-timeout=3000",
+      "--test-force-exit",
+      "--test-name-pattern='^migration recovery (record|journal|locked) direct '",
+      "test/migration-recovery-record.test.ts",
+      "test/migration-recovery-journal.test.ts",
+      "test/migration-recovery-locked.test.ts",
+    ],
     mcp: [
       "--test-name-pattern='^(MCP server direct |MCP smoke|MCP server version|a tool whose work rejects|MCP in-process|stdio source allowlists|stdio serves|hosted tools have|hosted: with no sources|hosted: find, load, read|hosted: a store failure|hosted source options|hosted file reads|CLI, stdio and hosted opt in)'",
       "test/mcp.test.ts",
@@ -80,6 +88,7 @@ if (process.argv.length > 2) {
     const stryker = new Stryker({
       mutate: [`src/${target}.ts`],
       ...(target === "migration-backup" ? { timeoutMS: 16_000 } : {}),
+      ...(target === "migration-recovery" ? { timeoutMS: 75_000 } : {}),
       commandRunner: {
         command: `node --import ./test/no-vendored-ripwire.ts --test --test-concurrency=1 ${testArgs.join(" ")}`,
       },

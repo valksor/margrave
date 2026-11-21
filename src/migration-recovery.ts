@@ -1,28 +1,63 @@
 import { spawn } from "node:child_process";
+import { once } from "node:events";
+import type { BigIntStats, Stats } from "node:fs";
 import { copyFile, lstat, mkdtemp, open, readFile, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { text } from "node:stream/consumers";
 import { checkLegacyJournalMode } from "./catalog-legacy.ts";
 import { WRITE_TIMEOUT_MS, readProbe } from "./catalog.ts";
 import type { MigrationRecord } from "./migration-backup.ts";
-import { execFileAsync, hashFile, hashLiveCatalog, migrationRecordSchema, sha256, verifyBackupFiles } from "./migration-backup.ts";
+import {
+  execFileAsync,
+  hashFile,
+  hashLiveCatalog,
+  migrationRecordSchema,
+  sameFileIdentity,
+  sha256,
+  verifyBackupFiles,
+} from "./migration-backup.ts";
 import { MargraveError, home, indexDbFile, isRecord, lstatIfExists, readIfExists, sourcesFile } from "./store-files.ts";
+function recoveryVerificationError(subject: string): MargraveError {
+  return new MargraveError(`cannot verify ${subject}. Restore a complete backup. See Upgrading in the README.`);
+}
+
+function invalidRecovery(store: string): MargraveError {
+  return recoveryVerificationError(`the interrupted Margrave upgrade at ${store}`);
+}
+
+function preparedMarker(raw: string | null): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(String(raw));
+    return isRecord(value) && value["kind"] === "margrave-store-migration" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function journalOwnerMatches(uid: number, owner: number, catalog: { uid: bigint }): boolean {
+  return uid === owner || BigInt(uid) === catalog.uid;
+}
+
+async function isVerifiedJournal(
+  stat: Stats,
+  expectedHash: string,
+  journal: string,
+  owner: number,
+  catalog: { uid: bigint },
+): Promise<boolean> {
+  return stat.isFile() && journalOwnerMatches(stat.uid, owner, catalog) && (await hashFile(journal)) === expectedHash;
+}
+
 async function extractBackupMember(archive: string, member: "./index.db" | "./sources.json", destination: string): Promise<void> {
   const output = await open(destination, "wx", 0o600);
   try {
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn("/usr/bin/tar", ["-xOf", archive, member], {
-        stdio: ["ignore", output.fd, "pipe"],
-        env: { ...process.env, TAR_OPTIONS: undefined },
-      });
-      let error = "";
-      child.stderr!.setEncoding("utf8");
-      child.stderr!.on("data", (chunk: string) => {
-        error += chunk;
-      });
-      child.on("error", reject);
-      child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(error))));
+    const child = spawn("/usr/bin/tar", ["-xOf", archive, member], {
+      stdio: ["ignore", output.fd, "pipe"],
+      env: { ...process.env, TAR_OPTIONS: undefined },
     });
+    const [[code], stderr] = await Promise.all([once(child, "close") as Promise<[number | null]>, text(child.stderr!)]);
+    if (code !== 0) throw new Error(stderr);
   } finally {
     await output.close();
   }
@@ -36,8 +71,7 @@ async function lockRecoveredCatalog(
 ): Promise<DatabaseSync> {
   const file = indexDbFile();
   const journal = `${file}-journal`;
-  const journalError = (): MargraveError =>
-    new MargraveError(`cannot verify the Margrave upgrade journal at ${journal}. Restore a complete backup. See Upgrading in the README.`);
+  const journalError = (): MargraveError => recoveryVerificationError(`the Margrave upgrade journal at ${journal}`);
   if ((await lstatIfExists(`${file}-wal`)) !== null || (await lstatIfExists(`${file}-shm`)) !== null) throw journalError();
   // The prepared record makes legacy writers reject application writes after they take the SQLite lock.
   // A legacy connection can still complete SQLite rollback while this connection waits for that lock.
@@ -53,14 +87,10 @@ async function lockRecoveredCatalog(
     const locked = await lstat(file, { bigint: true });
     const afterJournal = await lstatIfExists(journal);
     if (
-      locked.dev !== catalog.dev ||
-      locked.ino !== catalog.ino ||
+      !sameFileIdentity(locked, catalog) ||
       (await hashLiveCatalog(file)) !== expectedHash ||
       (afterJournal !== null &&
-        (journalHash === undefined ||
-          !afterJournal.isFile() ||
-          (afterJournal.uid !== owner && BigInt(afterJournal.uid) !== catalog.uid) ||
-          (await hashFile(journal)) !== journalHash))
+        (journalHash === undefined || !(await isVerifiedJournal(afterJournal, journalHash, journal, owner, catalog))))
     )
       throw journalError();
     if (readProbe(db, file).version !== 2) throw journalError();
@@ -77,23 +107,15 @@ async function validateMigrationJournal(
   catalog: { dev: bigint; ino: bigint; uid: bigint },
   record: MigrationRecord,
   owner: number,
-): Promise<{ journalHash?: string; db?: DatabaseSync }> {
-  const invalid = (): MargraveError =>
-    new MargraveError(
-      `cannot verify the interrupted Margrave upgrade at ${record.store}. Restore a complete backup. See Upgrading in the README.`,
-    );
-  const journalError = (): MargraveError =>
-    new MargraveError(
-      `cannot verify the Margrave upgrade journal at ${indexDbFile()}-journal. Restore a complete backup. See Upgrading in the README.`,
-    );
+): Promise<{ journalHash: string | undefined; db: DatabaseSync | undefined }> {
+  const journalError = (): MargraveError => recoveryVerificationError(`the Margrave upgrade journal at ${indexDbFile()}-journal`);
   let held: DatabaseSync | undefined;
   const journal = `${indexDbFile()}-journal`;
   const journalStat = await lstatIfExists(journal);
   let verifiedJournal: string | undefined;
   if (journalStat !== null) {
     try {
-      if (!journalStat.isFile() || journalStat.size < 28 || (journalStat.uid !== owner && BigInt(journalStat.uid) !== catalog.uid))
-        throw journalError();
+      if (!journalStat.isFile() || journalStat.size < 28 || !journalOwnerMatches(journalStat.uid, owner, catalog)) throw journalError();
       const headerFile = await open(journal, "r");
       const header = Buffer.alloc(28);
       try {
@@ -133,14 +155,10 @@ async function validateMigrationJournal(
       const currentHash = await hashFile(indexDbFile());
       const remaining = await lstatIfExists(journal);
       if (
-        current.dev !== catalog.dev ||
-        current.ino !== catalog.ino ||
+        !sameFileIdentity(current, catalog) ||
         (remaining === null
           ? currentHash !== record.indexSha256
-          : currentHash !== liveHash ||
-            !remaining.isFile() ||
-            (remaining.uid !== owner && BigInt(remaining.uid) !== catalog.uid) ||
-            (await hashFile(journal)) !== journalHash)
+          : currentHash !== liveHash || !(await isVerifiedJournal(remaining, journalHash, journal, owner, catalog)))
       )
         throw journalError();
       if (magic.equals(Buffer.from("d9d505f920a163d7", "hex"))) {
@@ -152,12 +170,11 @@ async function validateMigrationJournal(
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT" || (await lstatIfExists(journal)) !== null) throw err;
       const current = await lstat(indexDbFile(), { bigint: true });
-      if (current.dev !== catalog.dev || current.ino !== catalog.ino || (await hashFile(indexDbFile())) !== record.indexSha256)
-        throw journalError();
+      if (!sameFileIdentity(current, catalog) || (await hashFile(indexDbFile())) !== record.indexSha256) throw journalError();
       held = await lockRecoveredCatalog(catalog, record.indexSha256, undefined, owner);
     }
-  } else if ((await hashFile(indexDbFile())) !== record.indexSha256) throw invalid();
-  return { ...(verifiedJournal === undefined ? {} : { journalHash: verifiedJournal }), ...(held === undefined ? {} : { db: held }) };
+  } else if ((await hashFile(indexDbFile())) !== record.indexSha256) throw invalidRecovery(record.store);
+  return { journalHash: verifiedJournal, db: held };
 }
 
 /** Verify a prepared record and its archive before allowing SQLite to recover the live file. */
@@ -169,51 +186,47 @@ export async function recoverMigrationRecord(): Promise<{
 } | null> {
   const store = await realpath(home());
   const sourceStat = await lstatIfExists(sourcesFile());
-  if (sourceStat !== null && !sourceStat.isFile())
-    throw new MargraveError(
-      `cannot verify the interrupted Margrave upgrade at ${store}. Restore a complete backup. See Upgrading in the README.`,
-    );
+  if (sourceStat !== null && !sourceStat.isFile()) throw invalidRecovery(store);
   let raw: string | null;
   try {
     raw = await readIfExists(sourcesFile());
   } catch (err) {
     throw new MargraveError(`cannot upgrade the v0.2.1 catalog: ${err instanceof Error ? err.message : String(err)}`);
   }
-  if (raw === null) return null;
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (!isRecord(value) || value["kind"] !== "margrave-store-migration") return null;
-  const invalid = (): MargraveError =>
-    new MargraveError(
-      `cannot verify the interrupted Margrave upgrade at ${store}. Restore a complete backup. See Upgrading in the README.`,
-    );
+  const value = preparedMarker(raw);
+  if (value === null) return null;
+  const invalid = (): MargraveError => invalidRecovery(store);
+  const normalize = (err: unknown): MargraveError => (err instanceof MargraveError ? err : invalid());
   const parsed = migrationRecordSchema.safeParse(value);
   if (!parsed.success || parsed.data.store !== store) throw invalid();
   const record = parsed.data;
   const backup = path.join(path.dirname(store), record.backup);
-  let scratch: string | undefined;
-  let held: DatabaseSync | undefined;
+  let preflight: { catalog: BigIntStats; archive: string; checked: Awaited<ReturnType<typeof verifyBackupFiles>> };
   try {
     const catalog = await lstat(indexDbFile(), { bigint: true });
     if (!catalog.isFile() || catalog.dev.toString() !== record.catalogDevice || catalog.ino.toString() !== record.catalogInode)
       throw invalid();
     const archive = path.join(backup, "store.tar");
     const checked = await verifyBackupFiles(backup);
-    if (checked === null) throw invalid();
-    const { manifest, owner } = checked;
-    if (
-      manifest.store !== store ||
-      manifest.from !== 2 ||
-      manifest.indexSha256 !== record.indexSha256 ||
-      manifest.sourcesSha256 !== record.sourcesSha256
-    )
-      throw invalid();
-    const key = sha256(JSON.stringify([store, 2, record.indexSha256, record.sourcesSha256, manifest.inventorySha256]));
-    if (!record.backup.startsWith(`.margrave-upgrade-v2-${key}-`)) throw invalid();
+    preflight = { catalog, archive, checked };
+  } catch (err) {
+    throw normalize(err);
+  }
+  const { catalog, archive, checked } = preflight;
+  if (checked === null) throw invalid();
+  const { manifest, owner } = checked;
+  if (
+    manifest.store !== store ||
+    manifest.from !== 2 ||
+    manifest.indexSha256 !== record.indexSha256 ||
+    manifest.sourcesSha256 !== record.sourcesSha256
+  )
+    throw invalid();
+  const key = sha256(JSON.stringify([store, 2, record.indexSha256, record.sourcesSha256, manifest.inventorySha256]));
+  if (!record.backup.startsWith(`.margrave-upgrade-v2-${key}-`)) throw invalid();
+  let scratch: string | undefined;
+  let held: DatabaseSync | undefined;
+  try {
     scratch = await mkdtemp(path.join(path.dirname(store), ".margrave-upgrade-tmp-"));
     if (process.platform === "darwin") await execFileAsync("/bin/chmod", ["-N", scratch]);
     await extractBackupMember(archive, "./index.db", path.join(scratch, "original.db"));
@@ -239,8 +252,7 @@ export async function recoverMigrationRecord(): Promise<{
   } catch (err) {
     try {
       if (held?.isOpen === true) held.close();
-      if (err instanceof MargraveError) throw err;
-      throw invalid();
+      throw normalize(err);
     } finally {
       if (scratch !== undefined) await rm(scratch, { recursive: true, force: true });
     }

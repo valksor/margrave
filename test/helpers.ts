@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { constants } from "node:fs";
 import fsp, { chmod, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
@@ -19,6 +19,8 @@ import type { NewEntry, SourceRecord } from "../src/store.ts";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const CLI = path.join(ROOT, "src", "cli.ts");
+export const hasDirectoryAcl = (dir: string): boolean =>
+  execFileSync("/bin/ls", ["-lde", dir], { encoding: "utf8" }).trimEnd().includes("\n");
 /** Preload that hides a vendored ripwire from margrave. `runCli` puts it in front of every spawned CLI. */
 // No vendored ripwire for these tests: a developer's real vendor/ripwire must not change what they check.
 export const NO_VENDORED_PRELOAD = path.join(ROOT, "test", "no-vendored-ripwire.ts");

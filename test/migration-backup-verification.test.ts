@@ -18,7 +18,7 @@ import {
   sha256,
   verifyBackupFiles,
 } from "../src/migration-backup.ts";
-import { hostedUseHome, tmp } from "./helpers.ts";
+import { hasDirectoryAcl, hostedUseHome, tmp } from "./helpers.ts";
 
 const digest = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
 
@@ -390,21 +390,20 @@ test("migration backup verify direct clears staging ACLs only on macOS", { skip:
     const metadataStages = new Set<string>();
     const metadataAcls: boolean[] = [];
     const stageAcls: string[] = [];
-    const hasAcl = (dir: string): boolean => execFileSync("/bin/ls", ["-lde", dir], { encoding: "utf8" }).trimEnd().includes("\n");
     mock.method(fs, "mkdtemp", (async (...args: Parameters<typeof fs.mkdtemp>) => {
       const dir = await originalMkdtemp(...args);
       assert.equal(typeof dir, "string");
       assert.equal(path.dirname(dir), root);
       assert.match(path.basename(dir), /^\.margrave-upgrade-(?:tmp-|v2-)/u);
       execFileSync("/bin/chmod", ["+a", `user:${user} allow list,search,readattr`, dir]);
-      assert.equal(hasAcl(dir), true);
+      assert.equal(hasDirectoryAcl(dir), true);
       if (path.basename(dir).startsWith(".margrave-upgrade-tmp-")) metadataStages.add(dir);
       else stageAcls.push(dir);
       return dir;
     }) as typeof fs.mkdtemp);
     mock.method(fs, "open", (async (...args: Parameters<typeof fs.open>) => {
       if (typeof args[0] === "string" && path.basename(args[0]) === "directories.tar" && metadataStages.has(path.dirname(args[0]))) {
-        metadataAcls.push(hasAcl(path.dirname(args[0])));
+        metadataAcls.push(hasDirectoryAcl(path.dirname(args[0])));
       }
       return originalOpen(...args);
     }) as typeof fs.open);
@@ -414,7 +413,7 @@ test("migration backup verify direct clears staging ACLs only on macOS", { skip:
       const backup = await backupMigrationStore(2, []);
       assert.deepEqual(metadataAcls, [platform === "linux", platform === "linux"]);
       assert.deepEqual(stageAcls, [backup]);
-      assert.equal(hasAcl(backup), platform === "linux");
+      assert.equal(hasDirectoryAcl(backup), platform === "linux");
     } finally {
       Object.defineProperty(process, "platform", descriptor);
       mock.restoreAll();
