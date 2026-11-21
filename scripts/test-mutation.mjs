@@ -22,6 +22,10 @@ if (process.argv.length > 2) {
       "--test-name-pattern='^(store files |a missing sources|home|a sources.json that cannot be read|every field of a source record|atomic writes)'",
       "test/store-files.test.ts",
     ],
+    "source-git": [
+      "--test-name-pattern='^(source Git direct |spec parsing|owner/repo|a spec or --ref|a subpath segment|malformed specs|source ids|a git URL)'",
+      "test/source-git.test.ts",
+    ],
     hosted: ["test/hosted.test.ts"],
   };
 
