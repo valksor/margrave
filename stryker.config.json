@@ -1,0 +1,13 @@
+{
+  "mutate": ["src/bm25.ts"],
+  "commandRunner": {
+    "command": "node --import ./test/no-vendored-ripwire.ts --test test/bm25.test.ts"
+  },
+  "coverageAnalysis": "off",
+  "ignorePatterns": ["/*", "!/package.json", "!/src", "!/test", "/test/fixtures"],
+  "concurrency": 2,
+  "reporters": ["clear-text", "progress", "html"],
+  "htmlReporter": {
+    "fileName": "coverage/stryker.html"
+  }
+}

@@ -35,6 +35,7 @@
     "prepare": "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 lefthook install",
     "build": "tsrs && chmod +x dist/cli.js && node scripts/ensure-ripwire.mjs",
     "test": "c8 --check-coverage --100 --all --src src --include 'src/**/*.ts' --reporter=text --reporter=lcov node --import ./test/no-vendored-ripwire.ts --test test/",
+    "test:mutation": "stryker run",
     "lint": "oxlint --type-aware --type-check",
     "lint:fix": "oxlint --type-aware --fix",
     "format": "prettier --write .",
@@ -51,6 +52,7 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.4.0",
+    "@stryker-mutator/core": "10.1.1",
     "@types/node": "26.6.6",
     "c8": "12.0.0",
     "esbuild": "0.28.2",
