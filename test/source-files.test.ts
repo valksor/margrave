@@ -5,6 +5,9 @@ import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
+import type { TestContext } from "node:test";
+import { scanSource } from "../src/scan.ts";
+import { prepareSnapshot, syncSnapshot, toEntries } from "../src/source-files.ts";
 import { findSource, resolveScanRoot, sourceDir, installSource, localId, reindexAll, removeSource, updateSources } from "../src/sources.ts";
 import { UsageError } from "../src/store.ts";
 import type { SourceRecord } from "../src/store.ts";
@@ -33,6 +36,7 @@ import {
   names,
   sourceId,
   installLocalDir,
+  useHome,
 } from "./helpers.ts";
 
 /** Make the COMMIT statement of any DatabaseSync throw. Other statements run. */
@@ -810,4 +814,249 @@ test("concurrent Git updates retain the active and retired snapshots", async () 
   assert.ok(snapshots.includes(records[0]!.snapshot!));
   assert.ok(snapshots.length >= 2);
   assert.match(await readFile(path.join(env.home, "sources", id, "skills", "react-perf", "SKILL.md"), "utf8"), /concurrent update/u);
+});
+
+test("source files snapshot direct resolve scan roots and exact errors", async (t) => {
+  const fixture = await tmp("mg-direct-root-");
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const clone = path.join(fixture, "clone");
+  await mkdir(path.join(clone, "nested", "inner"), { recursive: true });
+  await mkdir(path.join(fixture, "outside"));
+  await writeFile(path.join(clone, "file"), "file");
+  await link(path.join(clone, "nested"), path.join(clone, "sibling"));
+  await link(path.join(fixture, "outside"), path.join(clone, "escape"));
+  const lexicalClone = `${clone}/.`;
+  assert.equal(await resolveScanRoot(lexicalClone, ""), lexicalClone);
+  assert.equal(await resolveScanRoot(clone, "nested/inner"), path.join(clone, "nested", "inner"));
+  assert.equal(await resolveScanRoot(clone, "sibling/inner"), path.join(clone, "sibling", "inner"));
+  for (const subpath of ["/nested", "nested/", "nested//inner", "nested/../inner"]) {
+    await assert.rejects(resolveScanRoot(clone, subpath), { message: `refused subpath "${subpath}"` });
+  }
+  await assert.rejects(resolveScanRoot(clone, "missing/member"), { message: 'subpath "missing/member" does not exist in the repository' });
+  await assert.rejects(resolveScanRoot(clone, "file"), { message: 'subpath "file" is not a directory' });
+  await assert.rejects(resolveScanRoot(clone, "escape"), { message: 'refused subpath "escape": resolves outside the clone' });
+});
+
+test("source files snapshot direct entries retain scanned values and input order", async (t) => {
+  const root = await tmp("mg-direct-entries-");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const alpha = await writeSkill(path.join(root, "one"), "alpha", "first description", "# First\n\nalpha words");
+  const beta = await writeSkill(path.join(root, "two", "nested"), "beta", "second description", "# Second\n\nbeta words");
+  await writeFile(path.join(alpha, "extra.txt"), "alpha manifest");
+  await writeFile(path.join(beta, "extra.txt"), "beta manifest");
+  const scanned = await scanSource(root, { followSymlinks: false });
+  assert.deepEqual(
+    scanned.skills.map((skill) => skill.name),
+    ["alpha", "beta"],
+  );
+  const skills = [...scanned.skills].reverse();
+  const inputs: string[] = [];
+  const entries = toEntries("owner__repo", skills, (dir) => {
+    inputs.push(dir);
+    return `mapped/${path.relative(root, dir)}`;
+  });
+  assert.deepEqual(inputs, [beta, alpha]);
+  assert.deepEqual(
+    entries,
+    skills.map((skill) => ({
+      id: `owner__repo/${skill.name}`,
+      name: skill.name,
+      description: skill.description,
+      source: "owner__repo",
+      dir: `mapped/${path.relative(root, skill.dir)}`,
+      revision: skill.revision,
+      manifest: JSON.stringify(skill.manifest),
+      frontmatter: skill.frontmatter,
+      tokens: skill.tokens,
+    })),
+  );
+  assert.deepEqual(
+    entries.map((entry) => entry.id),
+    ["owner__repo/beta", "owner__repo/alpha"],
+  );
+});
+
+test("source files snapshot direct prepare preserves clone contents and relative entries", async (t) => {
+  const fixture = await tmp("mg-direct-prepare-");
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const home = path.join(fixture, "home");
+  const clone = path.join(fixture, "clone");
+  await mkdir(home);
+  useHome(t, home);
+  const skill = await writeSkill(path.join(clone, "nested"), "alpha", "snapshot skill");
+  await writeFile(path.join(clone, "top.txt"), "top bytes");
+  await writeFile(path.join(fixture, "harmless.txt"), "link target");
+  await link(path.join(fixture, "harmless.txt"), path.join(clone, "link"));
+  const skillBytes = await readFile(path.join(skill, "SKILL.md"));
+  const skills = (await scanSource(clone, { followSymlinks: false })).skills;
+  const realClone = await fsp.realpath(clone);
+  const commit = "a".repeat(40);
+  const result = await prepareSnapshot("owner__repo", commit, clone, realClone, skills);
+  assert.match(result.snapshot, /^a{40}-[0-9a-f]{16}$/u);
+  assert.equal(result.destination, path.join(home, "snapshots", "owner__repo", result.snapshot));
+  await assert.rejects(stat(clone), { code: "ENOENT" });
+  assert.equal(await readFile(path.join(result.destination, "top.txt"), "utf8"), "top bytes");
+  assert.deepEqual(await readFile(path.join(result.destination, "nested", "alpha", "SKILL.md")), skillBytes);
+  assert.equal(await readlink(path.join(result.destination, "link")), path.join(fixture, "harmless.txt"));
+  assert.deepEqual(
+    result.entries.map((entry) => entry.dir),
+    [path.relative(realClone, skills[0]!.dir)],
+  );
+  assert.equal(result.entries[0]!.dir, path.join("nested", "alpha"));
+});
+
+async function directSnapshotFixture(t: TestContext) {
+  const fixture = await tmp("mg-direct-sync-");
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const home = path.join(fixture, "home");
+  const destination = path.join(home, "snapshots", "owner__repo", "snapshot");
+  const nested = path.join(destination, "nested");
+  await mkdir(nested, { recursive: true });
+  await writeFile(path.join(destination, "top.txt"), "top");
+  await writeFile(path.join(nested, "deep.txt"), "deep");
+  await writeFile(path.join(fixture, "harmless.txt"), "target");
+  await link(path.join(fixture, "harmless.txt"), path.join(destination, "link"));
+  useHome(t, home);
+  return { home, destination, nested };
+}
+
+function directObserveOpen(known: Set<string>, symlink: string, failAt?: string) {
+  const events: { action: string; file: string; flags?: unknown }[] = [];
+  const failure = new Error("fixture sync failure");
+  const original = fsp.open;
+  const spy = mock.method(fsp, "open", (async (file: string, flags: string) => {
+    events.push({ action: "open", file, flags });
+    if (file === symlink) throw new Error("snapshot symlink must not be opened");
+    assert.ok(known.has(file), `unexpected open: ${file}`);
+    const handle = await original(file, flags);
+    const sync = handle.sync.bind(handle);
+    const close = handle.close.bind(handle);
+    handle.sync = async () => {
+      events.push({ action: "sync", file });
+      if (file === failAt) throw failure;
+      await sync();
+    };
+    handle.close = async () => {
+      events.push({ action: "close", file });
+      await close();
+    };
+    return handle;
+  }) as typeof fsp.open);
+  syncBuiltinESMExports();
+  return {
+    events,
+    failure,
+    restore: () => {
+      spy.mock.restore();
+      syncBuiltinESMExports();
+    },
+  };
+}
+
+test("source files snapshot direct sync closes every handle in child-first order", async (t) => {
+  const { home, destination, nested } = await directSnapshotFixture(t);
+  const source = path.dirname(destination);
+  const snapshots = path.dirname(source);
+  const top = path.join(destination, "top.txt");
+  const deep = path.join(nested, "deep.txt");
+  const paths = [top, deep, nested, destination, source, snapshots, home];
+  const observed = directObserveOpen(new Set(paths), path.join(destination, "link"));
+  try {
+    await syncSnapshot(destination);
+    for (const file of paths) {
+      assert.deepEqual(
+        observed.events.filter((event) => event.file === file),
+        [
+          { action: "open", file, flags: "r" },
+          { action: "sync", file },
+          { action: "close", file },
+        ],
+      );
+    }
+    assert.equal(observed.events.length, paths.length * 3);
+    const eventIndex = (action: string, file: string) =>
+      observed.events.findIndex((event) => event.action === action && event.file === file);
+    for (const [child, parent] of [
+      [deep, nested],
+      [nested, destination],
+      [top, destination],
+      [destination, source],
+      [source, snapshots],
+      [snapshots, home],
+    ] as const) {
+      assert.ok(eventIndex("close", child) < eventIndex("open", parent), `${child} must finish before ${parent}`);
+    }
+  } finally {
+    observed.restore();
+  }
+});
+
+test("source files snapshot direct sync failures close handles and stop ancestor sync", async (t) => {
+  const { home, destination, nested } = await directSnapshotFixture(t);
+  const source = path.dirname(destination);
+  const snapshots = path.dirname(source);
+  const top = path.join(destination, "top.txt");
+  const deep = path.join(nested, "deep.txt");
+  const paths = [top, deep, nested, destination, source, snapshots, home];
+  for (const [failAt, later] of [
+    [deep, [nested, destination, source, snapshots, home]],
+    [nested, [destination, source, snapshots, home]],
+    [source, [snapshots, home]],
+  ] as const) {
+    const observed = directObserveOpen(new Set(paths), path.join(destination, "link"), failAt);
+    try {
+      await assert.rejects(syncSnapshot(destination), (error) => error === observed.failure);
+      assert.deepEqual(
+        observed.events.filter((event) => event.file === failAt),
+        [
+          { action: "open", file: failAt, flags: "r" },
+          { action: "sync", file: failAt },
+          { action: "close", file: failAt },
+        ],
+      );
+      for (const ancestor of later) assert.ok(!observed.events.some((event) => event.action === "sync" && event.file === ancestor));
+    } finally {
+      observed.restore();
+    }
+  }
+});
+
+test("source files snapshot direct prepare retains renamed destination after sync failure", async (t) => {
+  const fixture = await tmp("mg-direct-failed-prepare-");
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const home = path.join(fixture, "home");
+  const clone = path.join(fixture, "clone");
+  await mkdir(home);
+  await mkdir(clone);
+  useHome(t, home);
+  await writeFile(path.join(clone, "file.txt"), "original bytes");
+  const failure = new Error("fixture ancestor sync failure");
+  const original = fsp.open;
+  let closed = false;
+  const spy = mock.method(fsp, "open", (async (file: string, flags: string) => {
+    const handle = await original(file, flags);
+    if (file === home) {
+      const close = handle.close.bind(handle);
+      handle.sync = () => Promise.reject(failure);
+      handle.close = async () => {
+        closed = true;
+        await close();
+      };
+    }
+    return handle;
+  }) as typeof fsp.open);
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(prepareSnapshot("owner__repo", "b".repeat(40), clone, clone, []), (error) => error === failure);
+    assert.equal(closed, true);
+    await assert.rejects(stat(clone), { code: "ENOENT" });
+    const source = path.join(home, "snapshots", "owner__repo");
+    const snapshots = await readdir(source);
+    assert.equal(snapshots.length, 1);
+    assert.match(snapshots[0]!, /^b{40}-[0-9a-f]{16}$/u);
+    assert.equal(await readFile(path.join(source, snapshots[0]!, "file.txt"), "utf8"), "original bytes");
+  } finally {
+    spy.mock.restore();
+    syncBuiltinESMExports();
+  }
 });
