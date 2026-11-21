@@ -26,6 +26,7 @@ if (process.argv.length > 2) {
       "--test-name-pattern='^(source Git direct |spec parsing|owner/repo|a spec or --ref|a subpath segment|malformed specs|source ids|a git URL)'",
       "test/source-git.test.ts",
     ],
+    "mcp-skills": ["--test-timeout=2000", "--test-name-pattern='^MCP Skills direct '", "test/mcp.test.ts", "test/hosted.test.ts"],
     hosted: ["test/hosted.test.ts"],
   };
 
