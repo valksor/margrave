@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsp, { mkdir, writeFile } from "node:fs/promises";
@@ -13,7 +13,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { McpServer, SUPPORTED_PROTOCOL_VERSIONS, createMcpHandler } from "@modelcontextprotocol/server";
 import { attachMargraveSkills } from "../src/mcp-skills.ts";
 import { FIND_DESCRIPTION, LOAD_DESCRIPTION, READ_DESCRIPTION, SERVER_INSTRUCTIONS, createServer } from "../src/mcp.ts";
-import { CLI, fakeRipwire, newEntry, runCli, seedIndex, stdioTestEnv, tmp, writeSkill } from "./helpers.ts";
+import { CLI, NO_VENDORED_PRELOAD, fakeRipwire, newEntry, runCli, seedIndex, stdioTestEnv, tmp, useHome, writeSkill } from "./helpers.ts";
 
 interface ToolText {
   isError: boolean;
@@ -143,6 +143,151 @@ async function connectInMemory(t: { after: (fn: () => Promise<void>) => void }, 
   t.after(() => client.close());
   return client;
 }
+
+test("MCP server direct advertises metadata and validates revisions without a catalog", async (t) => {
+  const home = await tmp("mg-direct-empty-");
+  useHome(t, home);
+  t.after(() => fsp.rm(home, { recursive: true, force: true }));
+  const client = await connectInMemory(t);
+  assert.equal(client.getServerVersion()?.name, "margrave");
+  const find = (await client.listTools()).tools.find((tool) => tool.name === "find_skills");
+  const schema = find?.outputSchema as {
+    properties: {
+      results: { items: { properties: { scanVerdict: { enum: string[] }; matchedTerms: { properties: Record<string, unknown> } } } };
+    };
+  };
+  assert.deepEqual(schema.properties.results.items.properties.scanVerdict.enum, ["unknown", "clean", "warn", "critical", "failed"]);
+  assert.deepEqual(schema.properties.results.items.properties.matchedTerms.properties, {
+    name: { type: "array", items: { type: "string" } },
+    description: { type: "array", items: { type: "string" } },
+    headings: { type: "array", items: { type: "string" } },
+    body: { type: "array", items: { type: "string" } },
+  });
+  const hint = "no skill sources installed; run: margrave install <owner/repo|path>";
+  for (const [tool, args] of [
+    ["load_skill", { id: "missing" }],
+    ["read_skill_file", { id: "missing", path: "SKILL.md" }],
+  ] as const) {
+    assert.deepEqual(await call(client, tool, { ...args, revision: "bad" }), {
+      isError: true,
+      text: "revision must be a SHA-256 digest",
+    });
+    assert.deepEqual(await call(client, tool, args), { isError: true, text: hint });
+    assert.deepEqual(await call(client, tool, { ...args, revision: `sha256:${"0".repeat(64)}` }), {
+      isError: true,
+      text: "skill revision changed; search again",
+    });
+  }
+});
+
+test("MCP server direct distinguishes Git and local drift and closes the selected catalog", async (t) => {
+  const home = await tmp("mg-direct-drift-");
+  useHome(t, home);
+  t.after(async () => {
+    mock.restoreAll();
+    await fsp.rm(home, { recursive: true, force: true });
+  });
+  const commit = "a".repeat(40);
+  const snapshot = `${commit}-${"b".repeat(16)}`;
+  const localDir = path.join(home, "local", "local-skill");
+  const gitDir = path.join(home, "snapshots", "git-source", snapshot, "git-skill");
+  const fixtures = [
+    { source: "local-source", name: "local-skill", dir: localDir },
+    { source: "git-source", name: "git-skill", dir: gitDir },
+  ];
+  const rows: ReturnType<typeof newEntry>[] = [];
+  for (const fixture of fixtures) {
+    await mkdir(fixture.dir, { recursive: true });
+    const frontmatter = `name: ${fixture.name}\ndescription: valid`;
+    const bytes = Buffer.from(`---\n${frontmatter}\n---\noriginal\n`);
+    await writeFile(path.join(fixture.dir, "SKILL.md"), bytes);
+    const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+    rows.push({
+      ...newEntry(fixture.source, fixture.name),
+      dir: fixture.source === "git-source" ? fixture.name : fixture.dir,
+      revision: digest,
+      frontmatter,
+      manifest: JSON.stringify([{ path: "SKILL.md", digest, size: bytes.length }]),
+    });
+  }
+  await seedIndex(rows, [
+    {
+      id: "local-source",
+      kind: "local",
+      spec: path.dirname(localDir),
+      path: path.dirname(localDir),
+      subpath: "",
+      ref: null,
+      commit: null,
+      installedAt: "now",
+    },
+    {
+      id: "git-source",
+      kind: "git",
+      spec: "https://example.invalid/repo.git",
+      url: "https://example.invalid/repo.git",
+      subpath: "",
+      ref: "refs/heads/main",
+      commit,
+      snapshot,
+      installedAt: "now",
+    },
+  ]);
+  const client = await connectInMemory(t);
+  const prepare = mock.method(DatabaseSync.prototype, "prepare");
+  const close = mock.method(DatabaseSync.prototype, "close");
+  try {
+    for (const fixture of fixtures) {
+      prepare.mock.resetCalls();
+      close.mock.resetCalls();
+      const id = `${fixture.source}/${fixture.name}`;
+      assert.equal((await call(client, "load_skill", { id })).isError, false);
+      assert.deepEqual(await call(client, "read_skill_file", { id, path: "SKILL.md" }), {
+        isError: false,
+        text: `---\nname: ${fixture.name}\ndescription: valid\n---\noriginal\n`,
+      });
+      const connections = new Set(
+        prepare.mock.calls
+          .filter(({ arguments: [sql] }) => sql === "SELECT id, record FROM sources ORDER BY position")
+          .map((record) => record.this),
+      );
+      assert.equal(connections.size, 2);
+      for (const connection of connections) {
+        assert.ok(connection);
+        assert.equal(close.mock.calls.filter((record) => record.this === connection).length, 1);
+      }
+    }
+    prepare.mock.resetCalls();
+    close.mock.resetCalls();
+    assert.equal((await call(client, "load_skill", { id: "missing" })).isError, true);
+    const failed = prepare.mock.calls.find(({ arguments: [sql] }) => sql === "SELECT id, record FROM sources ORDER BY position")?.this;
+    assert.ok(failed);
+    assert.equal(close.mock.calls.filter((record) => record.this === failed).length, 1);
+  } finally {
+    prepare.mock.restore();
+    close.mock.restore();
+  }
+  const gitDrift = "skill files differ from the accepted revision. Ask the store operator to restore a verified copy";
+  const localDrift = "skill files changed since indexing; ask the store operator to run margrave reindex, then search again";
+  for (const [fixture, message] of [
+    [fixtures[1]!, gitDrift],
+    [fixtures[0]!, localDrift],
+  ] as const) {
+    await writeFile(path.join(fixture.dir, "SKILL.md"), `---\nname: ${fixture.name}\ndescription: valid\n---\nchanged!\n`);
+    const id = `${fixture.source}/${fixture.name}`;
+    for (const [tool, args] of [
+      ["load_skill", { id }],
+      ["read_skill_file", { id, path: "SKILL.md" }],
+    ] as const)
+      assert.deepEqual(await call(client, tool, args), { isError: true, text: message });
+  }
+  await fsp.rm(gitDir, { recursive: true });
+  for (const [tool, args] of [
+    ["load_skill", { id: "git-source/git-skill" }],
+    ["read_skill_file", { id: "git-source/git-skill", path: "SKILL.md" }],
+  ] as const)
+    assert.deepEqual(await call(client, tool, args), { isError: true, text: gitDrift });
+});
 
 function boundSkillsPages(t: { after: (fn: () => void) => void }, limit: number): { cursors: string[] } {
   const prepare = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare")?.value as DatabaseSync["prepare"];
@@ -330,14 +475,15 @@ test("stdio source allowlists scope search and both reads", async (t) => {
   const cli = await runCli(["find", "terraform modules", "--limit", "10"], { home, fakeBin, extra: { MARGRAVE_ALLOWED_SOURCES: "" } });
   assert.equal(cli.code, 0, cli.stderr);
   assert.ok(cli.stdout.includes(visible) && cli.stdout.includes(hidden));
-  for (const scope of [undefined, `${visible}, ${visible},missing`, ""]) {
+  for (const scope of [undefined, `${visible}, ${visible},missing`, "", "   "]) {
+    const emptyScope = scope?.trim() === "";
     const env: Record<string, string> = { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home };
     if (scope !== undefined) env["MARGRAVE_ALLOWED_SOURCES"] = scope;
     const client = new Client({ name: "scope-test", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
     await client.connect(new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp"], env: stdioTestEnv(env) }));
     t.after(() => client.close());
     const found = await call(client, "find_skills", { task: "terraform modules", limit: 1, explain: true });
-    if (scope === "") assert.match(found.text, /no match/u);
+    if (emptyScope) assert.match(found.text, /no match/u);
     else if (scope !== undefined) {
       assert.ok(found.text.includes(visible));
       assert.ok(!found.text.includes(hidden));
@@ -345,7 +491,7 @@ test("stdio source allowlists scope search and both reads", async (t) => {
     } else assert.ok(found.text.includes(hidden));
     const bare = await call(client, "load_skill", { id: "shared" });
     if (scope === undefined) assert.match(bare.text, /ambiguous/u);
-    else assert.equal(bare.isError, scope === "");
+    else assert.equal(bare.isError, emptyScope);
     const revision = /revision: (sha256:[0-9a-f]{64})/u.exec(
       (await call(client, "find_skills", { task: "shared", explain: true })).text,
     )?.[1];
@@ -361,12 +507,11 @@ test("stdio source allowlists scope search and both reads", async (t) => {
         if (scope !== undefined)
           assert.deepEqual(hiddenResult, { ...unknown, text: unknown.text.replace("unknown/shared", `${hidden}/shared`) });
         const visibleResult = await call(client, tool, args(`${visible}/shared`));
-        if (scope === "")
-          assert.deepEqual(visibleResult, { ...unknown, text: unknown.text.replace("unknown/shared", `${visible}/shared`) });
+        if (emptyScope) assert.deepEqual(visibleResult, { ...unknown, text: unknown.text.replace("unknown/shared", `${visible}/shared`) });
         else if (token === undefined || scope !== undefined) assert.equal(visibleResult.isError, false);
       }
     }
-    if (scope !== undefined && scope !== "" && revision !== undefined) {
+    if (scope !== undefined && !emptyScope && revision !== undefined) {
       await writeFile(path.join(dirs[0]!, "reference.txt"), "updated reference");
       const update = await runCli(["update", visible], { home, fakeBin });
       assert.equal(update.code, 0, update.stderr);
@@ -378,8 +523,14 @@ test("stdio source allowlists scope search and both reads", async (t) => {
     }
   }
   for (const value of [",", `${visible},`, "bad/id", " .,ok"]) {
-    const result = await runCli(["mcp"], { home, extra: { MARGRAVE_ALLOWED_SOURCES: value } });
-    assert.notEqual(result.code, 0);
+    const result = spawnSync(process.execPath, ["--import", NO_VENDORED_PRELOAD, CLI, "mcp"], {
+      input: "",
+      encoding: "utf8",
+      timeout: 2000,
+      env: stdioTestEnv({ PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home, MARGRAVE_ALLOWED_SOURCES: value }),
+    });
+    assert.notEqual(result.status, 0);
+    assert.equal(result.error, undefined);
     assert.match(result.stderr, /MARGRAVE_ALLOWED_SOURCES must contain comma-separated source IDs/u);
   }
 });
@@ -393,7 +544,7 @@ test("stdio serves a client that opens with an older protocol revision", { timeo
   assert.equal(installed.code, 0, installed.stderr);
   const id = `${/^installed (\S+)/u.exec(installed.stdout)?.[1] ?? ""}/legacy-fixture`;
   for (const protocolVersion of SUPPORTED_PROTOCOL_VERSIONS) {
-    const child = spawn(process.execPath, [CLI, "mcp"], { env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home } });
+    const child = spawn(process.execPath, [CLI, "mcp"], { env: stdioTestEnv({ PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home }) });
     const timeout = setTimeout(() => child.kill(), 10_000);
     const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
     let nextId = 0;

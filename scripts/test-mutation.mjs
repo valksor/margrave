@@ -32,6 +32,12 @@ if (process.argv.length > 2) {
       "--test-name-pattern='^(source Git direct |spec parsing|owner/repo|a spec or --ref|a subpath segment|malformed specs|source ids|a git URL)'",
       "test/source-git.test.ts",
     ],
+    mcp: [
+      "--test-name-pattern='^(MCP server direct |MCP smoke|MCP server version|a tool whose work rejects|MCP in-process|stdio source allowlists|stdio serves|hosted tools have|hosted: with no sources|hosted: find, load, read|hosted: a store failure|hosted source options|hosted file reads|CLI, stdio and hosted opt in)'",
+      "test/mcp.test.ts",
+      "test/hosted.test.ts",
+      "test/skills-sh.test.ts",
+    ],
     "mcp-skills": ["--test-timeout=2000", "--test-name-pattern='^MCP Skills direct '", "test/mcp.test.ts", "test/hosted.test.ts"],
     hosted: ["test/hosted.test.ts"],
   };
