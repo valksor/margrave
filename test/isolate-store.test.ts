@@ -22,9 +22,17 @@ test("test preload isolates the default store and replacement child environments
       delete process.env.MARGRAVE_HOME;
       const fallback = home();
       const replacement = stdioTestEnv({});
-      const child = execFileSync(process.execPath, ["--input-type=module", "-e", 'import { homedir } from "node:os"; import { home } from "./src/store-files.ts"; console.log(JSON.stringify({ os: homedir(), store: home(), profile: process.env.USERPROFILE }))'], { env: replacement, encoding: "utf8" });
+      const childProbe = \`
+        import { homedir } from "node:os";
+        import { home } from "./src/store-files.ts";
+        const initial = { os: homedir(), store: home(), profile: process.env.USERPROFILE, env: process.env.MARGRAVE_HOME };
+        delete process.env.MARGRAVE_HOME;
+        console.log(JSON.stringify({ initial, fallback: home() }));
+      \`;
+      const child = execFileSync(process.execPath, ["--input-type=module", "-e", childProbe], { env: replacement, encoding: "utf8" });
       const explicit = stdioTestEnv({ HOME: "wrong", USERPROFILE: "wrong", MARGRAVE_HOME: "fixture" });
-      console.log(JSON.stringify({ privateHome, initial, fallback, replacement, child: JSON.parse(child), explicit }));
+      const explicitChild = execFileSync(process.execPath, ["--input-type=module", "-e", childProbe], { env: explicit, encoding: "utf8" });
+      console.log(JSON.stringify({ privateHome, initial, fallback, replacement, child: JSON.parse(child), explicit, explicitChild: JSON.parse(explicitChild) }));
     `;
     const output = execFileSync(process.execPath, ["--import", "./test/isolate-store.ts", "--input-type=module", "-e", probe], {
       env: { ...process.env, HOME: canary, USERPROFILE: canary, MARGRAVE_HOME: store, __STRYKER_ACTIVE_MUTANT__: "fixture-mutant" },
@@ -35,20 +43,28 @@ test("test preload isolates the default store and replacement child environments
       initial: { os: string; store: string; env: string };
       fallback: string;
       replacement: Record<string, string>;
-      child: { os: string; store: string; profile: string };
+      child: { initial: { os: string; store: string; profile: string; env?: string }; fallback: string };
       explicit: Record<string, string>;
+      explicitChild: { initial: { os: string; store: string; profile: string; env: string }; fallback: string };
     };
     const privateStore = path.join(result.privateHome, ".margrave");
     assert.notEqual(result.privateHome, canary);
     assert.deepEqual(result.initial, { os: result.privateHome, store: privateStore, env: privateStore });
     assert.equal(result.fallback, privateStore);
-    assert.deepEqual(result.child, { os: result.privateHome, store: privateStore, profile: result.privateHome });
+    assert.deepEqual(result.child, {
+      initial: { os: result.privateHome, store: privateStore, profile: result.privateHome },
+      fallback: privateStore,
+    });
     assert.equal(result.replacement["__STRYKER_ACTIVE_MUTANT__"], "fixture-mutant");
     assert.deepEqual(result.explicit, {
       HOME: result.privateHome,
       USERPROFILE: result.privateHome,
       MARGRAVE_HOME: "fixture",
       __STRYKER_ACTIVE_MUTANT__: "fixture-mutant",
+    });
+    assert.deepEqual(result.explicitChild, {
+      initial: { os: result.privateHome, store: path.resolve("fixture"), profile: result.privateHome, env: "fixture" },
+      fallback: privateStore,
     });
     assert.equal(existsSync(result.privateHome), false);
     assert.deepEqual(readdirSync(store), ["index.db"]);

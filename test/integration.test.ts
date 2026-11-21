@@ -15,6 +15,7 @@ import {
   makeRepo,
   runCli,
   skillMd,
+  stdioTestEnv,
   tmp,
   writeCatalogRecords,
   writeSkill,
@@ -1077,7 +1078,7 @@ test("a closed stdout pipe is not an error: `margrave load` piped into a reader 
   const seen = preloadArgs(`process.stdout.prependListener("error", (e) => process.stderr.write("stdout error: " + e.code + ";"));`);
   // 3 MB cannot fit in the pipe, so the child is still writing when the reader closes it.
   const child = spawn(process.execPath, [...seen, CLI, "load", `${id}/big`], {
-    env: { ...process.env, MARGRAVE_HOME: env.home },
+    env: stdioTestEnv({ ...process.env, MARGRAVE_HOME: env.home }),
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stderr = "";

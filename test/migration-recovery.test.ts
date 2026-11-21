@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { CLI, copyLegacyStoreFixture, indexRows, runCli, tmp } from "./helpers.ts";
+import { CLI, copyLegacyStoreFixture, indexRows, runCli, stdioTestEnv, tmp } from "./helpers.ts";
 
 test("migration retries after the prepared record is written", async () => {
   const home = path.join(await tmp(), "store");
@@ -96,7 +96,7 @@ const exec = DatabaseSync.prototype.exec;
 DatabaseSync.prototype.exec = function(sql) { if (sql.startsWith("CREATE TABLE sources")) { process.send("locked"); readFileSync(${JSON.stringify(fifo)}); } return exec.call(this, sql); };\n`,
   );
   const retry = spawn(process.execPath, ["--import", barrier, CLI, "migrate"], {
-    env: { ...process.env, MARGRAVE_HOME: home },
+    env: stdioTestEnv({ ...process.env, MARGRAVE_HOME: home }),
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
   let stderr = "";
@@ -413,7 +413,7 @@ const exec = DatabaseSync.prototype.exec;
 DatabaseSync.prototype.exec = function(sql) { if (point === "exclusive" && sql === "BEGIN EXCLUSIVE") { process.send("paused"); readFileSync(${JSON.stringify(fifo)}); } return exec.call(this, sql); };\n`,
     );
     const retry = spawn(process.execPath, ["--import", barrier, CLI, "migrate"], {
-      env: { ...process.env, MARGRAVE_HOME: home },
+      env: stdioTestEnv({ ...process.env, MARGRAVE_HOME: home }),
       stdio: ["pipe", "pipe", "pipe", "ipc"],
     });
     let stderr = "";

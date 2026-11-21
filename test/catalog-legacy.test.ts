@@ -18,7 +18,18 @@ import {
   probeMigrationCatalog,
 } from "../src/catalog-legacy.ts";
 import { MargraveError } from "../src/store-files.ts";
-import { CLI, copyLegacyStoreFixture, catalogRecords, fakeRipwire, indexRows, makeRepo, runCli, tmp, useHome } from "./helpers.ts";
+import {
+  CLI,
+  copyLegacyStoreFixture,
+  catalogRecords,
+  fakeRipwire,
+  indexRows,
+  makeRepo,
+  runCli,
+  stdioTestEnv,
+  tmp,
+  useHome,
+} from "./helpers.ts";
 
 async function directHome(t: { after: (fn: () => void | Promise<void>) => void }): Promise<string> {
   const parent = await tmp();
@@ -735,7 +746,7 @@ const exec = DatabaseSync.prototype.exec;
 DatabaseSync.prototype.exec = function(sql) { try { return exec.call(this, sql); } catch (err) { if (sql === "BEGIN IMMEDIATE" && this.location("main") === ${JSON.stringify(path.join(home, "index.db"))} && err.errcode === 5) process.send("busy"); throw err; } };\n`,
       );
       const migration = spawn(process.execPath, ["--import", preload, CLI, "migrate"], {
-        env: { ...process.env, MARGRAVE_HOME: home },
+        env: stdioTestEnv({ ...process.env, MARGRAVE_HOME: home }),
         stdio: ["ignore", "pipe", "pipe", "ipc"],
       });
       let stderr = "";
@@ -795,7 +806,7 @@ fs.rename = async function(from, to) { if (to === ${JSON.stringify(path.join(hom
 syncBuiltinESMExports();\n`,
   );
   const migration = spawn(process.execPath, ["--import", preload, CLI, "migrate"], {
-    env: { ...process.env, MARGRAVE_HOME: home },
+    env: stdioTestEnv({ ...process.env, MARGRAVE_HOME: home }),
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
   let stderr = "";
@@ -854,7 +865,7 @@ const exec = DatabaseSync.prototype.exec;
 DatabaseSync.prototype.exec = function(sql) { if (sql === "PRAGMA user_version = 4; COMMIT") process.send({ phase: "commit", timeout: Number(this.prepare("PRAGMA busy_timeout").get().timeout) }); return exec.call(this, sql); };\n`,
   );
   const migration = spawn(process.execPath, ["--import", preload, CLI, "migrate"], {
-    env: { ...process.env, MARGRAVE_HOME: home },
+    env: stdioTestEnv({ ...process.env, MARGRAVE_HOME: home }),
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
   let stderr = "";
