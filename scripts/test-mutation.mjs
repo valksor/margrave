@@ -64,7 +64,7 @@ const targets = {
   "migration-backup": [
     "--import ./test/bounded-metadata-reads.ts",
     "--test-timeout=3000",
-    "--test-name-pattern='^(migration backup (verify|metadata|publication) direct |legacy backup validates selected file types|backup cleanup handles non-Error failures|backup rejects a snapshot changed during archiving|backup does not release the catalog lock|backup and record hashing preserve the catalog|prepared record refuses backup files linked|backup reports an unreadable catalog|migration backup and recovery clear staging directory ACLs on macOS|backup verification checks extended directory ACLs on macOS)'",
+    "--test-name-pattern='^(migration backup (verify|metadata|publication) direct |migration backup verifier |legacy backup validates selected file types|backup cleanup handles non-Error failures|backup rejects a snapshot changed during archiving|backup does not release the catalog lock|backup and record hashing preserve the catalog|prepared record refuses backup files linked|backup reports an unreadable catalog|migration backup and recovery clear staging directory ACLs on macOS|backup verification checks extended directory ACLs on macOS)'",
     "test/migration-backup-verification.test.ts",
     "test/migration-backup-acl.test.ts",
     "test/migration-backup-publication.test.ts",
