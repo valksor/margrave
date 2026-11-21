@@ -12,6 +12,7 @@ if (process.argv.length > 2) {
     "safety-runner": ["test/safety-runner.test.ts", "test/no-vendored-ripwire.test.ts"],
     safety: ["test/safety.test.ts"],
     search: ["test/skills-sh.test.ts"],
+    skills: ["test/index.test.ts", "test/guard.test.ts", "test/text.test.ts"],
     hosted: ["test/hosted.test.ts"],
   };
 
