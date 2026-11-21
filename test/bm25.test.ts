@@ -88,6 +88,7 @@ test("note and noted keep a token that is not a stopword", () => {
 test("a stopword is dropped before stemming and again after it", () => {
   assert.deepEqual(tokenize("used using use"), [], "stopword before stemming");
   assert.deepEqual(tokenize("uses gets setting usedness usee"), [], "stem is a stopword: us, get, set, used, use");
+  assert.deepEqual(tokenize("usingness itsness"), [], "stem is a stopword: using, its");
 });
 
 test("tokenizer stems -ing, -ed, -es, -s consistently", () => {

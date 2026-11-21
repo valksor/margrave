@@ -6,6 +6,7 @@
   "coverageAnalysis": "off",
   "ignorePatterns": ["/*", "!/package.json", "!/src", "!/test", "/test/fixtures"],
   "concurrency": 2,
+  "thresholds": { "high": 100, "low": 100, "break": 100 },
   "reporters": ["clear-text", "progress", "html"],
   "htmlReporter": {
     "fileName": "coverage/stryker.html"

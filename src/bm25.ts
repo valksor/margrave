@@ -72,7 +72,6 @@ const STOPWORDS = new Set([
   "per",
   "out",
   "new",
-  "one",
   "two",
   "all",
   "but",
@@ -97,7 +96,7 @@ function* tokens(input: string): Generator<string> {
     .toLowerCase()
     .matchAll(/[\p{L}\p{N}][\p{L}\p{N}\p{M}]*/gu)) {
     const ascii = /^[a-z0-9]+$/u.test(raw);
-    if ((ascii && raw.length < 2) || STOPWORDS.has(raw)) continue;
+    if (STOPWORDS.has(raw)) continue;
     const word = ascii ? stemmer(raw) : raw;
     if ((ascii && word.length < 2) || STOPWORDS.has(word)) continue;
     yield word;
