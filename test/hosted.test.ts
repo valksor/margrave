@@ -30,6 +30,7 @@ import {
   HOSTED_SERVER_ERROR,
   createServer,
 } from "../src/mcp.ts";
+import type { ServerOptions } from "../src/mcp.ts";
 
 const examplePath = "../examples/hosted-mcp.mjs";
 
@@ -354,11 +355,20 @@ test("hosted: a hot journal returns the generic error and logs the unfinished-wr
 });
 
 test("hosted: only POST is served", async () => {
+  let optionsRead = false;
+  const options: ServerOptions = {
+    get allowedSources() {
+      optionsRead = true;
+      return [];
+    },
+  };
   for (const method of ["GET", "DELETE"]) {
-    const res = await handleHostedMcp(new Request("http://test/mcp", { method }));
+    const res = await handleHostedMcp(new Request("http://test/mcp", { method }), options);
     assert.equal(res.status, 405, method);
     assert.equal(res.headers.get("Allow"), "POST", method);
+    assert.equal(res.headers.get("Content-Type"), "application/json", method);
     assert.deepEqual(await res.json(), { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null }, method);
+    assert.equal(optionsRead, false, method);
   }
 });
 

@@ -17,6 +17,6 @@ export async function handleHostedMcp(req: Request, options: ServerOptions = {})
     });
   }
   const server = createHostedServer(options);
-  // Clients that still open with an older protocol revision are served statelessly, one request at a time.
-  return createMcpHandler(() => server, { legacy: "stateless" }).fetch(req);
+  // The SDK default serves older protocol revisions statelessly, one request at a time.
+  return createMcpHandler(() => server).fetch(req);
 }
