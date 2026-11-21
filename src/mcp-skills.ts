@@ -5,6 +5,7 @@ import { parseFrontmatter } from "./scan.ts";
 import { loadContext, readSelectedFileBytes, resolveSkill } from "./skills.ts";
 import type { Context } from "./skills.ts";
 import { RequestError } from "./store.ts";
+import { isRecord } from "./store-files.ts";
 import type { IndexEntry } from "./store.ts";
 import type { ManifestEntry } from "./scan.ts";
 
@@ -18,20 +19,21 @@ function uri(entry: IndexEntry, file: string): string {
 
 function entrySkill(entry: IndexEntry, limit?: number): Skill | undefined {
   let fm: unknown;
+  const frontmatter = entry.frontmatter;
   try {
-    fm = parseFrontmatter(entry.frontmatter);
+    fm = parseFrontmatter(frontmatter);
     JSON.stringify(fm, (_key, value: unknown) => {
-      if (typeof value === "number" && !Number.isFinite(value)) throw new TypeError("not JSON");
+      if (typeof value === "number" && !Number.isFinite(value)) throw new TypeError();
       return value;
     });
   } catch {
     return undefined;
   }
-  if (typeof fm !== "object" || fm === null || Array.isArray(fm)) return undefined;
-  const fields = fm as Record<string, unknown>;
+  if (!isRecord(fm)) return undefined;
+  const fields = fm;
   const name = fields["name"];
   const description = fields["description"];
-  if (typeof name !== "string" || name !== entry.name || name.length > 64 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(name)) return undefined;
+  if (name !== entry.name || name.length > 64 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(name)) return undefined;
   if (typeof description !== "string" || description.length === 0 || Array.from(description).length > 1024) return undefined;
   if (
     fields["compatibility"] !== undefined &&
@@ -40,10 +42,7 @@ function entrySkill(entry: IndexEntry, limit?: number): Skill | undefined {
     return undefined;
   if (
     fields["metadata"] !== undefined &&
-    (typeof fields["metadata"] !== "object" ||
-      fields["metadata"] === null ||
-      Array.isArray(fields["metadata"]) ||
-      Object.values(fields["metadata"]).some((v) => typeof v !== "string"))
+    (!isRecord(fields["metadata"]) || Object.values(fields["metadata"]).some((v) => typeof v !== "string"))
   )
     return undefined;
   const manifest = JSON.parse(entry.manifest) as ManifestEntry[];
@@ -61,15 +60,18 @@ function decodeUri(input: string): { source: string; revision: string; name: str
   if (!input.startsWith(prefix)) return undefined;
   const raw = input.slice(prefix.length).split("/");
   if (raw.length < 4) return undefined;
+  let parts: string[];
+  let encodedParts: string[];
   try {
-    const parts = raw.map(decodeURIComponent);
-    if (parts.some((part, i) => part === "" || part === "." || part === ".." || encodeURIComponent(part) !== raw[i])) return undefined;
-    const [source, revision, name, ...file] = parts as [string, string, string, ...string[]];
-    if (!/^sha256:[0-9a-f]{64}$/u.test(revision)) return undefined;
-    return { source, revision, name, file: file.join("/") };
+    parts = raw.map(decodeURIComponent);
+    encodedParts = parts.map(encodeURIComponent);
   } catch {
     return undefined;
   }
+  if (parts.some((part, i) => part === "" || part === "." || part === ".." || encodedParts[i] !== raw[i])) return undefined;
+  const [source, revision, name, ...file] = parts as [string, string, string, ...string[]];
+  if (!/^sha256:[0-9a-f]{64}$/u.test(revision)) return undefined;
+  return { source, revision, name, file: file.join("/") };
 }
 
 function selected(
@@ -120,8 +122,9 @@ export function attachMargraveSkills(
         const found: { id: string; skill: Skill }[] = [];
         if (ctx !== null) {
           const scopeJson = scope === undefined ? null : JSON.stringify([...scope]);
-          while (found.length < 51) {
-            const rows = ctx.db
+          let rows: IndexEntry[];
+          do {
+            rows = ctx.db
               .prepare(
                 `SELECT ${columns} FROM skills WHERE id > ? AND (? IS NULL OR source IN (SELECT value FROM json_each(?))) ORDER BY id COLLATE BINARY LIMIT 51`,
               )
@@ -132,8 +135,7 @@ export function attachMargraveSkills(
               if (skill !== undefined) found.push({ id: row.id, skill });
               if (found.length === 51) break;
             }
-            if (rows.length < 51 || found.length === 51) break;
-          }
+          } while (rows.length === 51 && found.length !== 51);
         }
         const page = found.slice(0, 50);
         return {
@@ -170,7 +172,7 @@ export function attachMargraveSkills(
     if (resource === undefined) throw new ResourceNotFoundError(request.params.uri);
     const content = "text" in resource ? { text: resource.text } : { blob: Buffer.from(resource.bytes).toString("base64") };
     return {
-      contents: [{ uri: request.params.uri, ...content, ...(resource.mimeType === undefined ? {} : { mimeType: resource.mimeType }) }],
+      contents: [{ uri: request.params.uri, ...content, mimeType: resource.mimeType }],
     };
   });
 }

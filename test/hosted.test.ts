@@ -8,20 +8,26 @@ import {
   git,
   leaveHotJournal,
   makeRepo,
+  newEntry,
   runCli,
+  seedIndex,
   skillMd,
   stdioTestEnv,
   tmp,
   writeSkill,
 } from "./helpers.ts";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmod, cp, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { SUPPORTED_PROTOCOL_VERSIONS, createMcpHandler } from "@modelcontextprotocol/server";
+import { McpServer, SUPPORTED_PROTOCOL_VERSIONS, createMcpHandler } from "@modelcontextprotocol/server";
+import type { ReadResourceRequest, ServerContext } from "@modelcontextprotocol/server";
 import { handleHostedMcp } from "../src/hosted.ts";
+import { attachMargraveSkills } from "../src/mcp-skills.ts";
 import {
   FIND_DESCRIPTION,
   HOSTED_LOAD_DESCRIPTION,
@@ -33,6 +39,177 @@ import {
 import type { ServerOptions } from "../src/mcp.ts";
 
 const examplePath = "../examples/hosted-mcp.mjs";
+
+test("MCP Skills direct hosted scopes reads and distinguishes local and Git drift", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  const home = await useHome(t);
+  const commit = "a".repeat(40);
+  const snapshot = `${commit}-${"b".repeat(16)}`;
+  const localDir = path.join(home, "local", "local-skill");
+  const gitDir = path.join(home, "snapshots", "git-source", snapshot, "git-skill");
+  const otherDir = path.join(home, "other", "other-skill");
+  const fixtures = [
+    { source: "other-source", name: "other-skill", dir: otherDir },
+    { source: "local-source", name: "local-skill", dir: localDir },
+    { source: "git-source", name: "git-skill", dir: gitDir },
+  ];
+  const rows: ReturnType<typeof newEntry>[] = [];
+  for (const fixture of fixtures) {
+    await mkdir(fixture.dir, { recursive: true });
+    const frontmatter = `name: ${fixture.name}\ndescription: valid`;
+    const bytes = Buffer.from(`---\n${frontmatter}\n---\noriginal\n`);
+    await writeFile(path.join(fixture.dir, "SKILL.md"), bytes);
+    const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+    rows.push({
+      ...newEntry(fixture.source, fixture.name),
+      dir: fixture.source === "git-source" ? "git-skill" : fixture.dir,
+      revision: digest,
+      frontmatter,
+      manifest: JSON.stringify([{ path: "SKILL.md", digest, size: bytes.length }]),
+    });
+  }
+  await seedIndex(rows, [
+    {
+      id: "other-source",
+      kind: "local",
+      spec: path.dirname(otherDir),
+      path: path.dirname(otherDir),
+      subpath: "",
+      ref: null,
+      commit: null,
+      installedAt: "now",
+    },
+    {
+      id: "local-source",
+      kind: "local",
+      spec: path.dirname(localDir),
+      path: path.dirname(localDir),
+      subpath: "",
+      ref: null,
+      commit: null,
+      installedAt: "now",
+    },
+    {
+      id: "git-source",
+      kind: "git",
+      spec: "https://example.invalid/repo.git",
+      url: "https://example.invalid/repo.git",
+      subpath: "",
+      ref: "refs/heads/main",
+      commit,
+      snapshot,
+      installedAt: "now",
+    },
+  ]);
+  const uri = (index: number): string => {
+    const row = rows[index]!;
+    return `skill://margrave/${row.source}/${encodeURIComponent(row.revision)}/${row.name}/SKILL.md`;
+  };
+  const localUri = uri(1);
+  const gitUri = uri(2);
+  const scoped = await connectHosted(t, ["local-source"]);
+  const both = await connectHosted(t, ["local-source", "git-source"]);
+  const skills = new SkillsClient(scoped);
+  const prepare = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare")?.value as DatabaseSync["prepare"];
+  const selectedSql =
+    "SELECT id, name, description, source, dir, hash AS revision, manifest, frontmatter FROM skills WHERE id = ? AND source = ?";
+  let selectedQueries = 0;
+  const spy = mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql === selectedSql) selectedQueries++;
+    return prepare.call(this, sql);
+  });
+  t.after(() => spy.mock.restore());
+  assert.equal((await skills.get(localUri)).skill.uri, localUri);
+  assert.deepEqual((await scoped.readResource({ uri: localUri })).contents, [
+    { uri: localUri, mimeType: "text/markdown", text: "---\nname: local-skill\ndescription: valid\n---\noriginal\n" },
+  ]);
+  assert.deepEqual((await both.readResource({ uri: gitUri })).contents, [
+    { uri: gitUri, mimeType: "text/markdown", text: "---\nname: git-skill\ndescription: valid\n---\noriginal\n" },
+  ]);
+  assert.ok(selectedQueries > 0);
+  const before = selectedQueries;
+  await assert.rejects(skills.get(gitUri), { code: -32602, message: `No skill is served at ${gitUri}` });
+  await assert.rejects(scoped.readResource({ uri: gitUri }), { code: -32602, message: `Resource not found: ${gitUri}` });
+  assert.equal(selectedQueries, before);
+  for (const [dir, resource, message] of [
+    [localDir, localUri, "skill files changed since indexing; ask the store operator to run margrave reindex, then search again"],
+    [gitDir, gitUri, "skill files differ from the accepted revision. Ask the store operator to restore a verified copy"],
+  ] as const) {
+    const name = dir === localDir ? "local-skill" : "git-skill";
+    await writeFile(path.join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: valid\n---\nchanged!\n`);
+    await assert.rejects(both.readResource({ uri: resource }), { code: -32602, message });
+  }
+  await rm(gitDir, { recursive: true });
+  await assert.rejects(both.readResource({ uri: gitUri }), {
+    code: -32602,
+    message: "skill files differ from the accepted revision. Ask the store operator to restore a verified copy",
+  });
+});
+
+test("MCP Skills direct sanitizes catalog errors and preserves request errors", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  const home = await useHome(t);
+  const dir = path.join(home, "fixture");
+  await mkdir(dir);
+  const frontmatter = "name: example\ndescription: valid";
+  const bytes = Buffer.from(`---\n${frontmatter}\n---\nbody\n`);
+  await writeFile(path.join(dir, "SKILL.md"), bytes);
+  const revision = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  await seedIndex([
+    {
+      ...newEntry("source", "example"),
+      dir,
+      revision,
+      frontmatter,
+      manifest: JSON.stringify([{ path: "SKILL.md", digest: revision, size: bytes.length }]),
+    },
+  ]);
+  const server = new McpServer({ name: "direct-test", version: "1" });
+  type ReadHandler = (request: ReadResourceRequest, context: ServerContext) => Promise<unknown>;
+  let readHandler: ReadHandler | undefined;
+  const protocol = server.server as unknown as { setRequestHandler: (...args: unknown[]) => void };
+  const register = protocol.setRequestHandler;
+  const registration = mock.method(protocol, "setRequestHandler", function (this: typeof protocol, ...args: unknown[]) {
+    if (args[0] === "resources/read") readHandler = args[1] as ReadHandler;
+    return register.apply(this, args);
+  });
+  attachMargraveSkills(server, undefined, undefined, () => "safe catalog failure");
+  registration.mock.restore();
+  assert.ok(readHandler);
+  const handler = createMcpHandler(
+    () => {
+      const instance = new McpServer({ name: "direct-test", version: "1" });
+      attachMargraveSkills(instance, undefined, undefined, () => "safe catalog failure");
+      return instance;
+    },
+    { legacy: "reject" },
+  );
+  const client = new Client({ name: "direct-test", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL("http://test/mcp"), { fetch: (url, init) => handler.fetch(new Request(url, init)) }),
+  );
+  t.after(() => client.close());
+  const uri = `skill://margrave/source/${encodeURIComponent(revision)}/example/SKILL.md`;
+  const original = new Error("private catalog failure");
+  const prepare = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare")?.value as DatabaseSync["prepare"];
+  const fault = mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql === "SELECT id, record FROM sources ORDER BY position") throw original;
+    return prepare.call(this, sql);
+  });
+  t.after(() => fault.mock.restore());
+  await assert.rejects(
+    readHandler({ method: "resources/read", params: { uri } }, {} as ServerContext),
+    (err: unknown) => err instanceof Error && err.message === "safe catalog failure" && err.cause === original,
+  );
+  await assert.rejects(client.readResource({ uri }), /safe catalog failure/u);
+  fault.mock.restore();
+  const skills = new SkillsClient(client);
+  await assert.rejects(skills.list({ cursor: "!" }), { code: -32602, message: "invalid cursor" });
+  const stale = uri.replace(encodeURIComponent(revision), encodeURIComponent(`sha256:${"0".repeat(64)}`));
+  for (const request of [() => skills.get(stale), () => client.readResource({ uri: stale })]) {
+    await assert.rejects(request(), { code: -32602, message: "skill revision changed; search again" });
+  }
+});
 
 /** A client of the stdio server's createServer(), using a stateless handler. */
 async function connectLocal(t: { after: (fn: () => Promise<void>) => void }): Promise<Client> {

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsp, { mkdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
@@ -9,7 +10,8 @@ import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { SUPPORTED_PROTOCOL_VERSIONS, createMcpHandler } from "@modelcontextprotocol/server";
+import { McpServer, SUPPORTED_PROTOCOL_VERSIONS, createMcpHandler } from "@modelcontextprotocol/server";
+import { attachMargraveSkills } from "../src/mcp-skills.ts";
 import { FIND_DESCRIPTION, LOAD_DESCRIPTION, READ_DESCRIPTION, SERVER_INSTRUCTIONS, createServer } from "../src/mcp.ts";
 import { CLI, fakeRipwire, newEntry, runCli, seedIndex, stdioTestEnv, tmp, writeSkill } from "./helpers.ts";
 
@@ -132,14 +134,37 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
 });
 
 /** Run createServer() in this process through a stateless handler. */
-async function connectInMemory(t: { after: (fn: () => Promise<void>) => void }): Promise<Client> {
-  const handler = createMcpHandler(() => createServer(), { legacy: "reject" });
+async function connectInMemory(t: { after: (fn: () => Promise<void>) => void }, factory = () => createServer()): Promise<Client> {
+  const handler = createMcpHandler(factory, { legacy: "reject" });
   const client = new Client({ name: "margrave-test", version: "0.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
   await client.connect(
     new StreamableHTTPClientTransport(new URL("http://test/mcp"), { fetch: (url, init) => handler.fetch(new Request(url, init)) }),
   );
   t.after(() => client.close());
   return client;
+}
+
+function boundSkillsPages(t: { after: (fn: () => void) => void }, limit: number): { cursors: string[] } {
+  const prepare = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare")?.value as DatabaseSync["prepare"];
+  const cursors: string[] = [];
+  const query =
+    "SELECT id, name, description, source, dir, hash AS revision, manifest, frontmatter FROM skills WHERE id > ? AND (? IS NULL OR source IN (SELECT value FROM json_each(?))) ORDER BY id COLLATE BINARY LIMIT 51";
+  const hooked = mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    const statement = prepare.call(this, sql);
+    if (sql !== query) return statement;
+    return {
+      all: (...args: Parameters<typeof statement.all>) => {
+        const cursor = args[0];
+        assert.ok(typeof cursor === "string");
+        cursors.push(cursor);
+        assert.ok(cursors.length <= limit, "skills pagination exceeded the query limit");
+        if (cursors.length > 1) assert.ok(cursors.at(-1)! > cursors.at(-2)!, "skills pagination did not advance");
+        return statement.all(...args);
+      },
+    } as unknown as ReturnType<DatabaseSync["prepare"]>;
+  });
+  t.after(() => hooked.mock.restore());
+  return { cursors };
 }
 
 test("MCP server version is 0.0.0 when package.json has no version or cannot be read", async (t) => {
@@ -521,5 +546,487 @@ test("Skills extension serves verified scoped pages over stdio", async (t) => {
     );
   } finally {
     db.close();
+  }
+});
+
+test("MCP Skills direct validates catalog frontmatter boundaries", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  const previous = process.env["MARGRAVE_HOME"];
+  const home = await tmp("mg-direct-skills-");
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(async () => {
+    if (previous === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previous;
+    await fsp.rm(home, { recursive: true, force: true });
+  });
+  const rows: ReturnType<typeof newEntry>[] = [];
+  const add = async (name: string, frontmatter: string): Promise<void> => {
+    const dir = path.join(home, "fixtures", String(rows.length));
+    await mkdir(dir, { recursive: true });
+    const content = Buffer.from(`---\n${frontmatter}\n---\nfixture\n`);
+    const digest = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+    await writeFile(path.join(dir, "SKILL.md"), content);
+    const manifest = JSON.stringify([{ path: "SKILL.md", digest, size: content.length }]);
+    rows.push({ ...newEntry("source", name), dir, revision: digest, manifest, frontmatter });
+  };
+  const fm = (name: string, extra = "", description = "valid"): string =>
+    `name: ${JSON.stringify(name)}\ndescription: ${JSON.stringify(description)}\n${extra}`;
+  const longName = "a".repeat(64);
+  await add("alpha", fm("alpha", "extra: preserved\nmetadata: {author: Ada}\ncompatibility: ascii\n"));
+  await add("empty-map", fm("empty-map", "metadata: {}\n"));
+  await add("a-0-z", fm("a-0-z"));
+  await add("0", fm("0"));
+  await add("unicode", fm("unicode", `compatibility: ${"😀".repeat(500)}\n`, "😀".repeat(1024)));
+  await add(longName, fm(longName));
+  for (const [name, value] of [
+    ["primitive", "42"],
+    ["null-value", "null"],
+    ["array", "[one, two]"],
+    ["missing-name", "description: valid"],
+    ["number-name", "name: 42\ndescription: valid"],
+    ["null-name", "name: null\ndescription: valid"],
+    ["", 'name: ""\ndescription: valid'],
+    ["mismatch", fm("other")],
+    ["missing-description", "name: missing-description"],
+    ["number-description", "name: number-description\ndescription: 42"],
+    ["empty-description", fm("empty-description", "", "")],
+    ["long-description", fm("long-description", "", "x".repeat(1025))],
+    ["a".repeat(65), fm("a".repeat(65))],
+    ["-leading", fm("-leading")],
+    ["trailing-", fm("trailing-")],
+    ["double--hyphen", fm("double--hyphen")],
+    ["bad_name", fm("bad_name")],
+    ["!leading", fm("!leading")],
+    ["trailing!", fm("trailing!")],
+    ["Uppercase", fm("Uppercase")],
+    ["compat-empty", fm("compat-empty", 'compatibility: ""\n')],
+    ["compat-long", fm("compat-long", `compatibility: ${"x".repeat(501)}\n`)],
+    ["compat-number", fm("compat-number", "compatibility: 42\n")],
+    ["metadata-null", fm("metadata-null", "metadata: null\n")],
+    ["metadata-array", fm("metadata-array", "metadata: [value]\n")],
+    ["metadata-number", fm("metadata-number", "metadata: 42\n")],
+    ["metadata-value", fm("metadata-value", "metadata: {value: 42}\n")],
+    ["nonfinite", fm("nonfinite", "extra: .inf\n")],
+    ["cyclic", fm("cyclic", "extra: &loop [*loop]\n")],
+  ] as const)
+    await add(name, value);
+  const template = rows.find((row) => row.name === "alpha")!;
+  const manifestEntry = (JSON.parse(template.manifest) as { path: string; digest: string; size: number }[])[0]!;
+  for (const [name, manifest] of [
+    ["manifest-empty", JSON.stringify([manifestEntry, { ...manifestEntry, path: "nested//file" }])],
+    ["manifest-missing", JSON.stringify([{ ...manifestEntry, path: "nested/file" }])],
+  ] as const) {
+    rows.push({ ...newEntry("source", name), dir: template.dir, revision: template.revision, manifest, frontmatter: fm(name) });
+  }
+  const fillers = Array.from({ length: 55 }, (_, i) => `z-filler-${String(i).padStart(2, "0")}`);
+  for (const name of fillers) {
+    rows.push({
+      ...newEntry("source", name),
+      dir: template.dir,
+      revision: template.revision,
+      manifest: template.manifest,
+      frontmatter: fm(name),
+    });
+  }
+  await seedIndex(rows);
+  boundSkillsPages(t, 3);
+  const client = await connectInMemory(t);
+  const skills = new SkillsClient(client);
+  const listing = await skills.list({ cursor: Buffer.from("source").toString("base64url") }, { timeout: 2000 });
+  assert.deepEqual(
+    listing.skills.map((item) => item.frontmatter.name),
+    ["0", "a-0-z", longName, "alpha", "empty-map", "unicode", ...fillers.slice(0, 44)],
+  );
+  assert.equal(listing.nextCursor, Buffer.from("source/z-filler-43").toString("base64url"));
+  const alpha = listing.skills.find((item) => item.frontmatter.name === "alpha")!;
+  const alphaRow = rows.find((row) => row.name === "alpha")!;
+  const digest = alphaRow.revision;
+  const size = (JSON.parse(alphaRow.manifest) as { size: number }[])[0]!.size;
+  const uri = `skill://margrave/source/${encodeURIComponent(digest)}/alpha/SKILL.md`;
+  assert.deepEqual(alpha, {
+    uri,
+    frontmatter: { name: "alpha", description: "valid", extra: "preserved", metadata: { author: "Ada" }, compatibility: "ascii" },
+    resources: [{ uri, digest, size }],
+  });
+  assert.deepEqual((await skills.get(uri)).skill, alpha);
+  const response = await client.readResource({ uri });
+  assert.deepEqual(response.contents, [
+    { uri, mimeType: "text/markdown", text: await fsp.readFile(path.join(alphaRow.dir, "SKILL.md"), "utf8") },
+  ]);
+  assert.deepEqual(listing.skills.find((item) => item.frontmatter.name === "empty-map")?.frontmatter["metadata"], {});
+  assert.equal(listing.skills.find((item) => item.frontmatter.name === "unicode")?.frontmatter["compatibility"], "😀".repeat(500));
+  assert.equal(listing.skills.find((item) => item.frontmatter.name === "unicode")?.frontmatter.description, "😀".repeat(1024));
+});
+
+test("MCP Skills direct filters manifest paths, size and scope", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  const previous = process.env["MARGRAVE_HOME"];
+  const home = await tmp("mg-direct-manifest-");
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(async () => {
+    if (previous === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previous;
+    await fsp.rm(home, { recursive: true, force: true });
+  });
+  const rows: ReturnType<typeof newEntry>[] = [];
+  for (const [name, extraPath, extraSize] of [
+    ["valid", "nested/reference.txt", 100],
+    ["oversized", "nested/reference.txt", 101],
+    ["missing", "nested/reference.txt", 1],
+    ["empty", "nested//reference.txt", 1],
+    ["dot", "nested/./reference.txt", 1],
+    ["parent", "nested/../reference.txt", 1],
+  ] as const) {
+    const dir = path.join(home, name);
+    const frontmatter = `name: ${name}\ndescription: valid`;
+    const content = Buffer.from(`---\n${frontmatter}\n---\n`);
+    const digest = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+    await mkdir(path.join(dir, "nested"), { recursive: true });
+    await writeFile(path.join(dir, "SKILL.md"), content);
+    await writeFile(path.join(dir, "nested/reference.txt"), Buffer.alloc(extraSize));
+    const manifest = [
+      ...(name === "missing" ? [] : [{ path: "SKILL.md", digest, size: content.length }]),
+      { path: extraPath, digest: `sha256:${createHash("sha256").update(Buffer.alloc(extraSize)).digest("hex")}`, size: extraSize },
+    ];
+    rows.push({ ...newEntry("source", name), dir, revision: digest, frontmatter, manifest: JSON.stringify(manifest) });
+  }
+  const base = rows.find((row) => row.name === "valid")!;
+  const malformedSize = JSON.parse(base.manifest) as { path: string; digest: string; size: unknown }[];
+  malformedSize[1]!.size = { toString: null };
+  rows.push({
+    ...newEntry("other", "malformed-size"),
+    dir: base.dir,
+    revision: base.revision,
+    manifest: JSON.stringify(malformedSize),
+    frontmatter: "name: malformed-size\ndescription: valid",
+  });
+  await seedIndex(rows);
+  const pages = boundSkillsPages(t, 3);
+  const factory =
+    (scope: ReadonlySet<string> | undefined, limit?: number): (() => McpServer) =>
+    () => {
+      const server = new McpServer({ name: "direct-test", version: "1" });
+      attachMargraveSkills(server, scope, limit);
+      return server;
+    };
+  const unrestricted = new SkillsClient(await connectInMemory(t, factory(undefined)));
+  assert.deepEqual(
+    (await unrestricted.list()).skills.map((skill) => skill.frontmatter.name),
+    ["oversized", "valid"],
+  );
+  pages.cursors.length = 0;
+  const limited = new SkillsClient(await connectInMemory(t, factory(new Set(["source"]), 100)));
+  const allowed = await limited.list();
+  assert.deepEqual(
+    allowed.skills.map((skill) => skill.frontmatter.name),
+    ["valid"],
+  );
+  const resource = allowed.skills[0]?.resources[1];
+  assert.ok(resource !== undefined && typeof resource !== "string");
+  assert.equal(resource.size, 100);
+  pages.cursors.length = 0;
+  const empty = new SkillsClient(await connectInMemory(t, factory(new Set(), 100)));
+  assert.deepEqual((await empty.list()).skills, []);
+  for (const cursor of ["", "!", `${Buffer.from("source/valid").toString("base64url")}=`]) {
+    await assert.rejects(
+      limited.list({ cursor }),
+      (err: unknown) =>
+        typeof err === "object" &&
+        err !== null &&
+        "code" in err &&
+        err.code === -32602 &&
+        err instanceof Error &&
+        err.message === "invalid cursor",
+    );
+  }
+});
+
+test("MCP Skills direct advances keyset pages past rejected rows", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  const previous = process.env["MARGRAVE_HOME"];
+  const home = await tmp("mg-direct-pages-");
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(async () => {
+    if (previous === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previous;
+    await fsp.rm(home, { recursive: true, force: true });
+  });
+  const bytes = Buffer.from("page fixture\n");
+  const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  const manifest = JSON.stringify([{ path: "SKILL.md", digest, size: bytes.length }]);
+  const names = Array.from({ length: 56 }, (_, i) => `page-${String(i).padStart(2, "0")}`);
+  const rows = names.map((name) => ({
+    ...newEntry("source", name),
+    revision: digest,
+    manifest,
+    frontmatter: `name: ${name}\ndescription: page`,
+  }));
+  for (let i = 0; i < 5; i++) {
+    const name = `bad-${i}`;
+    rows.push({ ...newEntry("source", name), revision: digest, manifest, frontmatter: "[]" });
+  }
+  await seedIndex(rows);
+  const pages = boundSkillsPages(t, 3);
+  for (const scope of [undefined, new Set(["source"])] as const) {
+    const client = await connectInMemory(t, () => {
+      const server = new McpServer({ name: "direct-test", version: "1" });
+      attachMargraveSkills(server, scope);
+      return server;
+    });
+    const skills = new SkillsClient(client);
+    pages.cursors.length = 0;
+    const first = await skills.list({ cursor: Buffer.from("source/").toString("base64url") });
+    assert.deepEqual(
+      first.skills.map((skill) => skill.frontmatter.name),
+      names.slice(0, 50),
+    );
+    assert.deepEqual(
+      first.skills.map((skill) => skill.uri),
+      names.slice(0, 50).map((name) => `skill://margrave/source/${encodeURIComponent(digest)}/${name}/SKILL.md`),
+    );
+    assert.equal(first.nextCursor, Buffer.from("source/page-49").toString("base64url"));
+    assert.deepEqual(pages.cursors, ["source/", "source/page-45"]);
+    pages.cursors.length = 0;
+    const second = await skills.list({ cursor: first.nextCursor });
+    assert.deepEqual(
+      second.skills.map((skill) => skill.frontmatter.name),
+      names.slice(50),
+    );
+    assert.deepEqual(
+      second.skills.map((skill) => skill.uri),
+      names.slice(50).map((name) => `skill://margrave/source/${encodeURIComponent(digest)}/${name}/SKILL.md`),
+    );
+    assert.equal(second.nextCursor, undefined);
+    assert.deepEqual(pages.cursors, ["source/page-49"]);
+    pages.cursors.length = 0;
+    const exact = await skills.list({ cursor: Buffer.from("source/page-05").toString("base64url") });
+    assert.deepEqual(
+      exact.skills.map((skill) => skill.frontmatter.name),
+      names.slice(6),
+    );
+    assert.equal(exact.nextCursor, undefined);
+    assert.deepEqual(pages.cursors, ["source/page-05"]);
+    pages.cursors.length = 0;
+    const all = await skills.list();
+    assert.deepEqual(
+      all.skills.map((skill) => skill.frontmatter.name),
+      names,
+    );
+    assert.deepEqual(pages.cursors, ["", "source/page-45", "source/page-49"]);
+  }
+});
+
+test("MCP Skills direct stops consuming rows once the next page is established", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  const previous = process.env["MARGRAVE_HOME"];
+  const home = await tmp("mg-direct-page-stop-");
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(async () => {
+    if (previous === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previous;
+    await fsp.rm(home, { recursive: true, force: true });
+  });
+  const digest = `sha256:${createHash("sha256").update("page fixture\n").digest("hex")}`;
+  const manifest = JSON.stringify([{ path: "SKILL.md", digest, size: 13 }]);
+  const names = Array.from({ length: 110 }, (_, i) => (i < 100 ? `page-${String(i).padStart(2, "0")}` : `z-page-${i}`));
+  const rows = names.map((name) => ({
+    ...newEntry("source", name),
+    revision: digest,
+    manifest: name === "page-54" ? "{" : manifest,
+    frontmatter: `name: ${name}\ndescription: page`,
+  }));
+  for (let i = 0; i < 5; i++) {
+    const name = `bad-${i}`;
+    rows.push({ ...newEntry("source", name), revision: digest, manifest, frontmatter: "[]" });
+  }
+  await seedIndex(rows);
+  const pages = boundSkillsPages(t, 3);
+  const skills = new SkillsClient(await connectInMemory(t));
+  const page = await skills.list({ cursor: Buffer.from("source/").toString("base64url") });
+  assert.deepEqual(
+    page.skills.map((skill) => skill.frontmatter.name),
+    names.slice(0, 50),
+  );
+  assert.equal(page.nextCursor, Buffer.from("source/page-49").toString("base64url"));
+  assert.deepEqual(pages.cursors, ["source/", "source/page-45"]);
+});
+
+test("MCP Skills direct handles an absent catalog and closes catalog connections", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  const previous = process.env["MARGRAVE_HOME"];
+  const home = await tmp("mg-direct-empty-");
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(async () => {
+    if (previous === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previous;
+    await fsp.rm(home, { recursive: true, force: true });
+  });
+  boundSkillsPages(t, 3);
+  const client = await connectInMemory(t);
+  const skills = new SkillsClient(client);
+  const uri = `skill://margrave/source/${encodeURIComponent(`sha256:${"0".repeat(64)}`)}/missing/SKILL.md`;
+  const noSkill = { code: -32602, message: `No skill is served at ${uri}` };
+  const noResource = { code: -32602, message: `Resource not found: ${uri}` };
+  assert.deepEqual((await skills.list()).skills, []);
+  await assert.rejects(skills.get(uri), noSkill);
+  await assert.rejects(client.readResource({ uri }), noResource);
+
+  await seedIndex([newEntry("source", "skill")]);
+  const close = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "close")?.value as DatabaseSync["close"];
+  let closed = 0;
+  const closeMock = mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    closed++;
+    close.call(this);
+  });
+  t.after(() => closeMock.mock.restore());
+  assert.deepEqual((await skills.list()).skills, []);
+  assert.equal(closed, 1);
+  await assert.rejects(skills.get(uri), noSkill);
+  assert.equal(closed, 2);
+  await assert.rejects(client.readResource({ uri }), noResource);
+  assert.equal(closed, 3);
+  await assert.rejects(
+    skills.list({ cursor: "!" }),
+    (err: unknown) => err instanceof Error && "code" in err && err.code === -32602 && err.message === "invalid cursor",
+  );
+  assert.equal(closed, 4);
+  const prepare = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare")?.value as DatabaseSync["prepare"];
+  const failure = mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql.includes("WHERE id > ? AND (? IS NULL OR source IN")) throw new Error("catalog query failed");
+    return prepare.call(this, sql);
+  });
+  try {
+    await assert.rejects(skills.list(), /catalog query failed/u);
+    assert.equal(closed, 5);
+  } finally {
+    failure.mock.restore();
+  }
+});
+
+test("MCP Skills direct reports catalog close failure", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  const previous = process.env["MARGRAVE_HOME"];
+  const home = await tmp("mg-direct-close-");
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(async () => {
+    if (previous === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previous;
+    await fsp.rm(home, { recursive: true, force: true });
+  });
+  await seedIndex([newEntry("source", "skill")]);
+  boundSkillsPages(t, 3);
+  const client = await connectInMemory(t);
+  const close = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "close")?.value as DatabaseSync["close"];
+  const closeMock = mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    close.call(this);
+    throw new Error("catalog close failed");
+  });
+  t.after(() => closeMock.mock.restore());
+  await assert.rejects(new SkillsClient(client).list(), { code: -32603, message: "catalog close failed" });
+});
+
+test("MCP Skills direct reads exact resources and rejects noncanonical URIs", async (t) => {
+  const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
+  const previous = process.env["MARGRAVE_HOME"];
+  const home = await tmp("mg-direct-resource-");
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(async () => {
+    if (previous === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previous;
+    await fsp.rm(home, { recursive: true, force: true });
+  });
+  const dir = path.join(home, "fixture");
+  await mkdir(path.join(dir, "nested"), { recursive: true });
+  const frontmatter = "name: example\ndescription: valid";
+  const files = [
+    ["SKILL.md", Buffer.from(`---\n${frontmatter}\n---\nbody\n`)],
+    ["nested/résumé file.txt", Buffer.from("\uFEFFhello\n")],
+    ["nested/reference.md", Buffer.from("markdown\n")],
+    ["nested/data.bin", Buffer.from([0, 255, 1])],
+  ] as const;
+  const manifest = files.map(([file, bytes]) => ({
+    path: file,
+    digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+    size: bytes.length,
+  }));
+  for (const [file, bytes] of files) await writeFile(path.join(dir, file), bytes);
+  const revision = manifest[0]!.digest;
+  const badManifest = JSON.stringify([...manifest, { path: "../bad", digest: revision, size: 1 }]);
+  await seedIndex([
+    { ...newEntry("source", "example"), dir, revision, manifest: JSON.stringify(manifest), frontmatter },
+    { ...newEntry("source", "invalid"), dir, revision, manifest: badManifest, frontmatter: "name: invalid\ndescription: valid" },
+  ]);
+  const prepare = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare")?.value as DatabaseSync["prepare"];
+  let selectedQueries = 0;
+  const selectedSql =
+    "SELECT id, name, description, source, dir, hash AS revision, manifest, frontmatter FROM skills WHERE id = ? AND source = ?";
+  const sqlMock = mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+    if (sql === selectedSql) selectedQueries++;
+    return prepare.call(this, sql);
+  });
+  t.after(() => sqlMock.mock.restore());
+  const client = await connectInMemory(t);
+  const skills = new SkillsClient(client);
+  const root = `skill://margrave/source/${encodeURIComponent(revision)}/example`;
+  const uri = `${root}/SKILL.md`;
+  const skill = (await skills.get(uri)).skill;
+  assert.equal(skill.uri, uri);
+  assert.deepEqual(
+    skill.resources,
+    manifest.map((item) => ({
+      uri: `${root}/${item.path.split("/").map(encodeURIComponent).join("/")}`,
+      digest: item.digest,
+      size: item.size,
+    })),
+  );
+  for (const [file, bytes] of files) {
+    const fileUri = `${root}/${file.split("/").map(encodeURIComponent).join("/")}`;
+    const content = (await client.readResource({ uri: fileUri })).contents;
+    if (file.endsWith(".bin")) {
+      assert.deepEqual(content, [{ uri: fileUri, mimeType: "application/octet-stream", blob: bytes.toString("base64") }]);
+    } else {
+      assert.deepEqual(content, [
+        { uri: fileUri, text: bytes.toString("utf8"), ...(file.endsWith(".md") ? { mimeType: "text/markdown" } : {}) },
+      ]);
+    }
+  }
+  assert.equal((await skills.read(skill, "nested/résumé file.txt")).text, "\uFEFFhello\n");
+  assert.deepEqual([...(await skills.read(skill, "nested/data.bin")).bytes], [0, 255, 1]);
+  const missing = async (input: string): Promise<void> => {
+    await assert.rejects(
+      client.readResource({ uri: input }),
+      (err: unknown) => err instanceof Error && "code" in err && err.code === -32602 && err.message === `Resource not found: ${input}`,
+    );
+  };
+  const stale = `sha256:${"0".repeat(64)}`;
+  for (const input of [
+    `skill://other/source/${encodeURIComponent(revision)}/example/SKILL.md`,
+    `skill://margrave//${encodeURIComponent(revision)}/example/SKILL.md`,
+    `${root}//SKILL.md`,
+    `${root}/./SKILL.md`,
+    `${root}/../SKILL.md`,
+    `${root}/%`,
+    `${root}/%FF`,
+    `${root}/%53KILL.md`,
+    `${root.replace("%3A", "%3a")}/SKILL.md`,
+    `skill://margrave/source/${encodeURIComponent(`x${revision}`)}/example/SKILL.md`,
+    `skill://margrave/source/${encodeURIComponent(`${revision}x`)}/example/SKILL.md`,
+    `skill://margrave/source/${encodeURIComponent(stale)}/example`,
+  ]) {
+    const before = selectedQueries;
+    await missing(input);
+    assert.equal(selectedQueries, before, input);
+  }
+  await missing(`${root}/nested%2Freference.md`);
+  await missing(`${root}/unlisted.txt`);
+  await missing(`skill://margrave/source/${encodeURIComponent(revision)}/absent/SKILL.md`);
+  await missing(`skill://margrave/source/${encodeURIComponent(revision)}/invalid/SKILL.md`);
+  const staleUri = `skill://margrave/source/${encodeURIComponent(stale)}/example/SKILL.md`;
+  for (const request of [() => skills.get(staleUri), () => client.readResource({ uri: staleUri })]) {
+    await assert.rejects(
+      request(),
+      (err: unknown) =>
+        err instanceof Error && "code" in err && err.code === -32602 && err.message === "skill revision changed; search again",
+    );
   }
 });
