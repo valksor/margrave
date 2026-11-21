@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { chmod, readFile, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import fsp, { chmod, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import test from "node:test";
-import { PINNED_RIPWIRE, scanWithRipwire as scan } from "../src/safety.ts";
+import { PINNED_RIPWIRE, scanInventory, scanWithRipwire as scan } from "../src/safety.ts";
 import { MargraveError, validScan } from "../src/store.ts";
 import {
   xml,
@@ -104,7 +106,7 @@ test("accepted scan records retain verdicts and native relative fingerprints", a
   const logs: string[] = [];
   await assert.rejects(
     e.run(() => scan(critical, { ...opts(logs), baseline: d })),
-    /refused: ripwire found CRITICAL/u,
+    /refused: ripwire found CRITICAL[^\n]*\nscan: CRITICAL — 1 finding\(s\) \(1 critical\) in/u,
   );
   assert.equal(logs[0], "scan: no accepted baseline. Applying install rules");
 });
@@ -241,7 +243,9 @@ test("--allow-unsafe overrides a wrong VERSION stamp", async () => {
     await assert.rejects(
       withPath(empty, () => scanWithRipwire(empty, opts([], { vendored }))),
       (err: unknown) =>
-        err instanceof MargraveError && err.message.startsWith(`refused: vendored ripwire at ${vendored} is 0.4.0, not the pinned `),
+        err instanceof MargraveError &&
+        err.message.startsWith(`refused: vendored ripwire at ${vendored} is 0.4.0, not the pinned `) &&
+        err.message.split("\n").length === 2,
     );
     const r = await withPath(empty, () => scanWithRipwire(empty, opts([], { vendored, allowUnsafe: true })));
     assert.equal(r.overridden, true);
@@ -379,6 +383,7 @@ test("baseline: a flagged symlink is unreadable and counts as new, even as a war
   const ok = await e.run(() => scanWithRipwire(base, opts(logs, { baselineDir: base })));
   assert.equal(ok.code, 1);
   assert.match(logs.join("\n"), /; 0 new vs installed copy/u);
+  assert.doesNotMatch(logs.join("\n"), /known findings in changed files:/u);
 });
 
 // ---- a scripted ripwire: fixed stdout, stderr, and exit code ----
@@ -516,4 +521,265 @@ test("more than 20 new findings are cut with a count, and so are more than 10 kn
   assert.equal(r.code, 1);
   assert.match(logs.join("\n"), /; 0 new vs installed copy/u);
   assert.match(logs.join("\n"), /known findings in changed files:\n(?: {4}a\/f\d\d\.md · INJECTION:eval · 1\n){10} {4}… 1 more\n/u);
+});
+
+test("scripted findings retain only safely readable lines and cache each path", async (t) => {
+  const dir = await realpath(
+    await scanDir({ "a/text": "  first  \n\nlast", "a/terminated": "end\n", "a/close": "close\n", "a/bad": "x", "a/dir/child": "x" }),
+  );
+  await writeFile(path.join(dir, "a/bad"), Buffer.from([0xff]));
+  await symlink("dir", path.join(dir, "a/link"));
+  const entries = [
+    ["a/text:1", "first"],
+    ["a/text:1", "first"],
+    ["a/text:2", "blank"],
+    ["a/text:3", "last"],
+    ["a/text:4", "past"],
+    ["a/terminated:2", "terminal"],
+    ["a/text:0", "zero"],
+    ["a/text:1.5", "fraction"],
+    ["a/bad:1", "bad"],
+    ["a/link/child:1", "link"],
+    ["a/dir:1", "directory"],
+    ["a/close:1", "close"],
+  ];
+  const rows =
+    entries.map(([p, rule]) => `<f p="${dir}/${p}" rule="${rule}" sev="warn"/>`).join("") + '<f p=":1" rule="empty" sev="warn"/>';
+  const bin = await scriptedRipwire({ code: 1, stdout: xml(`files="6" findings="13" skipped="0" verdict="warn"`, rows) });
+  const originalOpen = fsp.open;
+  const opens = new Map<string, number>();
+  let directoryReads = 0;
+  t.mock.method(
+    fsp,
+    "open",
+    async (file: Parameters<typeof fsp.open>[0], flags: Parameters<typeof fsp.open>[1], mode?: Parameters<typeof fsp.open>[2]) => {
+      const name = String(file);
+      if (name.startsWith(dir + path.sep)) opens.set(name, (opens.get(name) ?? 0) + 1);
+      const handle = await originalOpen(file, flags, mode);
+      if (name === path.join(dir, "a/dir")) {
+        const read = handle.readFile.bind(handle);
+        t.mock.method(handle, "readFile", async () => {
+          directoryReads++;
+          return read();
+        });
+      }
+      if (name === path.join(dir, "a/close")) {
+        const close = handle.close.bind(handle);
+        t.mock.method(handle, "close", async () => {
+          await close();
+          throw new Error("close failed");
+        });
+      }
+      return handle;
+    },
+  );
+  syncBuiltinESMExports();
+  try {
+    const logs: string[] = [];
+    const result = await withScripted(bin, () =>
+      scan(dir, {
+        ...opts(logs),
+        baseline: { code: 0, overridden: false, version: null, verdict: "clean", keys: [], files: [], tree: "tree" },
+        allowUnsafe: true,
+      }),
+    );
+    const hash = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
+    assert.deepEqual(result.keys, [
+      [JSON.stringify(["a/text", "first", "warn", hash("first")]), 2],
+      [JSON.stringify(["a/text", "blank", "warn", hash("")]), 1],
+      [JSON.stringify(["a/text", "last", "warn", hash("last")]), 1],
+    ]);
+    assert.deepEqual(result.files, [["a/text", hash("  first  \n\nlast")]]);
+    for (const fragment of [
+      "a/text:4  past",
+      "a/terminated:2  terminal",
+      "a/text:0  zero",
+      "a/text:1.5  fraction",
+      "a/bad:1  bad",
+      "a/link/child:1  link",
+      "a/dir:1  directory",
+      "a/close:1  close",
+      ":1  empty",
+    ]) {
+      assert.ok(logs.join("\n").includes(`\n    ${fragment}  warn (unreadable)\n`), fragment);
+    }
+    assert.deepEqual([...opens.values()], [1, 1, 1, 1, 1, 1]);
+    assert.equal(directoryReads, 0);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
+test("inventory hashes sorted paths, file bytes, directories, and relative links", async (t) => {
+  const dir = await realpath(await scanDir({ z: "last", a: "first", "nested/data": "placeholder" }));
+  await writeFile(path.join(dir, "nested/data"), Buffer.from([0, 255, 42]));
+  await symlink("../a", path.join(dir, "nested/link"));
+  const originalReadDir = fsp.readdir;
+  const originalOpen = fsp.open;
+  const streams: unknown[] = [];
+  const closed = new Set<string>();
+  t.mock.method(fsp, "readdir", async (p: Parameters<typeof fsp.readdir>[0]) => (await originalReadDir(p)).sort().reverse());
+  t.mock.method(
+    fsp,
+    "open",
+    async (file: Parameters<typeof fsp.open>[0], flags: Parameters<typeof fsp.open>[1], mode?: Parameters<typeof fsp.open>[2]) => {
+      const handle = await originalOpen(file, flags, mode);
+      const stream = handle.createReadStream.bind(handle);
+      const close = handle.close.bind(handle);
+      t.mock.method(handle, "createReadStream", (options: Parameters<typeof stream>[0]) => {
+        streams.push(options);
+        return stream(options);
+      });
+      t.mock.method(handle, "close", async () => {
+        closed.add(String(file));
+        await close();
+      });
+      return handle;
+    },
+  );
+  syncBuiltinESMExports();
+  try {
+    const hash = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
+    const tuples = [
+      ["a", "file", hash("first")],
+      ["nested", "dir"],
+      ["nested/data", "file", hash(Buffer.from([0, 255, 42]))],
+      ["nested/link", "link", "../a"],
+      ["z", "file", hash("last")],
+    ];
+    assert.equal(await scanInventory(dir), hash(tuples.map((tuple) => JSON.stringify(tuple)).join("")));
+    assert.deepEqual(streams, [{ autoClose: false }, { autoClose: false }, { autoClose: false }]);
+    assert.deepEqual(closed, new Set([path.join(dir, "a"), path.join(dir, "nested/data"), path.join(dir, "z")]));
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
+test("scan failures preserve exact details and write malformed XML", async () => {
+  const dir = await scanDir({ "a/file": "x" });
+  const suffix = "\nre-run with --allow-unsafe to override for this one command";
+  const gone = path.join(dir, "missing");
+  const empty = await scriptedRipwire({ code: 3 });
+  const noScanner = await tmp("mg-emptybin-");
+  const missingVendor = path.join(noScanner, "missing-vendor");
+  await assert.rejects(
+    withScripted(empty, () => withPath(noScanner, () => scan(dir, opts([], { vendored: missingVendor })))),
+    { message: `refused: ripwire was not found on PATH or at ${missingVendor}${suffix}` },
+  );
+  await assert.rejects(
+    withScripted(empty, () => scan(dir + "/missing", opts([]))),
+    { message: `refused: cannot resolve the scan root ${gone}${suffix}` },
+  );
+  await assert.rejects(
+    withScripted(empty, () => scan(dir, opts([]))),
+    { message: `refused: ripwire could not read the files (exit 3)${suffix}` },
+  );
+  const fallback = await scriptedRipwire({ code: 3, stderr: "  \n", stdout: "  stdout detail  \n" });
+  await assert.rejects(
+    withScripted(fallback, () => scan(dir, opts([]))),
+    { message: `refused: ripwire could not read the files (exit 3)\nstdout detail${suffix}` },
+  );
+  const precedence = await scriptedRipwire({ code: 3, stderr: " stderr detail \n", stdout: "stdout detail" });
+  await assert.rejects(
+    withScripted(precedence, () => scan(dir, opts([]))),
+    { message: `refused: ripwire could not read the files (exit 3)\nstderr detail${suffix}` },
+  );
+  const malformed = "<skillscan broken";
+  const bad = await scriptedRipwire({ code: 1, stdout: malformed });
+  await withScripted(bad, async () => {
+    await assert.rejects(scan(dir, opts([])));
+    assert.equal(await readFile(path.join(process.env["MARGRAVE_HOME"]!, "reports/src.xml"), "utf8"), malformed);
+  });
+  const unavailable = path.join(await tmp(), "ripwire");
+  await writeFile(unavailable, "#!/no/such/interpreter\n");
+  await chmod(unavailable, 0o755);
+  await stamp(unavailable);
+  const logs: string[] = [];
+  const result = await withScripted(empty, () => scan(dir, { ...opts(logs, { vendored: unavailable }), allowUnsafe: true }));
+  assert.equal(result.code, null);
+  assert.equal(result.overridden, true);
+});
+
+test("detail limits are exclusive at forty lines and five hundred characters", async () => {
+  const dir = await scanDir({ x: "x" });
+  const detail = ["x".repeat(500), ...Array.from({ length: 39 }, (_, i) => `line ${i + 2}`)].join("\n");
+  const bin = await scriptedRipwire({ code: 4, stderr: detail });
+  await assert.rejects(
+    withScripted(bin, () => scan(dir, opts([]))),
+    { message: `refused: ripwire failed (exit 4)\n${detail}\nre-run with --allow-unsafe to override for this one command` },
+  );
+});
+
+test("accepted baseline warnings and summary rankings retain exact boundaries", async () => {
+  const e = await env();
+  const files = (n: number, text: string): Record<string, string> =>
+    Object.fromEntries(Array.from({ length: n }, (_, i) => [`a/f${String(i).padStart(2, "0")}.md`, text]));
+  const base = await scanDir(files(10, "x FAKE-WARN R:known\n"));
+  const changed = await scanDir(files(10, "intro\nx FAKE-WARN R:known\n"));
+  const logs: string[] = [];
+  await e.run(() => scanWithRipwire(changed, opts(logs, { baselineDir: base })));
+  assert.match(logs.join("\n"), /known findings in changed files:\n(?: {4}a\/f\d\d\.md · R:known · 1\n){10}  full report:/u);
+  assert.doesNotMatch(logs.join("\n"), /new findings:|…/u);
+  const twenty = await scanDir(files(20, "x FAKE-WARN R:new\n"));
+  const freshLogs: string[] = [];
+  await e.run(() => scanWithRipwire(twenty, opts(freshLogs, { baselineDir: base })));
+  assert.match(freshLogs.join("\n"), /new findings:\n(?: {4}a\/f\d\d\.md:1 {2}R:new {2}warn\n){20}  full report:/u);
+  assert.doesNotMatch(freshLogs.join("\n"), /known findings in changed files:|…/u);
+  const noTreeLogs: string[] = [];
+  const baseline = await e.run(() => scan(base, { ...opts([]), verifyContent: true }));
+  await e.run(() => scan(changed, { ...opts(noTreeLogs), baseline: { ...baseline, tree: null } }));
+  assert.equal(noTreeLogs[0], "scan: no accepted baseline. Applying install rules");
+  assert.doesNotMatch(noTreeLogs.join("\n"), /new vs installed copy/u);
+});
+
+test("summary ranks mixed rules and escaped skill names by count and name", async () => {
+  const dir = await realpath(await scanDir({ "a/file": "one\n", "b/file": "two\n", outside: "three\n" }));
+  const rows = [
+    `<f p="${dir}/b/file:1" rule="Z" sev="warn"/>`,
+    `<f p="${dir}/a/file:1" rule="A" sev="critical"/>`,
+    `<f p="${dir}/a/file:1" rule="A" sev="warn"/>`,
+    `<f p="${dir}/outside:1" rule="B" sev="warn"/>`,
+    ...Array.from({ length: 8 }, (_, i) => `<f p="${dir}/b/file:1" rule="R${i}" sev="warn"/>`),
+  ];
+  const bin = await scriptedRipwire({ code: 2, stdout: xml(`files="3" findings="12" skipped="0" verdict="critical"`, rows.join("")) });
+  const logs: string[] = [];
+  await withScripted(bin, () =>
+    scan(dir, {
+      ...opts(logs),
+      allowUnsafe: true,
+      skills: [
+        { name: "z\nname", dir: path.join(dir, "b") },
+        { name: "a", dir: path.join(dir, "a") },
+      ],
+    }),
+  );
+  const output = logs.join("\n");
+  assert.match(output, /12 finding\(s\) \(1 critical, 11 warn\) in 2 skill\(s\)/u);
+  assert.ok(output.includes("  by rule:   A 2 · B 1 · R0 1 · R1 1 · R2 1 · R3 1 · R4 1 · R5 1 · R6 1 · R7 1 · …\n"));
+  assert.ok(output.includes("  top skills: z\\x0aname 9 · a 2 · (outside skills) 1\n"));
+  const tenRows = rows.slice(0, -1);
+  const ten = await scriptedRipwire({ code: 2, stdout: xml(`files="3" findings="11" skipped="0" verdict="critical"`, tenRows.join("")) });
+  const tenLogs: string[] = [];
+  await withScripted(ten, () => scan(dir, { ...opts(tenLogs), allowUnsafe: true }));
+  assert.ok(tenLogs.join("\n").includes("  by rule:   A 2 · B 1 · R0 1 · R1 1 · R2 1 · R3 1 · R4 1 · R5 1 · R6 1 · Z 1\n"));
+});
+
+test("top skills shows ten ranked names and omits the eleventh", async () => {
+  const names = Array.from({ length: 11 }, (_, i) => `s${String(i).padStart(2, "0")}`);
+  const dir = await realpath(await scanDir(Object.fromEntries(names.map((name) => [`${name}/file`, "x\n"]))));
+  const rows = [...names].reverse().map((name) => `<f p="${dir}/${name}/file:1" rule="R" sev="warn"/>`);
+  const bin = await scriptedRipwire({ code: 1, stdout: xml(`files="11" findings="11" skipped="0" verdict="warn"`, rows.join("")) });
+  const logs: string[] = [];
+  await withScripted(bin, () => scan(dir, { ...opts(logs), skills: names.map((name) => ({ name, dir: path.join(dir, name) })) }));
+  assert.ok(
+    logs.join("\n").includes(
+      `  top skills: ${names
+        .slice(0, 10)
+        .map((name) => `${name} 1`)
+        .join(" · ")}\n`,
+    ),
+  );
+  assert.doesNotMatch(logs.join("\n"), /s10 1/u);
 });

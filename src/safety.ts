@@ -47,7 +47,7 @@ export interface ScanOptions {
 
 type Sev = "warn" | "critical";
 
-interface Finding {
+type Finding = {
   /** Path relative to the real scan root. The path as reported when it is outside the root. */
   rel: string;
   /** Absolute path as reported by ripwire. */
@@ -55,11 +55,9 @@ interface Finding {
   line: number;
   rule: string;
   sev: Sev;
-  /** (rel, rule, sev, sha256 of the trimmed flagged line). Null when the line cannot be read safely. */
-  key: string | null;
-  /** sha256 of the whole file, when it could be read. */
-  fileHash: string | null;
-}
+} &
+  /** Key contains the relative path, rule, severity, and hash of the trimmed line. */
+  ({ key: string; fileHash: string } | { key: null; fileHash: null });
 
 type ScanResult = (
   | { status: "clean" }
@@ -88,7 +86,7 @@ async function readFlagged(realRoot: string, rel: string, cache: Map<string, Fil
     const abs = path.join(realRoot, rel);
     const fh = await open(abs, READ_NO_FOLLOW);
     try {
-      if ((await fh.stat()).isFile() && (await realpath(abs)) === abs && isInside(abs, realRoot)) {
+      if ((await fh.stat()).isFile() && (await realpath(abs)) === abs) {
         const buf = await fh.readFile();
         const lines = utf8.decode(buf).split("\n");
         if (lines.at(-1) === "") lines.pop();
@@ -114,8 +112,10 @@ async function toFinding(row: Row, realRoot: string, cache: Map<string, FileInfo
     return { ...base, rel: pathPart, key: null, fileHash: null };
   }
   const info = await readFlagged(realRoot, rel, cache);
-  const text = Number.isInteger(line) && line >= 1 ? info?.lines[line - 1] : undefined;
-  if (info === null || text === undefined) return { ...base, rel, key: null, fileHash: info?.hash ?? null };
+  const unreadable: Finding = { ...base, rel, key: null, fileHash: null };
+  if (info === null) return unreadable;
+  const text = info.lines[line - 1];
+  if (text === undefined) return unreadable;
   return { ...base, rel, key: JSON.stringify([rel, row.rule, row.sev, sha256(text.trim())]), fileHash: info.hash };
 }
 
@@ -168,26 +168,26 @@ function toBaseline(findings: readonly Finding[]): Baseline {
   for (const f of findings) {
     if (f.key === null) continue;
     keys.set(f.key, (keys.get(f.key) ?? 0) + 1);
-    if (f.fileHash !== null) files.set(f.rel, f.fileHash);
+    files.set(f.rel, f.fileHash);
   }
   return { keys, files };
 }
 
 /** Split `findings` into new and known. A key is used up once per baseline occurrence. */
-function diff(findings: readonly Finding[], base: Baseline): { fresh: Finding[]; known: Finding[] } {
-  const left = new Map(base.keys);
+function diff(findings: readonly Finding[], base: Baseline): { fresh: Finding[]; changed: Finding[] } {
+  const left = new Map<string | null, number>(base.keys);
   const fresh: Finding[] = [];
-  const known: Finding[] = [];
+  const changed: Finding[] = [];
   for (const f of findings) {
-    const n = f.key === null ? 0 : (left.get(f.key) ?? 0);
-    if (f.key !== null && n > 0) {
+    const n = left.get(f.key) ?? 0;
+    if (n > 0) {
       left.set(f.key, n - 1);
-      known.push(f);
+      if (f.fileHash !== base.files.get(f.rel)) changed.push(f);
     } else {
       fresh.push(f);
     }
   }
-  return { fresh, known };
+  return { fresh, changed };
 }
 
 const OUTSIDE = "(outside skills)";
@@ -199,8 +199,10 @@ const MAX_DETAIL_LINES = 40;
 const MAX_DETAIL_WIDTH = 500;
 
 function ranked(counts: Map<string, number>): [string, number][] {
-  // Map keys are unique, so two keys are never equal.
-  return [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
+  return [...counts.keys()]
+    .sort()
+    .map((key): [string, number] => [key, counts.get(key)!])
+    .sort((a, b) => b[1] - a[1]);
 }
 
 function tally(items: readonly string[]): Map<string, number> {
@@ -211,8 +213,7 @@ function tally(items: readonly string[]): Map<string, number> {
 
 interface Compared {
   fresh: Finding[];
-  known: Finding[];
-  baseline: Baseline;
+  changed: Finding[];
 }
 
 function summarize(findings: readonly Finding[], opts: ScanOptions, report: string, cmp: Compared | null): string {
@@ -248,8 +249,7 @@ function summarize(findings: readonly Finding[], opts: ScanOptions, report: stri
     if (cmp.fresh.length > MAX_NEW) lines.push(`    … ${cmp.fresh.length - MAX_NEW} more`);
   }
   if (cmp !== null) {
-    const changed = cmp.known.filter((f) => f.fileHash !== cmp.baseline.files.get(f.rel));
-    const groups = ranked(tally(changed.map((f) => JSON.stringify([f.rel, f.rule]))));
+    const groups = ranked(tally(cmp.changed.map((f) => JSON.stringify([f.rel, f.rule]))));
     if (groups.length > 0) {
       lines.push("  known findings in changed files:");
       for (const [k, n] of groups.slice(0, MAX_CHANGED)) {
@@ -310,7 +310,7 @@ export async function scanWithRipwire(dir: string, opts: ScanOptions): Promise<S
   let cmp: Compared | null = null;
   if (opts.baseline !== undefined && opts.baseline !== null && opts.baseline.verdict !== "failed" && opts.baseline.tree !== null) {
     const baseline = { keys: new Map(opts.baseline.keys), files: new Map(opts.baseline.files) };
-    cmp = { ...diff(res.findings, baseline), baseline };
+    cmp = diff(res.findings, baseline);
   }
 
   const summary = summarize(res.findings, opts, reportFile, cmp);
