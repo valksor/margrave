@@ -7,6 +7,8 @@ test("clean strips ANSI escapes and C0/C1 control characters", () => {
   assert.equal(clean("\u001b[31mred\u001b[0m text"), "red text");
   assert.equal(clean("a\u0000b\u0007c\u007fd\u0085e\u009bf"), "abcdef");
   assert.equal(clean("title\u001b]0;evil\u0007 end"), "title end");
+  assert.equal(clean("a\u001bMb"), "ab");
+  assert.equal(clean("a\u001bqb"), "aqb");
   assert.equal(clean("line1\nline2\tx\r"), "line1 line2 x");
   assert.equal(clean("plain ünïcode ✓"), "plain ünïcode ✓");
 });

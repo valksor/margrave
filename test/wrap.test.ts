@@ -105,6 +105,11 @@ test("defaultWrapInput in a SEA uses the invoked path, and process.execPath when
   assert.equal(defaultWrapInput(true, "./bin/margrave").command, path.resolve("./bin/margrave"));
 });
 
+test("defaultWrapInput in a SEA falls back to process.execPath without an invoked path", (t) => {
+  t.mock.property(process, "argv", [process.execPath]);
+  assert.equal(defaultWrapInput(true).command, process.execPath);
+});
+
 test("`margrave wrap` prints, exits 0, and writes nothing into MARGRAVE_HOME", async () => {
   const home = await tmp("mg-home-");
   for (const agent of AGENTS) {
@@ -137,7 +142,7 @@ test("wrap rejects an unknown agent, and adds a build note only when dist/cli.js
   });
   assert.throws(
     () => wrap("emacs"),
-    (e: unknown) => e instanceof UsageError && /unknown agent "emacs"/u.test(e.message),
+    (e: unknown) => e instanceof UsageError && e.message === 'unknown agent "emacs"; use one of: claude, codex, bb, generic',
   );
 
   const exists = mock.method(fs, "existsSync", () => false);
