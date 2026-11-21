@@ -396,8 +396,10 @@ To roll back, stop Margrave readers and writers. Move the upgraded store aside. 
 nvm use && pnpm install --frozen-lockfile
 pnpm run build  # tsrs, chmod +x dist/cli.js, then scripts/ensure-ripwire.mjs
 pnpm run build:sea  # build the standalone development binary at build/dev/bin/margrave-dev
-pnpm test       # node --test test/ under c8 (runs the .ts sources directly; no network, temp MARGRAVE_HOME); fails when line, branch, function, or statement coverage of src/ is below 100%
+pnpm test       # run coverage tests and CodeQL (requires the CodeQL CLI)
 ```
+
+See [contributor instructions](CONTRIBUTING.md) for the test commands and prerequisites.
 
 ## License
 

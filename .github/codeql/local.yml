@@ -1,0 +1,7 @@
+paths-ignore:
+  - /build
+  - /coverage
+  - /dist
+  - /node_modules
+  - /vendor
+  - /.stryker-tmp

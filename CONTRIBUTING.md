@@ -27,11 +27,15 @@ Thank you for your interest in contributing to margrave. Contributions are welco
 
 ## Development
 
+- CodeQL CLI with the JavaScript and GitHub Actions query packs. Put `codeql` on your PATH. See the [CodeQL CLI setup instructions](https://docs.github.com/en/code-security/how-tos/find-and-fix-code-vulnerabilities/scan-from-the-command-line/set-up-codeql-cli).
+
 ### Available scripts
 
 - `pnpm build` - Compile `src/` to `dist/` with tsrs, then make sure `vendor/ripwire/` holds the pinned ripwire
 - `pnpm build:sea` - Build the standalone development executable at `build/dev/bin/margrave-dev`. The build appends `-dirty` to the package version and ad-hoc signs the executable on macOS. The executable embeds the Node version in `.nvmrc`.
-- `pnpm test` - Run the tests under c8 (`node --test test/`; no network, temporary `MARGRAVE_HOME`). It fails when line, branch, function, or statement coverage of `src/` is below 100%. The coverage gate needs a non-root user, because the tests that need unreadable files skip as root. The run also writes `coverage/lcov.info`, which CI uploads to Coveralls
+- `pnpm test` - Run the coverage tests and the local CodeQL scan
+- `pnpm test:unit` - Run the tests under c8 (`node --test test/`; no network, temporary `MARGRAVE_HOME`). It fails when line, branch, function, or statement coverage of `src/` is below 100%. The coverage gate needs a non-root user, because the tests that need unreadable files skip as root. The run also writes `coverage/lcov.info`, which CI uploads to Coveralls
+- `pnpm test:codeql` - Scan JavaScript, TypeScript, and GitHub Actions with CodeQL. Each finding prints as an error and fails the command
 - `pnpm lint` - Check the code with oxlint, including type-aware rules and type errors in the linted files (via tsrs-lint)
 - `pnpm lint:fix` - Apply oxlint's automatic fixes
 - `pnpm format` - Format all files with prettier

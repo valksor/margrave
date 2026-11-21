@@ -53,7 +53,7 @@ jobs:
         run: pnpm typecheck
 
       - name: Run tests
-        run: pnpm test
+        run: pnpm test:unit
 
       # Upload only. A Coveralls outage never fails the run. GITHUB_TOKEN
       # identifies the repo to Coveralls, so no repo token secret is needed.
