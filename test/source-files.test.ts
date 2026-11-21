@@ -7,11 +7,21 @@ import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import type { TestContext } from "node:test";
 import { scanSource } from "../src/scan.ts";
-import { prepareSnapshot, syncSnapshot, toEntries } from "../src/source-files.ts";
+import {
+  commit as sourceFilesCommit,
+  gitDir,
+  ownedStage,
+  prepareSnapshot,
+  syncSnapshot,
+  toEntries,
+  withStaging,
+} from "../src/source-files.ts";
 import { findSource, resolveScanRoot, sourceDir, installSource, localId, reindexAll, removeSource, updateSources } from "../src/sources.ts";
 import { UsageError } from "../src/store.ts";
-import type { SourceRecord } from "../src/store.ts";
 import {
+  assertWriterAvailable,
+  disposableHome,
+  gitSourceRecord,
   changeAtLock,
   catalogRecords,
   fakeRipwire,
@@ -20,6 +30,7 @@ import {
   indexRows,
   makeRepo,
   realExec,
+  realClose,
   runCli,
   seedIndex,
   tmp,
@@ -79,21 +90,11 @@ test("sourceDir only returns a direct child of sources/", async () => {
 });
 
 test("findSource accepts an id or the original spec", () => {
-  const rec = (id: string, spec: string): SourceRecord => ({
-    id,
-    kind: "git",
-    spec,
-    url: "u",
-    subpath: "",
-    ref: null,
-    commit: "abc",
-    installedAt: "now",
-  });
-  const list = [rec("o__r", "o/r"), rec("o__q", "o/q")];
+  const list = [gitSourceRecord("o__r", "o/r"), gitSourceRecord("o__q", "o/q")];
   assert.equal(findSource(list, "o__r").id, "o__r");
   assert.equal(findSource(list, "o/q").id, "o__q");
   assert.throws(() => findSource(list, "zzz"), /no source/u);
-  assert.throws(() => findSource([rec("a", "same"), rec("b", "same")], "same"), /several sources/u);
+  assert.throws(() => findSource([gitSourceRecord("a", "same"), gitSourceRecord("b", "same")], "same"), /several sources/u);
 });
 
 test("install: when catalog publication fails, the old catalog stays", async (t) => {
@@ -1058,5 +1059,458 @@ test("source files snapshot direct prepare retains renamed destination after syn
   } finally {
     spy.mock.restore();
     syncBuiltinESMExports();
+  }
+});
+
+async function ownershipStage(home: string, name: string, row: string | null = name): Promise<string> {
+  const dir = path.join(home, "staging", name);
+  await mkdir(dir, { recursive: true });
+  const db = new DatabaseSync(path.join(dir, ".margrave-owner.db"), { timeout: 0 });
+  try {
+    db.exec("CREATE TABLE owner(name TEXT NOT NULL)");
+    if (row !== null) db.prepare("INSERT INTO owner(name) VALUES (?)").run(row);
+  } finally {
+    db.close();
+  }
+  return dir;
+}
+
+test("source files ownership direct paths and lookup guards", async (t) => {
+  const home = await disposableHome(t);
+  const root = path.join(home, "sources");
+  const dir = path.join(root, "owner__repo");
+  const rec = gitSourceRecord("owner__repo", "owner/repo", "snapshot");
+  assert.equal(sourceDir(rec.id), dir);
+  assert.equal(gitDir(rec), path.join(home, "snapshots", rec.id, "snapshot"));
+  assert.throws(() => gitDir({ ...rec, id: "../bad" }), UsageError);
+  for (const method of ["dirname", "basename"] as const) {
+    const original = path[method];
+    const spy = mock.method(path, method, (value: string) => (value === dir ? "unsafe" : original(value)));
+    try {
+      assert.throws(() => sourceDir(rec.id), { message: `refused: ${dir} is not a direct child of ${root}` });
+    } finally {
+      spy.mock.restore();
+    }
+  }
+  assert.deepEqual(await readdir(home), []);
+  const first = { ...rec, id: "first", spec: "match" };
+  const second = { ...rec, id: "match", spec: "other" };
+  assert.strictEqual(findSource([first, second], "match"), second);
+  assert.strictEqual(findSource([first, second], "other"), second);
+  assert.throws(() => findSource([first, second], "missing"), { message: 'no source "missing"; run: margrave list' });
+  assert.throws(() => findSource([first, { ...second, id: "second", spec: "match" }], "match"), {
+    message: '"match" matches several sources; use an id:\n  first\n  second',
+  });
+});
+
+test("source files ownership direct stage lifecycle and locks", async (t) => {
+  const home = await disposableHome(t);
+  const owners = new Map<string, DatabaseSync>();
+  const writers = new Set<DatabaseSync>();
+  const execSpy = mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && this.location("main") === path.join(home, "writer-lock.db")) writers.add(this);
+    const file = this.location("main");
+    if (sql === "CREATE TABLE owner(name TEXT NOT NULL)" && file?.startsWith(path.join(home, "staging") + path.sep)) owners.set(file, this);
+    return realExec.call(this, sql);
+  });
+  const originalRm = fsp.rm;
+  const removals: Array<[unknown, unknown]> = [];
+  const rmSpy = mock.method(fsp, "rm", ((file: string, options: unknown) => {
+    if (path.dirname(file) === path.join(home, "staging")) removals.push([file, options]);
+    return originalRm(file, options as Parameters<typeof fsp.rm>[1]);
+  }) as typeof fsp.rm);
+  syncBuiltinESMExports();
+  try {
+    const stage = await ownedStage("restore-");
+    assert.equal(path.dirname(stage.dir), path.join(home, "staging"));
+    assert.match(path.basename(stage.dir), /^restore-[A-Za-z0-9]{6}$/u);
+    const ownerFile = path.join(stage.dir, ".margrave-owner.db");
+    const owner = owners.get(ownerFile);
+    assert.ok(owner?.isTransaction);
+    assert.equal(owner.location("main"), ownerFile);
+    const reader = new DatabaseSync(ownerFile, { readOnly: true, timeout: 0 });
+    try {
+      assert.equal(reader.prepare("SELECT name FROM owner").get()?.["name"], path.basename(stage.dir));
+    } finally {
+      reader.close();
+    }
+    const contender = new DatabaseSync(ownerFile, { timeout: 0 });
+    try {
+      assert.throws(() => contender.exec("BEGIN IMMEDIATE"), { errcode: 5 });
+    } finally {
+      contender.close();
+    }
+    assertWriterAvailable(home);
+    await writeFile(path.join(stage.dir, "content"), "data");
+    const actualOwner = owner;
+    const close = mock.method(DatabaseSync.prototype, "close");
+    const stageDir = stage.dir;
+    try {
+      await stage.close();
+      assert.ok(close.mock.calls.some((call) => call.this === actualOwner));
+      assert.deepEqual(
+        removals.find(([file]) => file === stageDir),
+        [stageDir, { recursive: true, force: true }],
+      );
+    } finally {
+      close.mock.restore();
+    }
+    const value = {};
+    let successful = "";
+    assert.strictEqual(
+      await withStaging(async (dir) => {
+        successful = dir;
+        await Promise.resolve();
+        assert.ok((await stat(dir)).isDirectory());
+        return value;
+      }),
+      value,
+    );
+    assert.equal(path.dirname(successful), path.join(home, "staging"));
+    assert.match(path.basename(successful), /^s-[A-Za-z0-9]{6}$/u);
+    await assert.rejects(stat(successful), { code: "ENOENT" });
+    const failure = new Error("callback failure");
+    let failed = "";
+    await assert.rejects(
+      withStaging((dir) => {
+        failed = dir;
+        return Promise.reject(failure);
+      }),
+      (error) => error === failure,
+    );
+    await assert.rejects(stat(failed), { code: "ENOENT" });
+  } finally {
+    for (const handle of [...owners.values(), ...writers]) if (handle.isOpen) realClose.call(handle);
+    rmSpy.mock.restore();
+    execSpy.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test("source files ownership direct initialization failures release the writer", async (t) => {
+  const home = await disposableHome(t);
+  const staging = path.join(home, "staging");
+  for (const kind of ["mkdtemp", "owner"] as const) {
+    const failure = new Error(kind);
+    const writers = new Set<DatabaseSync>();
+    const owners = new Set<DatabaseSync>();
+    let created: string | undefined;
+    const execSpy = mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+      if (sql === "BEGIN IMMEDIATE" && this.location("main") === path.join(home, "writer-lock.db")) writers.add(this);
+      if (sql === "CREATE TABLE owner(name TEXT NOT NULL)" && this.location("main") === path.join(created!, ".margrave-owner.db")) {
+        owners.add(this);
+        if (kind === "owner") throw failure;
+      }
+      return realExec.call(this, sql);
+    });
+    const realMkdtemp = fsp.mkdtemp;
+    const mkSpy = mock.method(fsp, "mkdtemp", (async (prefix: string, ...args: unknown[]) => {
+      if (prefix === path.join(staging, "restore-")) {
+        if (kind === "mkdtemp") throw failure;
+        created = await (realMkdtemp as (prefix: string) => Promise<string>)(prefix);
+        return created;
+      }
+      return (realMkdtemp as (...args: unknown[]) => Promise<string>)(prefix, ...args);
+    }) as typeof fsp.mkdtemp);
+    const realRm = fsp.rm;
+    const removals: Array<[unknown, unknown]> = [];
+    const rmSpy = mock.method(fsp, "rm", ((file: string, options: unknown) => {
+      if (file === created) removals.push([file, options]);
+      return realRm(file, options as Parameters<typeof fsp.rm>[1]);
+    }) as typeof fsp.rm);
+    syncBuiltinESMExports();
+    try {
+      let thrown: unknown;
+      try {
+        await ownedStage("restore-");
+      } catch (error) {
+        thrown = error;
+      }
+      const capturedWriters = [...writers];
+      const owner = [...owners][0];
+      try {
+        assertWriterAvailable(home);
+        assert.strictEqual(thrown, failure);
+        assert.equal(capturedWriters.length, 1);
+        assert.equal(capturedWriters[0]?.isOpen, false);
+        if (kind === "owner") {
+          assert.ok(owner);
+          assert.equal(owner.isOpen, false);
+          assert.deepEqual(removals, [[created, { recursive: true, force: true }]]);
+        } else {
+          assert.equal(owner, undefined);
+          assert.deepEqual(removals, []);
+        }
+        assert.deepEqual(await readdir(staging), []);
+      } finally {
+        for (const handle of [...writers, ...owners]) if (handle.isOpen) realClose.call(handle);
+      }
+    } finally {
+      rmSpy.mock.restore();
+      mkSpy.mock.restore();
+      execSpy.mock.restore();
+      syncBuiltinESMExports();
+    }
+  }
+});
+
+test("source files ownership direct commit cleanup selects only abandoned owners", async (t) => {
+  const home = await disposableHome(t);
+  const writers = new Set<DatabaseSync>();
+  const writerSpy = mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && this.location("main") === path.join(home, "writer-lock.db")) writers.add(this);
+    return realExec.call(this, sql);
+  });
+  try {
+    await sourceFilesCommit(() => undefined);
+    assertWriterAvailable(home);
+    const staging = path.join(home, "staging");
+    await mkdir(staging, { recursive: true });
+    const removed = [await ownershipStage(home, "s-Ab1234"), await ownershipStage(home, "restore-Cd5678")];
+    for (const dir of removed) await writeFile(path.join(dir, "payload"), "keep until removal");
+    for (const name of ["xs-Ef9012", "s-Gh3456x", "xrestore-Ij7890", "restore-Kl1234x", "s-Mn12_4", "restore-Op12_4"])
+      await ownershipStage(home, name);
+    await writeFile(path.join(staging, "s-Qr1234"), "regular file");
+    await mkdir(path.join(staging, "s-St1234"));
+    await mkdir(path.join(staging, "s-Uv1234", ".margrave-owner.db"), { recursive: true });
+    await mkdir(path.join(staging, "s-Wx1234"));
+    const symlinkTarget = path.join(home, "symlink-owner.db");
+    const symlinkDb = new DatabaseSync(symlinkTarget, { timeout: 0 });
+    try {
+      symlinkDb.exec("CREATE TABLE owner(name TEXT NOT NULL)");
+      symlinkDb.prepare("INSERT INTO owner(name) VALUES (?)").run("s-Wx1234");
+    } finally {
+      symlinkDb.close();
+    }
+    await fsp.symlink(symlinkTarget, path.join(staging, "s-Wx1234", ".margrave-owner.db"));
+    await ownershipStage(home, "s-Yz1234", null);
+    await ownershipStage(home, "s-Aa1234", "wrong");
+    const liveDir = await ownershipStage(home, "s-Bb1234");
+    const live = new DatabaseSync(path.join(liveDir, ".margrave-owner.db"), { timeout: 0 });
+    live.exec("BEGIN IMMEDIATE");
+    await mkdir(path.join(staging, "s-Cc1234"));
+    await writeFile(path.join(staging, "s-Cc1234", ".margrave-owner.db"), "not sqlite");
+    await mkdir(path.join(staging, "s-Dd1234"));
+    const missing = new DatabaseSync(path.join(staging, "s-Dd1234", ".margrave-owner.db"), { timeout: 0 });
+    missing.exec("CREATE TABLE other(name TEXT)");
+    missing.close();
+    const handles = new Map<string, DatabaseSync>();
+    const realPrepare = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare")!.value as typeof DatabaseSync.prototype.prepare;
+    const prepareSpy = mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+      const file = this.location("main");
+      if (sql === "SELECT name FROM owner" && file && removed.some((dir) => file === path.join(dir, ".margrave-owner.db"))) {
+        handles.set(path.dirname(file), this);
+      }
+      return realPrepare.call(this, sql);
+    });
+    const originalRm = fsp.rm;
+    const calls: Array<{ file: string; options: unknown; locked: boolean }> = [];
+    const rmSpy = mock.method(fsp, "rm", ((file: string, options: unknown) => {
+      if (removed.includes(file)) calls.push({ file, options, locked: handles.get(file)?.isTransaction === true });
+      return originalRm(file, options as Parameters<typeof fsp.rm>[1]);
+    }) as typeof fsp.rm);
+    syncBuiltinESMExports();
+    try {
+      await sourceFilesCommit(() => undefined);
+      assertWriterAvailable(home);
+      assert.deepEqual(calls.map(({ file }) => file).sort(), [...removed].sort());
+      for (const call of calls) {
+        assert.deepEqual(call.options, { recursive: true, force: true });
+        assert.equal(call.locked, true);
+      }
+      assert.equal(handles.size, removed.length);
+      assert.ok([...handles.values()].every((db) => !db.isOpen));
+      assert.deepEqual(
+        (await readdir(staging)).sort(),
+        [
+          "restore-Kl1234x",
+          "restore-Op12_4",
+          "s-Aa1234",
+          "s-Bb1234",
+          "s-Cc1234",
+          "s-Dd1234",
+          "s-Gh3456x",
+          "s-Mn12_4",
+          "s-Qr1234",
+          "s-St1234",
+          "s-Uv1234",
+          "s-Wx1234",
+          "s-Yz1234",
+          "xrestore-Ij7890",
+          "xs-Ef9012",
+        ].sort(),
+      );
+    } finally {
+      live.close();
+      for (const handle of handles.values()) if (handle.isOpen) realClose.call(handle);
+      rmSpy.mock.restore();
+      prepareSpy.mock.restore();
+      syncBuiltinESMExports();
+    }
+  } finally {
+    for (const writer of writers) if (writer.isOpen) realClose.call(writer);
+    writerSpy.mock.restore();
+  }
+});
+
+test("source files ownership direct cleanup readdir and removal failures", async (t) => {
+  const home = await disposableHome(t);
+  const writers = new Set<DatabaseSync>();
+  const writerSpy = mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && this.location("main") === path.join(home, "writer-lock.db")) writers.add(this);
+    return realExec.call(this, sql);
+  });
+  try {
+    const staging = path.join(home, "staging");
+    await mkdir(staging, { recursive: true });
+    const denied = Object.assign(new Error("staging denied"), { code: "EACCES" });
+    const realReaddir = fsp.readdir;
+    const readSpy = mock.method(fsp, "readdir", ((file: string, ...args: unknown[]) =>
+      file === staging ? Promise.reject(denied) : (realReaddir as (...args: unknown[]) => unknown)(file, ...args)) as typeof fsp.readdir);
+    syncBuiltinESMExports();
+    let published = false;
+    try {
+      await assert.rejects(
+        sourceFilesCommit(() => {
+          published = true;
+          return [];
+        }),
+        (error) => error === denied,
+      );
+      assertWriterAvailable(home);
+      assert.equal(published, false);
+    } finally {
+      readSpy.mock.restore();
+      syncBuiltinESMExports();
+    }
+    const dir = await ownershipStage(home, "s-Ab1234");
+    const failure = new Error("remove denied");
+    const realRm = fsp.rm;
+    const owners = new Set<DatabaseSync>();
+    const realPrepare = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare")!.value as typeof DatabaseSync.prototype.prepare;
+    const prepareSpy = mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+      if (sql === "SELECT name FROM owner" && this.location("main") === path.join(dir, ".margrave-owner.db")) owners.add(this);
+      return realPrepare.call(this, sql);
+    });
+    let removeOptions: unknown;
+    const rmSpy = mock.method(fsp, "rm", ((file: string, options: unknown) => {
+      if (file === dir) {
+        removeOptions = options;
+        return Promise.reject(failure);
+      }
+      return realRm(file, options as Parameters<typeof fsp.rm>[1]);
+    }) as typeof fsp.rm);
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(
+        sourceFilesCommit(() => undefined),
+        (error) => error === failure,
+      );
+      assertWriterAvailable(home);
+      assert.equal(owners.size, 1);
+      assert.ok([...owners].every((owner) => !owner.isOpen));
+      assert.deepEqual(removeOptions, { recursive: true, force: true });
+      assert.deepEqual(await readdir(dir), [".margrave-owner.db"]);
+    } finally {
+      for (const owner of owners) if (owner.isOpen) realClose.call(owner);
+      rmSpy.mock.restore();
+      prepareSpy.mock.restore();
+      syncBuiltinESMExports();
+    }
+  } finally {
+    for (const writer of writers) if (writer.isOpen) realClose.call(writer);
+    writerSpy.mock.restore();
+  }
+});
+
+test("source files ownership direct cleanup preserves unexpected errors", async (t) => {
+  const home = await disposableHome(t);
+  const writers = new Set<DatabaseSync>();
+  const writerSpy = mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && this.location("main") === path.join(home, "writer-lock.db")) writers.add(this);
+    return realExec.call(this, sql);
+  });
+  try {
+    const dir = await ownershipStage(home, "s-Ab1234");
+    const file = path.join(dir, ".margrave-owner.db");
+    const denial = Object.assign(new Error("owner denied"), { code: "EACCES" });
+    const realLstat = fsp.lstat;
+    const statSpy = mock.method(fsp, "lstat", ((name: string, ...args: unknown[]) =>
+      name === file ? Promise.reject(denial) : (realLstat as (...args: unknown[]) => unknown)(name, ...args)) as typeof fsp.lstat);
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(
+        sourceFilesCommit(() => undefined),
+        (error) => error === denial,
+      );
+      assertWriterAvailable(home);
+    } finally {
+      statSpy.mock.restore();
+      syncBuiltinESMExports();
+    }
+    assert.deepEqual(await readdir(dir), [".margrave-owner.db"]);
+    for (const failure of [
+      Object.assign(new Error("no such table: owner"), { errcode: 10 }),
+      Object.assign(new Error("other error"), { errcode: 1 }),
+      { errcode: 1, message: "no such table: owner" },
+    ]) {
+      const owners = new Set<DatabaseSync>();
+      const realPrepare = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare")!
+        .value as typeof DatabaseSync.prototype.prepare;
+      const prepareSpy = mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+        if (sql === "SELECT name FROM owner" && this.location("main") === file) {
+          owners.add(this);
+          // This case deliberately throws a non-Error value.
+          throw failure as Error;
+        }
+        return realPrepare.call(this, sql);
+      });
+      try {
+        await assert.rejects(
+          sourceFilesCommit(() => undefined),
+          (error) => error === failure,
+        );
+        assertWriterAvailable(home);
+        assert.equal(owners.size, 1);
+        assert.ok([...owners].every((owner) => !owner.isOpen));
+        assert.deepEqual(await readdir(dir), [".margrave-owner.db"]);
+      } finally {
+        for (const owner of owners) if (owner.isOpen) realClose.call(owner);
+        prepareSpy.mock.restore();
+      }
+    }
+    let openError: unknown;
+    const goneSpy = mock.method(fsp, "lstat", (async (name: string, ...args: unknown[]) => {
+      const result = await (realLstat as (...args: unknown[]) => Promise<Awaited<ReturnType<typeof fsp.lstat>>>)(name, ...args);
+      if (name === file) {
+        await rm(dir, { recursive: true, force: true });
+        try {
+          new DatabaseSync(file, { timeout: 0 }).close();
+        } catch (error) {
+          openError = error;
+        }
+      }
+      return result;
+    }) as typeof fsp.lstat);
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(
+        sourceFilesCommit(() => undefined),
+        (error) =>
+          error instanceof Error &&
+          openError instanceof Error &&
+          error.message === openError.message &&
+          (error as NodeJS.ErrnoException).code === (openError as NodeJS.ErrnoException).code,
+      );
+      assertWriterAvailable(home);
+      assert.ok(openError);
+      await assert.rejects(stat(dir), { code: "ENOENT" });
+    } finally {
+      goneSpy.mock.restore();
+      syncBuiltinESMExports();
+    }
+  } finally {
+    for (const writer of writers) if (writer.isOpen) realClose.call(writer);
+    writerSpy.mock.restore();
   }
 });

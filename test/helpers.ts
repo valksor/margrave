@@ -668,3 +668,19 @@ export async function hostedUseHome(t: { after: (fn: () => void) => void }): Pro
   });
   return home;
 }
+
+export async function disposableHome(t: { after: (fn: () => void | Promise<void>) => void }): Promise<string> {
+  const home = await hostedUseHome(t);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  return home;
+}
+
+export function assertWriterAvailable(home: string): void {
+  using db = new DatabaseSync(path.join(home, "writer-lock.db"), { timeout: 0 });
+  realExec.call(db, "BEGIN IMMEDIATE");
+}
+
+export function gitSourceRecord(id: string, spec = id, snapshot = `${"a".repeat(40)}-${"b".repeat(16)}`): SourceRecord {
+  const [commit] = snapshot.split("-", 1);
+  return { id, kind: "git", spec, url: "u", subpath: "", ref: null, commit: commit!, installedAt: "now", snapshot };
+}

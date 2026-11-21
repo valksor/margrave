@@ -38,6 +38,13 @@ if (process.argv.length > 2) {
       "--test-name-pattern='^(source Git direct |spec parsing|owner/repo|a spec or --ref|a subpath segment|malformed specs|source ids|a git URL)'",
       "test/source-git.test.ts",
     ],
+    "source-files": [
+      "--test-timeout=2000",
+      "--test-name-pattern='^source files (snapshot|ownership|publication|scan) direct '",
+      "test/source-files.test.ts",
+      "test/source-files-publication.test.ts",
+      "test/source-files-scan.test.ts",
+    ],
     "source-maintenance": [
       "--test-name-pattern='^(source maintenance direct |check reports a source record|check reports a metadata read|check scans valid skills|check reports an unavailable local Git remote|reindex: control characters|a reindex whose sources|a remove whose source)'",
       "test/source-maintenance.test.ts",

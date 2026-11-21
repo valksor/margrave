@@ -29,9 +29,7 @@ export function sourceDir(id: string): string {
   checkId(id);
   const root = path.resolve(sourcesRoot());
   const dir = path.join(root, id);
-  // Defence in depth in front of every `rm -rf`. checkId() already limits `id` to one safe path segment,
-  // so no test can make this fire; the guard stays so a later change to checkId() cannot make it unsafe.
-  /* node:coverage ignore next 3 */
+  // Keep both path checks as independent defenses before recursive removal, even if checkId() changes.
   if (path.dirname(dir) !== root || path.basename(dir) !== id) {
     throw new MargraveError(`refused: ${dir} is not a direct child of ${root}`);
   }
@@ -49,8 +47,8 @@ export function findSource(sources: readonly SourceRecord[], arg: string): Sourc
   const byId = sources.find((s) => s.id === arg);
   if (byId !== undefined) return byId;
   const bySpec = sources.filter((s) => s.spec === arg);
-  if (bySpec.length === 1 && bySpec[0] !== undefined) return bySpec[0];
-  if (bySpec.length > 1) {
+  if (bySpec.length === 1) return bySpec[0]!;
+  if (bySpec.length !== 0) {
     throw new MargraveError(`"${arg}" matches several sources; use an id:\n${bySpec.map((s) => `  ${s.id}`).join("\n")}`);
   }
   throw new MargraveError(`no source "${arg}"; run: margrave list`);
@@ -73,7 +71,7 @@ export async function ownedStage(prefix: "s-" | "restore-"): Promise<{ dir: stri
   let result: { dir: string; close: () => Promise<void> };
   try {
     dir = await mkdtemp(path.join(stagingRoot(), prefix));
-    owner = new DatabaseSync(path.join(dir, ".margrave-owner.db"), { timeout: 0 });
+    owner = new DatabaseSync(path.join(dir, ".margrave-owner.db"));
     owner.exec("CREATE TABLE owner(name TEXT NOT NULL)");
     owner.prepare("INSERT INTO owner(name) VALUES (?)").run(path.basename(dir));
     owner.exec("BEGIN IMMEDIATE");
@@ -113,7 +111,7 @@ async function cleanupStages(): Promise<void> {
     let owner: DatabaseSync | undefined;
     let abandoned = false;
     try {
-      owner = new DatabaseSync(file, { timeout: 0 });
+      owner = new DatabaseSync(file);
       const marker = owner.prepare("SELECT name FROM owner").get();
       if (marker?.["name"] !== entry.name) continue;
       owner.exec("BEGIN IMMEDIATE");
@@ -128,7 +126,7 @@ async function cleanupStages(): Promise<void> {
         try {
           await rm(dir, { recursive: true, force: true });
         } finally {
-          owner?.close();
+          owner!.close();
         }
       } else owner?.close();
     }
