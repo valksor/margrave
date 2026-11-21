@@ -3,6 +3,7 @@ import type { Stats } from "node:fs";
 import { copyFile, mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { setTimeout } from "node:timers/promises";
 import type { NewEntry, SourceRecord } from "./store-files.ts";
 import {
   MargraveError,
@@ -198,26 +199,29 @@ export function putCatalogSources(db: DatabaseSync, sources: readonly SourceReco
   for (const [position, source] of sources.entries()) insert.run(source.id, JSON.stringify(source), position);
 }
 
+async function attemptWriterLock(db: DatabaseSync, deadline: number): Promise<DatabaseSync> {
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    return db;
+  } catch (err) {
+    if ((err as { errcode?: number }).errcode !== 5) throw err;
+    if (Date.now() >= deadline) throw new MargraveError("another Margrave writer holds the store lock. Try the command again");
+  }
+  await setTimeout(25);
+  return attemptWriterLock(db, deadline);
+}
+
 export async function writerLock(): Promise<DatabaseSync> {
   await mkdir(home(), { recursive: true });
   let db: DatabaseSync;
   try {
-    db = new DatabaseSync(path.join(home(), "writer-lock.db"), { timeout: 0 });
+    db = new DatabaseSync(path.join(home(), "writer-lock.db"));
   } catch (err) {
     throw new MargraveError(`cannot complete the store operation: ${(err as Error).message}`);
   }
   const deadline = Date.now() + WRITE_TIMEOUT_MS;
   try {
-    for (;;) {
-      try {
-        db.exec("BEGIN IMMEDIATE");
-        return db;
-      } catch (err) {
-        if ((err as { errcode?: number }).errcode !== 5) throw err;
-        if (Date.now() >= deadline) throw new MargraveError("another Margrave writer holds the store lock. Try the command again");
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-    }
+    return await attemptWriterLock(db, deadline);
   } catch (err) {
     db.close();
     throw err;

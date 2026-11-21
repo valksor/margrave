@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fsp, { readFile, chmod, mkdir, readdir, rename, rm, stat, symlink, writeFile, cp, readlink, realpath } from "node:fs/promises";
 import path from "node:path";
+import timers from "node:timers/promises";
 import test, { mock } from "node:test";
 import { installSource, reindexAll, removeSource, updateSources } from "../src/sources.ts";
 import {
@@ -16,6 +17,13 @@ import {
   openProbed,
   catalogSources,
   putCatalogSources,
+  catalogTempPath,
+  publishCatalog,
+  cleanupCatalogTemps,
+  openCatalogReadOptional,
+  deleteAllSkills,
+  skillHashes,
+  READ_TIMEOUT_MS,
 } from "../src/catalog.ts";
 import { MargraveError } from "../src/store-files.ts";
 import { writerLock, home as storeHome } from "../src/store.ts";
@@ -174,7 +182,7 @@ const readArgs = (s: { id: string; other: string }): string[][] => [
   ["remove", s.id],
 ];
 
-async function seedDirectIndex(home: string, entries: Parameters<typeof seedIndex>[0]): Promise<void> {
+async function withBoundedIndexProbes<T>(home: string, action: () => Promise<T>): Promise<T> {
   const file = path.join(home, "index.db");
   const lstat = fsp.lstat;
   let probes = 0;
@@ -184,12 +192,536 @@ async function seedDirectIndex(home: string, entries: Parameters<typeof seedInde
   }) as typeof fsp.lstat);
   syncBuiltinESMExports();
   try {
-    await seedIndex(entries);
+    return await action();
   } finally {
     bounded.mock.restore();
     syncBuiltinESMExports();
   }
 }
+
+async function seedDirectIndex(home: string, entries: Parameters<typeof seedIndex>[0]): Promise<void> {
+  await withBoundedIndexProbes(home, () => seedIndex(entries));
+}
+
+test("catalog rows direct read handles are read-only and use the read timeout", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  assert.equal(await withBoundedIndexProbes(home, () => openCatalogReadOptional()), null);
+  await seedDirectIndex(home, [newEntry("s", "a")]);
+  const file = path.join(home, "index.db");
+  const handles: (DatabaseSync | null)[] = [await openIndexRead()];
+  const lstat = fsp.lstat;
+  let indexProbes = 0;
+  const ordinaryProbe = mock.method(fsp, "lstat", ((target: string, ...args: unknown[]) => {
+    if (target === file) indexProbes++;
+    return (lstat as (...values: unknown[]) => unknown)(target, ...args);
+  }) as typeof fsp.lstat);
+  syncBuiltinESMExports();
+  try {
+    handles.push(await openCatalogReadOptional());
+    assert.equal(indexProbes, 1);
+  } catch (err) {
+    for (const db of handles) db?.close();
+    throw err;
+  } finally {
+    ordinaryProbe.mock.restore();
+    syncBuiltinESMExports();
+  }
+  let first = true;
+  const probe = mock.method(fsp, "lstat", (async (target: string, ...args: unknown[]) => {
+    if (target === file && first) {
+      first = false;
+      throw Object.assign(new Error("missing"), { code: "ENOENT" });
+    }
+    return (lstat as (...values: unknown[]) => Promise<unknown>)(target, ...args);
+  }) as typeof fsp.lstat);
+  syncBuiltinESMExports();
+  try {
+    handles.push(await openCatalogReadOptional());
+  } catch (err) {
+    for (const db of handles) db?.close();
+    throw err;
+  } finally {
+    probe.mock.restore();
+    syncBuiltinESMExports();
+  }
+  try {
+    assert.equal(new Set(handles).size, 3);
+    for (const db of handles) {
+      assert.ok(db);
+      assert.throws(() => db.exec("CREATE TABLE harmless(x)"), /readonly/iu);
+      assert.equal(db.prepare("PRAGMA busy_timeout").get()?.["timeout"], READ_TIMEOUT_MS);
+    }
+  } finally {
+    for (const db of handles) db?.close();
+  }
+});
+
+test("catalog rows direct insert and delete maintain case, FTS, and source scope", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await seedDirectIndex(home, []);
+  const db = new DatabaseSync(path.join(home, "index.db"), { readBigInts: true });
+  try {
+    const a = {
+      ...newEntry("SourceA", "MixedName"),
+      tokens: { name: "nameunique", description: "descunique", headings: "headunique", body: "bodyunique" },
+    };
+    const b = { ...newEntry("SourceB", "OtherName"), tokens: { name: "otherunique", description: "", headings: "", body: "" } };
+    insertSkills(db, [a, b]);
+    const rows = db.prepare("SELECT rowid, id_lc, name_lc FROM skills ORDER BY rowid").all();
+    assert.deepEqual(
+      rows.map((row) => [row["id_lc"], row["name_lc"]]),
+      [
+        ["sourcea/mixedname", "mixedname"],
+        ["sourceb/othername", "othername"],
+      ],
+    );
+    for (const token of ["nameunique", "descunique", "headunique", "bodyunique"]) {
+      assert.equal(db.prepare("SELECT rowid FROM fts WHERE fts MATCH ?").get(token)?.["rowid"], rows[0]?.["rowid"]);
+    }
+    assert.deepEqual(skillHashes(db, "SourceA"), new Map([[a.id, a.revision]]));
+    deleteSourceSkills(db, "SourceA");
+    assert.deepEqual(skillHashes(db, "SourceB"), new Map([[b.id, b.revision]]));
+    assert.equal(db.prepare("SELECT rowid FROM fts WHERE fts MATCH 'otherunique'").get()?.["rowid"], rows[1]?.["rowid"]);
+    assert.equal(db.prepare("SELECT rowid FROM fts WHERE fts MATCH 'nameunique'").get(), undefined);
+    deleteAllSkills(db);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM skills").get()?.["n"], 0n);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM fts").get()?.["n"], 0n);
+  } finally {
+    db.close();
+  }
+});
+
+test("catalog write direct cleanup respects ownership and regular files", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const name = `.catalog-123-${"a".repeat(24)}.tmp`;
+  const file = path.join(home, name);
+  const owner = `${file}.owner`;
+  const bytes = "margrave-catalog-v1\n";
+  for (const kind of ["valid", "prefix", "suffix", "missing", "symlink", "directory", "wal", "shm"] as const) {
+    for (const entry of await readdir(home)) await rm(path.join(home, entry), { recursive: true, force: true });
+    if (kind === "prefix" || kind === "suffix") {
+      const marker = kind === "prefix" ? path.join(home, `.extra${name}.owner`) : `${owner}.extra`;
+      const derived = marker.slice(0, -".owner".length);
+      await writeFile(derived, "catalog");
+      await writeFile(marker, bytes);
+      const expected = (await readdir(home)).sort();
+      await cleanupCatalogTemps();
+      assert.deepEqual((await readdir(home)).sort(), expected, kind);
+      continue;
+    }
+    await writeFile(file, "catalog");
+    if (kind === "symlink") {
+      await writeFile(path.join(home, "owner-text"), bytes);
+      await symlink(path.join(home, "owner-text"), owner);
+    } else if (kind === "directory") await mkdir(owner);
+    else await writeFile(owner, bytes);
+    if (kind === "valid" || kind === "wal" || kind === "shm") {
+      for (const ext of ["-journal", "-wal", "-shm"]) await writeFile(file + ext, ext);
+      if (kind !== "valid") {
+        await rm(`${file}-${kind}`);
+        await mkdir(`${file}-${kind}`);
+      }
+    }
+    const before = (await readdir(home)).sort();
+    const lstat = fsp.lstat;
+    const probe = mock.method(fsp, "lstat", (async (target: string, ...args: unknown[]) => {
+      if (kind === "missing" && target === owner) await rm(owner);
+      return (lstat as (...values: unknown[]) => Promise<unknown>)(target, ...args);
+    }) as typeof fsp.lstat);
+    syncBuiltinESMExports();
+    try {
+      await cleanupCatalogTemps();
+    } finally {
+      probe.mock.restore();
+      syncBuiltinESMExports();
+    }
+    const expected = kind === "valid" ? [] : kind === "missing" ? [name] : before;
+    assert.deepEqual((await readdir(home)).sort(), expected, kind);
+  }
+});
+
+test("catalog write direct allocates and syncs the ownership marker", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const events: string[] = [];
+  const open = fsp.open;
+  const spy = mock.method(fsp, "open", (async (...args: Parameters<typeof open>) => {
+    const handle = await open(...args);
+    const name = String(args[0]);
+    const kind =
+      name === home ? "directory" : name.startsWith(path.join(home, ".catalog-")) && name.endsWith(".tmp.owner") ? "marker" : null;
+    if (kind !== null) {
+      const sync = handle.sync.bind(handle);
+      const close = handle.close.bind(handle);
+      handle.sync = async () => {
+        events.push(`${kind} sync`);
+        await sync();
+      };
+      handle.close = async () => {
+        events.push(`${kind} close`);
+        await close();
+      };
+    }
+    return handle;
+  }) as typeof fsp.open);
+  syncBuiltinESMExports();
+  let file: string;
+  try {
+    file = await catalogTempPath();
+  } finally {
+    spy.mock.restore();
+    syncBuiltinESMExports();
+  }
+  assert.equal(await readFile(`${file}.owner`, "utf8"), "margrave-catalog-v1\n");
+  await assert.rejects(stat(file), { code: "ENOENT" });
+  assert.deepEqual(events, ["marker sync", "marker close", "directory sync", "directory close"]);
+});
+
+test("catalog write direct pending cleanup preserves or removes the correct files", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  for (const mode of ["active", "stage", "missing"] as const) {
+    for (const name of await readdir(home)) await rm(path.join(home, name), { recursive: true, force: true });
+    const name = `.catalog-1-${"a".repeat(24)}.tmp`;
+    const file = path.join(home, name);
+    const marker = path.join(home, "catalog-published");
+    await writeFile(`${file}.owner`, "margrave-catalog-v1\n");
+    if (mode !== "missing") await writeFile(file, "stage");
+    if (mode === "active") await writeFile(path.join(home, "index.db"), "active");
+    await writeFile(marker, `pending ${name}\n`);
+    const events: string[] = [];
+    const open = fsp.open;
+    const spy = mock.method(fsp, "open", (async (...args: Parameters<typeof open>) => {
+      const handle = await open(...args);
+      if (args[0] === home) {
+        const sync = handle.sync.bind(handle);
+        const close = handle.close.bind(handle);
+        handle.sync = async () => {
+          events.push("sync");
+          await sync();
+        };
+        handle.close = async () => {
+          events.push("close");
+          await close();
+        };
+      }
+      return handle;
+    }) as typeof fsp.open);
+    syncBuiltinESMExports();
+    try {
+      await cleanupCatalogTemps();
+    } finally {
+      spy.mock.restore();
+      syncBuiltinESMExports();
+    }
+    const expected =
+      mode === "active" ? [name, `${name}.owner`, "catalog-published", "index.db"] : mode === "missing" ? ["catalog-published"] : [];
+    assert.deepEqual((await readdir(home)).sort(), expected.sort());
+    assert.deepEqual(events, mode === "stage" ? ["sync", "close"] : []);
+  }
+});
+
+test("catalog write direct publication syncs each phase in order", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  for (const replacement of [false, true]) {
+    for (const name of await readdir(home)) await rm(path.join(home, name), { recursive: true, force: true });
+    await seedDirectIndex(home, [newEntry("s", "a")]);
+    const index = path.join(home, "index.db");
+    const stage = path.join(home, `.catalog-1-${"a".repeat(24)}.tmp`);
+    await fsp.copyFile(index, stage);
+    if (!replacement) await rm(index);
+    const marker = path.join(home, "catalog-published");
+    const events: string[] = [];
+    const open = fsp.open;
+    const renameFile = fsp.rename;
+    const openSpy = mock.method(fsp, "open", (async (...args: Parameters<typeof open>) => {
+      const handle = await open(...args);
+      const kind = args[0] === stage ? "stage" : args[0] === home ? "directory" : null;
+      if (kind !== null) {
+        const sync = handle.sync.bind(handle);
+        const close = handle.close.bind(handle);
+        handle.sync = async () => {
+          events.push(`${kind} sync`);
+          await sync();
+        };
+        handle.close = async () => {
+          events.push(`${kind} close`);
+          await close();
+        };
+      }
+      return handle;
+    }) as typeof fsp.open);
+    const renameSpy = mock.method(fsp, "rename", (async (from, to) => {
+      if (from === stage && to === index) {
+        const bytes = await readFile(marker, "utf8").catch((err: NodeJS.ErrnoException) => {
+          if (err.code === "ENOENT") return null;
+          throw err;
+        });
+        events.push(`rename ${bytes ?? "absent"}`);
+      }
+      await renameFile(from, to);
+      if (to === marker) events.push(`marker ${await readFile(marker, "utf8")}`);
+    }) as typeof fsp.rename);
+    syncBuiltinESMExports();
+    try {
+      await publishCatalog(stage);
+    } finally {
+      renameSpy.mock.restore();
+      openSpy.mock.restore();
+      syncBuiltinESMExports();
+    }
+    const dir = ["directory sync", "directory close"];
+    assert.deepEqual(events, [
+      "stage sync",
+      "stage close",
+      ...(replacement ? [] : [`marker pending ${path.basename(stage)}\n`, ...dir]),
+      `rename ${replacement ? "absent" : `pending ${path.basename(stage)}\n`}`,
+      ...dir,
+      "marker published\n",
+      ...dir,
+    ]);
+    assert.equal(await readFile(marker, "utf8"), "published\n");
+    const db = new DatabaseSync(index, { readOnly: true });
+    try {
+      assert.equal(db.prepare("SELECT id FROM skills").get()?.["id"], "s/a");
+    } finally {
+      db.close();
+    }
+  }
+});
+
+test("catalog write direct writer lock returns its transaction and preserves errors", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const lockPath = path.join(home, "writer-lock.db");
+  await mkdir(lockPath);
+  let nativeDetail = "";
+  try {
+    new DatabaseSync(lockPath).close();
+  } catch (err) {
+    assert.ok(err instanceof Error);
+    nativeDetail = err.message;
+  }
+  assert.notEqual(nativeDetail, "");
+  await assert.rejects(
+    writerLock(),
+    (err: unknown) => err instanceof MargraveError && err.message === `cannot complete the store operation: ${nativeDetail}`,
+  );
+  await rm(lockPath, { recursive: true });
+  const failure = new Error("injected begin failure");
+  let injecting = false;
+  let attempts = 0;
+  const handles = new Map<DatabaseSync, string | null>();
+  const exec = mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && this.location("main") === lockPath) {
+      handles.set(this, this.location("main"));
+      if (injecting && ++attempts === 1) throw failure;
+    }
+    return realExec.call(this, sql);
+  });
+  const close = mock.method(DatabaseSync.prototype, "close");
+  const now = mock.method(Date, "now", () => (attempts === 0 ? 0 : 30000));
+  const delay = mock.method(timers, "setTimeout", (() => Promise.reject(new Error("unexpected lock retry"))) as typeof timers.setTimeout);
+  syncBuiltinESMExports();
+  try {
+    const lock = await writerLock();
+    try {
+      assert.equal(lock.isTransaction, true);
+      assert.equal(exec.mock.calls.find((call) => call.arguments[0] === "BEGIN IMMEDIATE")?.this, lock);
+    } finally {
+      lock.close();
+    }
+    injecting = true;
+    await assert.rejects(
+      writerLock().then((db) => {
+        db.close();
+        return db;
+      }),
+      (err: unknown) => err === failure,
+    );
+    const handle: unknown = exec.mock.calls.filter((call) => call.arguments[0] === "BEGIN IMMEDIATE").at(-1)?.this;
+    assert.ok(handle instanceof DatabaseSync);
+    assert.equal(handles.get(handle), lockPath);
+    assert.equal(attempts, 1);
+    assert.equal(close.mock.calls.filter((call) => call.this === handle).length, 1);
+    assert.equal(delay.mock.calls.length, 0);
+  } finally {
+    for (const handle of handles.keys()) if (handle.isOpen) handle.close();
+    delay.mock.restore();
+    syncBuiltinESMExports();
+    now.mock.restore();
+    close.mock.restore();
+    exec.mock.restore();
+  }
+});
+
+test("catalog write direct writer lock retries busy only before the deadline", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const lockPath = path.join(home, "writer-lock.db");
+  const busy = Object.assign(new Error("busy"), { errcode: 5 });
+  let attempts = 0;
+  let deadline = false;
+  const handles = new Map<DatabaseSync, string | null>();
+  const exec = mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && this.location("main") === lockPath) {
+      handles.set(this, this.location("main"));
+      if (++attempts === 1) throw busy;
+    }
+    return realExec.call(this, sql);
+  });
+  const close = mock.method(DatabaseSync.prototype, "close");
+  let clock = 0;
+  const now = mock.method(Date, "now", () => (clock++ === 0 ? 0 : deadline ? 30000 : 29999));
+  let delays = 0;
+  const delay = mock.method(timers, "setTimeout", ((ms: number) => {
+    assert.equal(ms, 25);
+    if (++delays > 1) return Promise.reject(new Error("unexpected lock retry"));
+    return Promise.resolve();
+  }) as typeof timers.setTimeout);
+  syncBuiltinESMExports();
+  try {
+    const lock = await writerLock();
+    try {
+      assert.equal(exec.mock.calls.at(-1)?.this, lock);
+      assert.equal(handles.get(lock), lockPath);
+      assert.equal(lock.isTransaction, true);
+      assert.equal(attempts, 2);
+      assert.equal(delay.mock.calls.length, 1);
+    } finally {
+      lock.close();
+    }
+    attempts = 0;
+    clock = 0;
+    deadline = true;
+    await assert.rejects(
+      writerLock().then((db) => {
+        db.close();
+        return db;
+      }),
+      (err: unknown) =>
+        err instanceof MargraveError && err.message === "another Margrave writer holds the store lock. Try the command again",
+    );
+    const handle: unknown = exec.mock.calls.at(-1)?.this;
+    assert.ok(handle instanceof DatabaseSync);
+    assert.equal(handles.get(handle), lockPath);
+    assert.equal(attempts, 1);
+    assert.equal(close.mock.calls.filter((call) => call.this === handle).length, 1);
+    assert.equal(delay.mock.calls.length, 1);
+  } finally {
+    for (const handle of handles.keys()) if (handle.isOpen) handle.close();
+    delay.mock.restore();
+    syncBuiltinESMExports();
+    now.mock.restore();
+    close.mock.restore();
+    exec.mock.restore();
+  }
+});
+
+test("catalog write direct temporary catalogs initialize and copy real rows", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const fresh = await withBoundedIndexProbes(home, () => temporaryCatalog());
+  try {
+    assert.equal(fresh.db.prepare("PRAGMA user_version").get()?.["user_version"], 4n);
+    assert.equal(fresh.db.prepare("PRAGMA busy_timeout").get()?.["timeout"], BigInt(READ_TIMEOUT_MS));
+    assert.equal(fresh.db.prepare("PRAGMA journal_mode").get()?.["journal_mode"], "delete");
+  } finally {
+    fresh.db.close();
+  }
+  await rm(fresh.file);
+  await rm(`${fresh.file}.owner`);
+  await seedDirectIndex(home, [newEntry("s", "a")]);
+  const original = await readFile(path.join(home, "index.db"));
+  const prepares = new Map<DatabaseSync, string | null>();
+  const preparedSql: string[] = [];
+  const sql: string[] = [];
+  const prepare = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare")!.value as typeof DatabaseSync.prototype.prepare;
+  const probe = mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, query: string): ReturnType<typeof prepare> {
+    preparedSql.push(query);
+    if (query.includes("FROM sqlite_master") && query.includes("pragma_user_version")) {
+      prepares.set(this, this.location("main"));
+      assert.throws(() => realExec.call(this, "CREATE TABLE harmless(x)"), /readonly/iu);
+    }
+    return prepare.call(this, query);
+  });
+  const exec = mock.method(DatabaseSync.prototype, "exec", function (this: DatabaseSync, query: string) {
+    sql.push(query);
+    return realExec.call(this, query);
+  });
+  const close = mock.method(DatabaseSync.prototype, "close");
+  try {
+    const copy = await temporaryCatalog();
+    try {
+      assert.equal(prepares.size, 2);
+      assert.deepEqual([...prepares.values()], [path.join(home, "index.db"), copy.file]);
+      for (const db of prepares.keys()) assert.equal(close.mock.calls.filter((call) => call.this === db).length, 1);
+      assert.ok(sql.every((query) => !query.includes("CREATE TABLE IF NOT EXISTS skills")));
+      assert.ok(!preparedSql.includes("SELECT id, record FROM sources ORDER BY position"));
+      assert.equal(
+        exec.mock.calls.filter((call) => call.this === copy.db && call.arguments[0] === "PRAGMA journal_mode = DELETE").length,
+        1,
+      );
+      assert.equal(copy.db.prepare("SELECT id FROM skills").get()?.["id"], "s/a");
+      assert.equal(copy.db.prepare("SELECT count(*) AS n FROM skills").get()?.["n"], 1n);
+      assert.equal(copy.db.prepare("PRAGMA busy_timeout").get()?.["timeout"], BigInt(READ_TIMEOUT_MS));
+      assert.equal(copy.db.prepare("PRAGMA journal_mode").get()?.["journal_mode"], "delete");
+    } finally {
+      copy.db.close();
+    }
+  } finally {
+    close.mock.restore();
+    exec.mock.restore();
+    probe.mock.restore();
+  }
+  assert.deepEqual(await readFile(path.join(home, "index.db")), original);
+});
+
+test("catalog write direct copy failures clean owned artifacts and preserve the active bytes", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await seedDirectIndex(home, [newEntry("s", "a")]);
+  const index = path.join(home, "index.db");
+  const original = await readFile(index);
+  for (const disappear of [false, true]) {
+    const failure = new Error("copy failure");
+    const copy = fsp.copyFile;
+    const spy = mock.method(fsp, "copyFile", (async (from, to, flags) => {
+      if (from === index && typeof to === "string" && to.startsWith(path.join(home, ".catalog-")) && to.endsWith(".tmp")) {
+        if (disappear) {
+          await copy(from, to, flags);
+          await rm(to);
+          await rm(`${to}.owner`);
+        }
+        throw failure;
+      }
+      return copy(from, to, flags);
+    }) as typeof fsp.copyFile);
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(temporaryCatalog(), (err: unknown) => err === failure);
+    } finally {
+      spy.mock.restore();
+      syncBuiltinESMExports();
+    }
+    assert.deepEqual(await readdir(home), ["index.db"]);
+    assert.deepEqual(await readFile(index), original);
+  }
+});
 
 test("catalog read direct openIndexRead rejects missing and invalid files without writes", async (t) => {
   const home = await tmp("mg-home-");
