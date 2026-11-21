@@ -15,7 +15,16 @@ import {
   resolveSkill,
   validateRevision,
 } from "./skills.ts";
-import { checkSources, installSource, listSources, migrateStore, reindexAll, removeSource, updateSources } from "./sources.ts";
+import {
+  checkSources,
+  installSource,
+  listSources,
+  migrateStore,
+  reindexAll,
+  removeSource,
+  updateSources,
+  validateUpdateRefSyntax,
+} from "./sources.ts";
 import type { Ctx } from "./sources.ts";
 import { MargraveError, RequestError, UsageError } from "./store.ts";
 import { wrap } from "./wrap.ts";
@@ -83,11 +92,14 @@ async function updateCommand(rest: string[]): Promise<void> {
   const p = parse(rest, { ref: { type: "string" }, "allow-unsafe": { type: "boolean" }, skill: { type: "string", multiple: true } });
   if (p.values["ref"] !== undefined && p.positionals.length !== 1) throw new UsageError("update --ref requires one Git source");
   const [source] = positionals(p, 0, 1, "update [source]");
+  const selected = selection(p.values["skill"] as string[] | undefined);
+  if (typeof p.values["ref"] === "string") await validateUpdateRefSyntax(p.values["ref"]);
+  await migrateStore();
   const { results, errors } = await updateSources(
     source ?? null,
     ctx(p.values["allow-unsafe"] === true),
     typeof p.values["ref"] === "string" ? p.values["ref"] : null,
-    selection(p.values["skill"] as string[] | undefined),
+    selected,
   );
   for (const r of results) {
     out(r.kind === "git" ? `${clean(r.id)}: ${short(r.oldCommit)} → ${short(r.newCommit)}` : `${clean(r.id)}: reindexed`);
@@ -104,6 +116,7 @@ async function updateCommand(rest: string[]): Promise<void> {
 async function checkCommand(rest: string[]): Promise<void> {
   const p = parse(rest, { json: { type: "boolean" } });
   const [source] = positionals(p, 0, 1, "check [source] [--json]");
+  await migrateStore();
   const results = await checkSources(source ?? null);
   if (results.length === 0) out(NO_SOURCES_MESSAGE);
   else if (p.values["json"] === true) {
@@ -155,12 +168,15 @@ async function run(argv: string[]): Promise<void> {
       if (action === "export") {
         const p = parse(args, { source: { type: "string", multiple: true } });
         positionals(p, 0, 0, "lock export [--source <id> ...]");
+        await migrateStore();
         json(await exportLock((p.values["source"] as string[] | undefined) ?? []));
         return;
       }
       if (action === "restore") {
         const [file] = positionals(parse(args, {}), 1, 1, "lock restore <file>");
-        await restoreLock(await readLock(file as string), ctx(false), out);
+        const locked = await readLock(file as string);
+        await migrateStore();
+        await restoreLock(locked, ctx(false), out);
         return;
       }
       throw new UsageError("expected lock export or lock restore");
@@ -185,6 +201,7 @@ async function run(argv: string[]): Promise<void> {
     case "remove": {
       const p = parse(rest, {});
       const [source] = positionals(p, 1, 1, "remove <source>");
+      await migrateStore();
       const rec = await removeSource(source as string);
       out(rec.kind === "local" ? `unregistered ${clean(rec.id)} (the directory was not touched)` : `removed ${clean(rec.id)}`);
       return;
@@ -192,6 +209,7 @@ async function run(argv: string[]): Promise<void> {
     case "list": {
       const p = parse(rest, { skills: { type: "boolean" }, json: { type: "boolean" } });
       positionals(p, 0, 0, "list [--skills] [--json]");
+      await migrateStore();
       const withSkills = p.values["skills"] === true;
       const { sources, skills } = await listSources(withSkills);
       if (p.values["json"] === true) {
@@ -224,6 +242,7 @@ async function run(argv: string[]): Promise<void> {
       });
       const words = positionals(p, 1, Number.POSITIVE_INFINITY, 'find "<task>"');
       const task = words.join(" ");
+      await migrateStore();
       const { hits, noSources, suggestions } = await searchSkills(
         task,
         p.values["limit"],
@@ -247,6 +266,7 @@ async function run(argv: string[]): Promise<void> {
       const revision = typeof p.values["revision"] === "string" ? p.values["revision"] : undefined;
       validateRevision(revision);
       const [id] = positionals(p, 1, 1, "load <id>");
+      await migrateStore();
       const c = await loadContext();
       if (c === null)
         throw revision === undefined ? new MargraveError(NO_SOURCES_MESSAGE) : new RequestError("skill revision changed; search again");
@@ -271,6 +291,7 @@ async function run(argv: string[]): Promise<void> {
     }
     case "reindex": {
       positionals(parse(rest, {}), 0, 0, "reindex");
+      await migrateStore();
       const r = await reindexAll(ctx(false));
       out(`reindexed ${r.skills} skills from ${r.sources} sources`);
       return;

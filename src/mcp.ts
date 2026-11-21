@@ -1,4 +1,4 @@
-// stdio MCP server. Read-only: it opens index.db on every call.
+// The stdio MCP server reads index.db for each tool call after startup.
 import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
@@ -16,7 +16,7 @@ import {
 import type { Context, FindText } from "./skills.ts";
 import { RequestError } from "./store.ts";
 import type { IndexEntry } from "./store.ts";
-import { checkId } from "./sources.ts";
+import { checkId, migrateStore } from "./sources.ts";
 import { formatSuggestions, searchSkills } from "./search.ts";
 import { attachMargraveSkills } from "./mcp-skills.ts";
 
@@ -258,11 +258,11 @@ function buildServer(variant: Variant, allowedSources: ReadonlySet<string> | und
   return server;
 }
 
-export function runMcp(): Promise<void> {
+export async function runMcp(): Promise<void> {
   const value = process.env["MARGRAVE_ALLOWED_SOURCES"];
   const ids = value === undefined ? undefined : value.trim() === "" ? [] : value.split(",").map((id) => id.trim());
   const allowedSources = validateAllowedSources(ids, "MARGRAVE_ALLOWED_SOURCES must contain comma-separated source IDs");
+  await migrateStore();
   // Local agent hosts (Claude Code, Codex, bb) still open with an older protocol revision: serve them.
   serveStdio(() => buildServer(LOCAL, allowedSources, process.env["MARGRAVE_SKILLS_SH"] === "1"), { legacy: "serve" });
-  return Promise.resolve();
 }

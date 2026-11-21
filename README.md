@@ -154,7 +154,7 @@ Each suggestion links to its catalog page and shows a manual command. Use `margr
 
 `<source>` is a source id or the original spec you installed it with.
 
-`margrave check [source] [--json]` reports updates and installed-file drift without changing the store. It exits 1 when a source needs attention.
+`margrave check [source] [--json]` reports updates and installed-file drift for the current catalog. It exits 1 when a source needs attention.
 
 `margrave lock export > margrave-lock.json` records installed Git commits and whole-skill revisions. Repeat `--source <id>` to export selected Git sources from a mixed store.
 
@@ -264,7 +264,7 @@ Limit: the baseline compares the flagged line, not the lines around it. A known 
 
 `margrave mcp` (stdio) and `margrave/hosted` speak MCP protocol revision `2026-07-28` and also serve clients that open with an older revision the MCP SDK supports (for example `2025-06-18`); hosted serves those statelessly, one request at a time.
 
-`margrave mcp` is read-only. `install`, `update`, and `remove` are not exposed. It opens `index.db` on every call, so a new install shows up without a restart. After upgrading Margrave, restart running `margrave mcp` sessions.
+The `margrave mcp` tools are read-only. `install`, `update`, and `remove` are not exposed. It opens `index.db` on every call, so a new install shows up without a restart. After upgrading Margrave, restart running `margrave mcp` sessions.
 
 | Tool              | Input                                         | Result                                                                                                                                  |
 | ----------------- | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
@@ -362,7 +362,7 @@ Scores have a different scale from earlier versions (per-column BM25 replaced BM
 
 ## Store
 
-The published `index.db` contains the active sources, skill manifests, and search index. Readers use one database connection for each operation. A writer prepares a complete database beside the active catalog and publishes it with one rename. The active file requires no write journal.
+The published `index.db` contains the active sources, skill manifests, and search index. Readers use one database connection for each operation. A writer prepares a complete database beside the active catalog and publishes it with one rename. Normal catalog writes require no journal on the active file.
 
 Git snapshots live under `snapshots/<source-id>/<commit>-<nonce>/`. Move or copy the catalog and its snapshots together. Git skill paths are relative to their snapshots. Registered local directories still use absolute paths.
 
@@ -372,16 +372,15 @@ To reclaim space, stop all Margrave readers and writers. Use `margrave list --js
 
 ## Upgrading
 
-1. Stop Margrave writers, stdio servers, and hosted readers.
-2. Make a complete backup of `MARGRAVE_HOME`. Preserve symlinks and record the original store path.
-3. Install the new CLI and update any host package. Run `margrave migrate` with the original `MARGRAVE_HOME`.
-4. Run `margrave find` and `margrave load` on an existing skill. Restart servers after both commands succeed.
+Install the new CLI. The first local command that uses the store or the first stdio MCP startup backs up a supported older store and upgrades it automatically. To upgrade at a scheduled time, run `margrave migrate` with the store's original `MARGRAVE_HOME`. Margrave prints the backup directory to stderr after a successful upgrade.
 
-Migration checks that source records, index entries, and snapshot files agree. It rebuilds the search index from the verified files. If migration reports a conflict, keep the original store offline and preserve the complete backup. If you have a known-good backup, restore it at the original path and retry migration.
+Migration checks that source records, index entries, and snapshot files agree. It rebuilds the search index from the verified files. The backup contains the previous catalog, legacy source records, and registered Git snapshots and links. Registered local source directories stay at their original paths.
 
-To recover from verified locks, set `MARGRAVE_HOME` to a new empty directory. Run `margrave lock restore <lockfile>` for the locked Git sources. Recover each required Git source from a verified lock and re-register local sources from their original directories. Compare the source IDs and Git revisions with your backup inventory. Run `margrave find` and `margrave load` before pointing servers at the new store. Keep the old store and its backup until you verify every source you need.
+For hosted HTTP, run the migration through the CLI against the writable store before serving it with the new host package. Verify find and load with the hosted reader's identity.
 
-To roll back, stop Margrave processes. Move the upgraded store aside and restore the complete backup at its original path. Start the previous CLI and restart the previous MCP servers.
+If migration reports a conflict, preserve the store and the backup. Restore a known-good backup at the original path and retry. To recover from verified locks, set `MARGRAVE_HOME` to a new empty directory. Run `margrave lock restore <lockfile>` for the locked Git sources. Register local sources from their original directories. Compare source IDs and Git revisions before pointing servers at the new store.
+
+To roll back, stop Margrave readers and writers. Move the upgraded store aside. Create the original store directory and extract `store.tar` there with ownership, modes, ACLs, and extended attributes preserved. Keep the same absolute path so existing links work. Verify find and load with the previous CLI and verify hosted access before you restart the servers.
 
 ## Exit codes
 

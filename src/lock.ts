@@ -28,6 +28,7 @@ import {
   home,
   insertSkills,
   isRecord,
+  isSha256,
   validScan,
   validSelection,
   openCatalogReadOptional,
@@ -58,7 +59,7 @@ const malformed = (): never => {
 };
 const keys = (value: Record<string, unknown>, expected: string[]): boolean =>
   Object.keys(value).sort().join(",") === expected.sort().join(",");
-const digest = (s: string): boolean => /^sha256:[0-9a-f]{64}$/u.test(s);
+const digest = (s: string): boolean => s.startsWith("sha256:") && isSha256(s.slice(7));
 const commitHash = (s: string): boolean => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(s);
 const refValid = (s: string): boolean =>
   /^refs\/(heads|tags)\/.+/u.test(s) &&

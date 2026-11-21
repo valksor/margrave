@@ -235,7 +235,7 @@ test("a malformed sources.json is an error and nothing is written", async () => 
     await writeFile(file, content);
     const r = await runCli(["install", src], { home, fakeBin: bin });
     assert.equal(r.code, 1, r.stderr);
-    assert.match(r.stderr, /store upgrade required/u);
+    assert.match(r.stderr, /index\.db is missing/u);
     assert.equal(await readFile(file, "utf8"), content, "sources.json unchanged");
     assert.equal((await readdir(home)).includes("index.db"), false, "no index.db written");
     assert.deepEqual(

@@ -74,7 +74,7 @@ Only the first line counts. A token in the body of the message, such as in a squ
 
 ### Store compatibility
 
-A release must work with stores created by supported earlier releases. If a change makes their source records, index, or snapshots incompatible, ship a tested migration with the same release. Document how to back up the store, apply the migration, and roll back if it fails. Apply the migration before running the new CLI or restarting MCP servers. Preserve installed sources, pinned refs, snapshots, and skill content.
+A release must work with stores created by supported earlier releases. If a change makes their source records, index, or snapshots incompatible, ship a tested migration with the same release. Local CLI and stdio must upgrade supported stores after creating a recoverable backup. Document how to use `margrave migrate` for hosted stores and how to roll back. Preserve installed sources, pinned refs, snapshots, and skill content.
 
 Test the upgrade from a populated store created by the previous format. Keep that fixture in the release test suite for as long as the upgrade path is supported. Check that the CLI, local MCP server, and hosted MCP handler can find and load existing skills after the upgrade. A clean-install test alone does not cover an upgrade.
 
