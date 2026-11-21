@@ -71,12 +71,11 @@ try {
     fail(`checksum mismatch for ${url}: expected ${SHA256[platform]}, got ${actual}`);
   }
 
-  const tarball = path.join(work, `${name}.tar.gz`);
   const out = path.join(work, "out");
-  writeFileSync(tarball, data);
   mkdirSync(out);
-  const tar = spawnSync("tar", ["-xzf", tarball, "-C", out, "--strip-components=1", `${name}/ripwire`, `${name}/LICENSE`], {
+  const tar = spawnSync("tar", ["-xzf", "-", "-C", out, "--strip-components=1", `${name}/ripwire`, `${name}/LICENSE`], {
     encoding: "utf8",
+    input: data,
   });
   if (tar.status !== 0) fail(`could not unpack ${url}: ${tar.stderr.trim() || `tar exited ${tar.status}`}`);
 
