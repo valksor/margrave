@@ -1,3 +1,5 @@
+import { globSync } from "node:fs";
+import { sep } from "node:path";
 import { Stryker, StrykerCli } from "@stryker-mutator/core";
 
 if (process.argv.length > 2) {
@@ -32,6 +34,11 @@ if (process.argv.length > 2) {
     ],
     "store-files": [
       "--test-name-pattern='^(store files |a missing sources|home|a sources.json that cannot be read|every field of a source record|atomic writes)'",
+      "test/store-files.test.ts",
+    ],
+    store: [
+      "--test-name-pattern='^(a store directory that cannot be inspected|writer lock timeout and unexpected SQLite errors|a missing sources.json is an empty list)'",
+      "test/catalog.test.ts",
       "test/store-files.test.ts",
     ],
     "source-git": [
@@ -90,7 +97,25 @@ if (process.argv.length > 2) {
     ],
     "mcp-skills": ["--test-timeout=2000", "--test-name-pattern='^MCP Skills direct '", "test/mcp.test.ts", "test/hosted.test.ts"],
     hosted: ["test/hosted.test.ts"],
+    cli: [
+      "--test-name-pattern='^(CLI (direct |output direct |Git direct )|CLI, stdio and hosted opt in|empty stores reject explicit source checks|with no sources: update|wrap adds a build note on stderr|lock export and restore pins|stdio serves a client|reference-only updates change revision|a Git skill at the snapshot root reports drift|usage and setup commands do not upgrade a legacy store|released v0.2.1 store remains)'",
+      "test/cli.test.ts",
+      "test/cli-output.test.ts",
+      "test/cli-git.test.ts",
+      "test/integration.test.ts",
+      "test/skills-sh.test.ts",
+      "test/source-migration.test.ts",
+      "test/mcp.test.ts",
+    ],
   };
+
+  const discovered = new Set(globSync("src/**/*.ts").map((file) => file.replaceAll(sep, "/")));
+  const mapped = new Set(Object.keys(targets).map((target) => `src/${target}.ts`));
+  const missing = [...discovered].filter((file) => !mapped.has(file)).sort((a, b) => a.localeCompare(b));
+  const stale = [...mapped].filter((file) => !discovered.has(file)).sort((a, b) => a.localeCompare(b));
+  if (missing.length > 0) console.error(`Missing mutation targets: ${missing.join(", ")}`);
+  if (stale.length > 0) console.error(`Stale mutation targets: ${stale.join(", ")}`);
+  if (missing.length > 0 || stale.length > 0) process.exit(1);
 
   for (const [target, testArgs] of Object.entries(targets)) {
     const stryker = new Stryker({
@@ -98,14 +123,14 @@ if (process.argv.length > 2) {
       ...(target === "migration-backup" || target === "source-migration" ? { timeoutMS: 16_000 } : {}),
       ...(target === "migration-recovery" ? { timeoutMS: 75_000 } : {}),
       commandRunner: {
-        command: `node --import ./test/no-vendored-ripwire.ts --test --test-concurrency=1 ${testArgs.join(" ")}`,
+        command: `node scripts/run-mutation-tests.mjs ${testArgs.join(" ")}`,
       },
       reporters: ["clear-text", "progress", "html", "json"],
       htmlReporter: { fileName: `coverage/mutation/${target}.html` },
       jsonReporter: { fileName: `coverage/mutation/${target}.json` },
     });
     const mutants = await stryker.runMutationTest();
-    if (mutants.length === 0 || mutants.some((mutant) => mutant.status !== "Killed")) {
+    if ((target !== "store" && mutants.length === 0) || mutants.some((mutant) => mutant.status !== "Killed")) {
       console.error(`${target}: each generated mutant must be killed by a test`);
       process.exitCode = 1;
     }

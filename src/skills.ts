@@ -263,7 +263,7 @@ export async function readSelectedFileBytes(
     if (!(err instanceof RequestError) && code !== "ENOENT" && code !== "ENOTDIR") throw err;
   }
   if (bytes === undefined || bytes.length !== item.size || `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== item.digest) {
-    if (gitDrift !== undefined) throw new RequestError(gitDriftMessage(gitDrift === "mcp"));
+    if (gitDrift) throw new RequestError(gitDriftMessage(gitDrift === "mcp"));
     throw new RequestError("skill files changed since indexing; ask the store operator to run margrave reindex, then search again");
   }
   return bytes;

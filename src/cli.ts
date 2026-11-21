@@ -72,6 +72,7 @@ const err = (s: string): void => {
   const t = cleanBlock(s);
   process.stderr.write(t.endsWith("\n") ? t : `${t}\n`);
 };
+const ctx = (allowUnsafe: boolean = false): Ctx => ({ log: err, allowUnsafe });
 const json = (v: unknown): void => out(JSON.stringify(v, null, 2));
 
 const short = (sha: string | null): string => (sha === null ? "-" : sha.slice(0, 7));
@@ -88,19 +89,14 @@ function selection(values: string[] | undefined): string[] | undefined {
 }
 
 async function updateCommand(rest: string[]): Promise<void> {
-  const ctx = (allowUnsafe: boolean): Ctx => ({ log: err, allowUnsafe });
   const p = parse(rest, { ref: { type: "string" }, "allow-unsafe": { type: "boolean" }, skill: { type: "string", multiple: true } });
-  if (p.values["ref"] !== undefined && p.positionals.length !== 1) throw new UsageError("update --ref requires one Git source");
+  const ref = p.values["ref"] as string | undefined;
+  if (ref !== undefined && p.positionals.length !== 1) throw new UsageError("update --ref requires one Git source");
   const [source] = positionals(p, 0, 1, "update [source]");
   const selected = selection(p.values["skill"] as string[] | undefined);
-  if (typeof p.values["ref"] === "string") await validateUpdateRefSyntax(p.values["ref"]);
+  if (ref !== undefined) await validateUpdateRefSyntax(ref);
   await migrateStore();
-  const { results, errors } = await updateSources(
-    source ?? null,
-    ctx(p.values["allow-unsafe"] === true),
-    typeof p.values["ref"] === "string" ? p.values["ref"] : null,
-    selected,
-  );
+  const { results, errors } = await updateSources(source ?? null, ctx(p.values["allow-unsafe"] === true), ref, selected);
   for (const r of results) {
     out(r.kind === "git" ? `${clean(r.id)}: ${short(r.oldCommit)} → ${short(r.newCommit)}` : `${clean(r.id)}: reindexed`);
     for (const id of r.added) out(`  added: ${clean(id)}`);
@@ -150,7 +146,6 @@ async function checkCommand(rest: string[]): Promise<void> {
 }
 
 async function lockCommand(rest: string[]): Promise<void> {
-  const ctx = (allowUnsafe: boolean): Ctx => ({ log: err, allowUnsafe });
   const [action, ...args] = rest;
   if (action === "export") {
     const p = parse(args, { source: { type: "string", multiple: true } });
@@ -163,7 +158,7 @@ async function lockCommand(rest: string[]): Promise<void> {
     const [file] = positionals(parse(args, {}), 1, 1, "lock restore <file>");
     const locked = await readLock(file as string);
     await migrateStore();
-    await restoreLock(locked, ctx(false), out);
+    await restoreLock(locked, ctx(), out);
     return;
   }
   throw new UsageError("expected lock export or lock restore");
@@ -188,10 +183,8 @@ async function listCommand(rest: string[]): Promise<void> {
   }
   for (const s of sources) {
     out(`${clean(s.id)}  ${s.kind}  ref=${s.ref === null ? "-" : clean(s.ref)}  commit=${short(s.commit)}  skills=${s.skillCount}`);
-    if (withSkills) {
-      for (const e of skills) {
-        if (e.source === s.id) out(`  ${clean(e.id)}: ${clean(e.description)}`);
-      }
+    for (const e of skills) {
+      if (e.source === s.id) out(`  ${clean(e.id)}: ${clean(e.description)}`);
     }
   }
   return;
@@ -213,7 +206,7 @@ async function findCommand(rest: string[]): Promise<void> {
     p.values["explain"] === true,
     process.env["MARGRAVE_SKILLS_SH"] === "1",
     undefined,
-    typeof p.values["catalog-query"] === "string" ? p.values["catalog-query"] : undefined,
+    p.values["catalog-query"] as string | undefined,
   );
   if (p.values["json"] === true)
     json({
@@ -228,7 +221,7 @@ async function findCommand(rest: string[]): Promise<void> {
 
 async function loadCommand(rest: string[]): Promise<void> {
   const p = parse(rest, { json: { type: "boolean" }, file: { type: "string" }, revision: { type: "string" } });
-  const revision = typeof p.values["revision"] === "string" ? p.values["revision"] : undefined;
+  const revision = p.values["revision"] as string | undefined;
   validateRevision(revision);
   const [id] = positionals(p, 1, 1, "load <id>");
   await migrateStore();
@@ -266,8 +259,6 @@ async function run(argv: string[]): Promise<void> {
     out(`margrave ${version()}`);
     return;
   }
-  const ctx = (allowUnsafe: boolean): Ctx => ({ log: err, allowUnsafe });
-
   switch (command) {
     case "lock":
       return lockCommand(rest);
@@ -305,7 +296,7 @@ async function run(argv: string[]): Promise<void> {
     case "reindex": {
       positionals(parse(rest, {}), 0, 0, "reindex");
       await migrateStore();
-      const r = await reindexAll(ctx(false));
+      const r = await reindexAll(ctx());
       out(`reindexed ${r.skills} skills from ${r.sources} sources`);
       return;
     }
@@ -334,9 +325,6 @@ async function run(argv: string[]): Promise<void> {
 
 // A closed pipe (`margrave load x | head`) is not an error.
 process.stdout.on("error", (e: NodeJS.ErrnoException) => {
-  // Any other stdout error must stay loud. A test could emit an error event with another code through a
-  // preload, but that test would cost more than it checks, so this line is left out of the coverage count.
-  /* node:coverage ignore next */
   if (e.code !== "EPIPE") throw e;
 });
 
