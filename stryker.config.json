@@ -1,7 +1,7 @@
 {
   "mutate": ["src/bm25.ts"],
   "commandRunner": {
-    "command": "node --import ./test/no-vendored-ripwire.ts --test test/bm25.test.ts"
+    "command": "node --import ./test/isolate-store.ts --import ./test/no-vendored-ripwire.ts --test test/bm25.test.ts"
   },
   "coverageAnalysis": "off",
   "ignorePatterns": [

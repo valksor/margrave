@@ -20,7 +20,7 @@ import {
   verifyBackupChild,
   sameFileIdentity,
 } from "../src/migration-backup.ts";
-import { hasDirectoryAcl, hostedUseHome, mkfifo, tmp } from "./helpers.ts";
+import { hasDirectoryAcl, hostedUseHome, mkfifo, stdioTestEnv, tmp } from "./helpers.ts";
 
 const digest = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
 
@@ -310,7 +310,7 @@ test("migration backup verifier rejects FIFO members without reading them", asyn
         () =>
           execFileSync(process.execPath, [verifier, "--internal-verify-backup", String(dir.dev), String(dir.ino), f.catalog, ""], {
             cwd: f.backup,
-            env: { MARGRAVE_HOME: f.home },
+            env: stdioTestEnv({ MARGRAVE_HOME: f.home }),
             timeout: 5000,
             killSignal: "SIGKILL",
             encoding: "utf8",

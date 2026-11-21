@@ -16,6 +16,7 @@ import { buildFieldTokens } from "../src/bm25.ts";
 import { PINNED_RIPWIRE, scanWithRipwire as scan } from "../src/safety.ts";
 import { catalogSources, deleteSourceSkills, indexDbFile, insertSkills, putCatalogSources, temporaryCatalog } from "../src/store.ts";
 import type { NewEntry, SourceRecord } from "../src/store.ts";
+import { privateHome } from "./isolate-store.ts";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const CLI = path.join(ROOT, "src", "cli.ts");
@@ -27,7 +28,7 @@ export const NO_VENDORED_PRELOAD = path.join(ROOT, "test", "no-vendored-ripwire.
 
 export function stdioTestEnv(env: Record<string, string>): Record<string, string> {
   const mutant = process.env["__STRYKER_ACTIVE_MUTANT__"];
-  return mutant === undefined ? env : { ...env, __STRYKER_ACTIVE_MUTANT__: mutant };
+  return { ...env, HOME: privateHome, USERPROFILE: privateHome, ...(mutant === undefined ? {} : { __STRYKER_ACTIVE_MUTANT__: mutant }) };
 }
 
 const execFileAsync = promisify(execFile);
@@ -158,6 +159,8 @@ export function runCli(args: string[], opts: RunOptions): Promise<Run> {
           GIT_CONFIG_GLOBAL: "/dev/null",
           GIT_CONFIG_NOSYSTEM: "1",
           ...opts.extra,
+          HOME: privateHome,
+          USERPROFILE: privateHome,
         },
       },
       (err, stdout, stderr) => {

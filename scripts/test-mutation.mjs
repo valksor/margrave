@@ -1,3 +1,4 @@
+import "../test/isolate-store.ts";
 import { globSync } from "node:fs";
 import { sep } from "node:path";
 import { Stryker, StrykerCli } from "@stryker-mutator/core";

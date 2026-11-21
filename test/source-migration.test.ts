@@ -610,7 +610,7 @@ test("stdio upgrades an untouched released store before serving", async (t) => {
   const home = path.join(parent, "store");
   await copyLegacyStoreFixture(home);
   const child = spawn(process.execPath, [CLI, "mcp"], {
-    env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home },
+    env: stdioTestEnv({ PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home }),
   });
   const exited = once(child, "close");
   let stderr = "";
@@ -675,7 +675,7 @@ DatabaseSync.prototype.exec = function(sql) {
 };\n`,
     );
     assert.notEqual((await runCli(["migrate"], { home, nodeArgs: ["--import", preload] })).code, 0);
-    const child = spawn(process.execPath, [CLI, "mcp"], { env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home } });
+    const child = spawn(process.execPath, [CLI, "mcp"], { env: stdioTestEnv({ PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home }) });
     const exited = once(child, "close");
     let stderr = "";
     child.stderr.on("data", (chunk: Buffer) => {

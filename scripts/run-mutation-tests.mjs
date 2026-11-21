@@ -27,6 +27,8 @@ run({
   execArgv: [
     ...process.execArgv,
     "--import",
+    "./test/isolate-store.ts",
+    "--import",
     "./test/no-vendored-ripwire.ts",
     ...(values.import ?? []).flatMap((value) => ["--import", value]),
   ],
