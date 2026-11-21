@@ -77,6 +77,7 @@ try {
     encoding: "utf8",
     input: data,
   });
+  if (tar.error) fail(`could not unpack ${url}: ${tar.error.message}`);
   if (tar.status !== 0) fail(`could not unpack ${url}: ${tar.stderr.trim() || `tar exited ${tar.status}`}`);
 
   chmodSync(path.join(out, "ripwire"), 0o755);
