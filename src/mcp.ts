@@ -263,6 +263,6 @@ export async function runMcp(): Promise<void> {
   const ids = value === undefined ? undefined : value.trim() === "" ? [] : value.split(",").map((id) => id.trim());
   const allowedSources = validateAllowedSources(ids, "MARGRAVE_ALLOWED_SOURCES must contain comma-separated source IDs");
   await migrateStore();
-  // The SDK default serves older protocol revisions used by local agent hosts.
+  // Keep the SDK default for older MCP clients.
   serveStdio(() => buildServer(LOCAL, allowedSources, process.env["MARGRAVE_SKILLS_SH"] === "1"));
 }
