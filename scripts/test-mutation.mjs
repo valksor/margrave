@@ -7,6 +7,8 @@ if (process.argv.length > 2) {
     bm25: ["test/bm25.test.ts"],
     text: ["test/text.test.ts"],
     wrap: ["test/wrap.test.ts"],
+    scan: ["test/scan.test.ts"],
+    "skill-files": ["test/guard.test.ts"],
   };
 
   for (const [target, tests] of Object.entries(targets)) {
