@@ -38,6 +38,10 @@ if (process.argv.length > 2) {
       "--test-name-pattern='^(source Git direct |spec parsing|owner/repo|a spec or --ref|a subpath segment|malformed specs|source ids|a git URL)'",
       "test/source-git.test.ts",
     ],
+    "source-maintenance": [
+      "--test-name-pattern='^(source maintenance direct |check reports a source record|check reports a metadata read|check scans valid skills|check reports an unavailable local Git remote|reindex: control characters|a reindex whose sources|a remove whose source)'",
+      "test/source-maintenance.test.ts",
+    ],
     mcp: [
       "--test-name-pattern='^(MCP server direct |MCP smoke|MCP server version|a tool whose work rejects|MCP in-process|stdio source allowlists|stdio serves|hosted tools have|hosted: with no sources|hosted: find, load, read|hosted: a store failure|hosted source options|hosted file reads|CLI, stdio and hosted opt in)'",
       "test/mcp.test.ts",

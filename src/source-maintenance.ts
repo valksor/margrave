@@ -29,7 +29,7 @@ export interface CheckResult {
 export async function checkSources(arg: string | null): Promise<CheckResult[]> {
   const db = await openCatalogReadOptional();
   if (db === null) {
-    if (arg !== null) findSource([], arg);
+    if (arg !== null) throw new MargraveError(`no source "${arg}"; run: margrave list`);
     return [];
   }
   try {
@@ -120,8 +120,7 @@ function verifyReindex(sources: readonly SourceRecord[], scan: ReindexScan, db: 
     const indexed = db.prepare("SELECT id, hash AS revision, dir, manifest FROM skills WHERE source = ? ORDER BY id").all(rec.id);
     const observed = scan.entries
       .filter((entry) => entry.source === rec.id)
-      .map(({ id, revision, dir, manifest }) => ({ id, revision, dir, manifest }))
-      .sort((a, b) => Number(a.id > b.id) - Number(a.id < b.id));
+      .map(({ id, revision, dir, manifest }) => ({ id, revision, dir, manifest }));
     if (JSON.stringify(indexed) !== JSON.stringify(observed)) {
       scan.failed.add(rec.id);
       ctx.log(

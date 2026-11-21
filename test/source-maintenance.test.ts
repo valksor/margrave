@@ -2,8 +2,13 @@ import assert from "node:assert/strict";
 import fsp, { mkdir, writeFile, rm, readFile, readdir, realpath } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
-import { checkSources, reindexAll, removeSource } from "../src/source-maintenance.ts";
+import { checkSources, listSources, reindexAll, removeSource } from "../src/source-maintenance.ts";
+import { scanSource } from "../src/scan.ts";
+import { toEntries } from "../src/source-files.ts";
+import { openIndexRead } from "../src/catalog.ts";
+import type { SourceRecord } from "../src/store-files.ts";
 import { installSource, localId } from "../src/sources.ts";
 import {
   catalogRecords,
@@ -23,6 +28,7 @@ import {
   mockSourcesRead,
   changeAtLock,
   newEntry,
+  seedIndex,
   writeIndexRows,
   useHome,
   catalogSetup,
@@ -448,4 +454,315 @@ test("git source: reindex rescans the stored copy, and skips it when the copy is
   assert.equal(gone.code, 0, gone.stderr);
   assert.equal(gone.stdout.trim(), "reindexed 0 skills from 1 sources");
   assert.match(gone.stderr, new RegExp(`warning: ${id}: .*; skipped`, "u"));
+});
+
+test("source maintenance direct check and list boundaries close catalog connections", async (t) => {
+  const home = await tmp("mg-direct-home-");
+  t.after(() => rm(home, { recursive: true, force: true }));
+  useHome(t, home);
+  assert.deepEqual(await checkSources(null), []);
+  await assert.rejects(checkSources("missing"), { message: 'no source "missing"; run: margrave list' });
+  assert.deepEqual(await listSources(true), { sources: [], skills: [] });
+  assert.deepEqual(await listSources(false), { sources: [], skills: [] });
+
+  const first = (await localSource("alpha")).record("first");
+  const second = (await localSource("beta")).record("second");
+  t.after(async () => {
+    await Promise.all([first.path!, second.path!].map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+  const alpha = newEntry(first.id, "alpha");
+  const zeta = newEntry(first.id, "zeta");
+  await seedIndex([zeta, alpha], [first, second]);
+  const prepare = mock.method(DatabaseSync.prototype, "prepare");
+  const close = mock.method(DatabaseSync.prototype, "close");
+  t.after(() => mock.restoreAll());
+  const sources = [
+    { ...first, skillCount: 2 },
+    { ...second, skillCount: 0 },
+  ];
+  assert.deepEqual(await listSources(false), { sources, skills: [] });
+  const listed = await listSources(true);
+  assert.deepEqual(
+    { ...listed, skills: listed.skills.map((skill) => ({ ...skill })) },
+    {
+      sources,
+      skills: [alpha, zeta].map(({ id, name, description, source }) => ({ id, name, description, source })),
+    },
+  );
+  await assert.rejects(checkSources("missing"), { message: 'no source "missing"; run: margrave list' });
+  assert.equal((await checkSources(second.id))[0]?.id, second.id);
+  const receivers = prepare.mock.calls
+    .filter((call) => call.arguments[0] === "SELECT id, record FROM sources ORDER BY position")
+    .map((call) => call.this);
+  assert.equal(receivers.length, 5);
+  assert.equal(new Set(receivers).size, 5);
+  for (const receiver of receivers) assert.equal(close.mock.calls.filter((call) => call.this === receiver).length, 1);
+});
+
+test("source maintenance direct check selects the second local source and retains rows on scan failure", async (t) => {
+  const home = await tmp("mg-direct-home-");
+  t.after(() => rm(home, { recursive: true, force: true }));
+  useHome(t, home);
+  const one = await localSource("alpha");
+  const two = await localSource("beta");
+  t.after(async () => {
+    await Promise.all([one.dir, two.dir].map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+  const first = one.record("first");
+  const second = two.record("second");
+  const firstScan = await scanSource(one.dir, { followSymlinks: true, strict: true });
+  const secondScan = await scanSource(two.dir, { followSymlinks: true, strict: true });
+  await seedIndex(
+    [...toEntries(first.id, firstScan.skills, (dir) => dir), ...toEntries(second.id, secondScan.skills, (dir) => dir)],
+    [first, second],
+  );
+  const result = {
+    id: second.id,
+    updateAvailable: false,
+    added: [],
+    changed: [],
+    removed: [],
+    error: null,
+    oldCommit: null,
+    newCommit: null,
+  };
+  assert.deepEqual(await checkSources(two.dir), [result]);
+  await writeSkill(two.dir, "beta", "changed beta");
+  await writeSkill(two.dir, "gamma", "gamma skill");
+  assert.deepEqual(await checkSources(second.id), [{ ...result, added: ["second/gamma"], changed: ["second/beta"] }]);
+  const before = indexRows(home);
+  const actual = fsp.readdir;
+  mock.method(fsp, "readdir", ((p: string, ...args: unknown[]) =>
+    p === two.dir
+      ? Promise.reject(new Error("scan denied"))
+      : (actual as (...a: unknown[]) => Promise<unknown>)(p, ...args)) as typeof fsp.readdir);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  assert.deepEqual(await checkSources(second.id), [{ ...result, error: "scan denied" }]);
+  assert.deepEqual(indexRows(home), before);
+});
+
+test("source maintenance direct remove deletes only the second source and its rows", async (t) => {
+  const home = await tmp("mg-direct-home-");
+  t.after(() => rm(home, { recursive: true, force: true }));
+  useHome(t, home);
+  const first = (await localSource("alpha")).record("first");
+  const second = (await localSource("beta")).record("second");
+  t.after(async () => {
+    await Promise.all([first.path!, second.path!].map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+  await seedIndex([newEntry(first.id, "alpha"), newEntry(second.id, "beta")], [first, second]);
+  const before = indexRows(home);
+  assert.deepEqual(await removeSource(second.id), second);
+  assert.deepEqual(readSourceRecords(home), [first]);
+  assert.deepEqual(
+    indexRows(home),
+    before.filter((row) => row.source === first.id),
+  );
+});
+
+function directGitRecord(home: string, subpath = ""): SourceRecord {
+  const commit = "a".repeat(40);
+  const snapshotName = `${commit}-${"b".repeat(16)}`;
+  const location = path.join(home, "snapshots", "git-direct", snapshotName);
+  return {
+    id: "git-direct",
+    kind: "git",
+    spec: location,
+    url: location,
+    subpath,
+    ref: "refs/heads/main",
+    commit,
+    snapshot: snapshotName,
+    installedAt: "now",
+  };
+}
+
+async function directInventory(): Promise<unknown[]> {
+  const db = await openIndexRead();
+  try {
+    return db.prepare("SELECT id, source, hash, dir, manifest FROM skills ORDER BY id").all();
+  } finally {
+    db.close();
+  }
+}
+
+test("source maintenance direct check detects local Git tracking and snapshot changes", async (t) => {
+  const home = await tmp("mg-direct-home-");
+  t.after(() => rm(home, { recursive: true, force: true }));
+  useHome(t, home);
+  const repo = await makeRepo();
+  t.after(() => rm(repo.dir, { recursive: true, force: true }));
+  const originalCommit = await head(repo.dir);
+  const snapshotName = `${originalCommit}-${"b".repeat(16)}`;
+  const record = {
+    ...directGitRecord(home),
+    spec: repo.url,
+    url: repo.url,
+    ref: "refs/heads/main",
+    commit: originalCommit,
+    snapshot: snapshotName,
+  };
+  const root = path.join(home, "snapshots", record.id, snapshotName);
+  await writeSkill(root, "react-perf", "Optimize React rendering performance and bundle size");
+  const scan = await scanSource(root, { followSymlinks: false, boundary: root, strict: true });
+  await seedIndex(
+    toEntries(record.id, scan.skills, (dir) => path.relative(root, dir)),
+    [record],
+  );
+  const rows = await directInventory();
+  const result = {
+    id: record.id,
+    updateAvailable: false,
+    added: [],
+    changed: [],
+    removed: [],
+    error: null,
+    oldCommit: originalCommit,
+    newCommit: originalCommit,
+  };
+  assert.deepEqual(await checkSources(null), [result]);
+  assert.deepEqual(readSourceRecords(home), [record]);
+  assert.deepEqual(await directInventory(), rows);
+
+  await writeSkill(path.join(repo.dir, "skills"), "upstream", "upstream skill");
+  await git(repo.dir, "add", "-A");
+  await git(repo.dir, "commit", "-q", "-m", "upstream change");
+  const newCommit = await head(repo.dir);
+  assert.notEqual(newCommit, originalCommit);
+  await writeSkill(root, "react-perf", "changed installed skill");
+  assert.deepEqual(await checkSources(record.id), [{ ...result, updateAvailable: true, changed: [`${record.id}/react-perf`], newCommit }]);
+  assert.deepEqual(readSourceRecords(home), [record]);
+  assert.deepEqual(await directInventory(), rows);
+});
+
+test("source maintenance direct reindex preserves missing and escaped Git snapshots", async (t) => {
+  for (const kind of ["missing-root", "not-directory", "missing-subpath", "escaped", "null"] as const) {
+    await t.test(`source maintenance direct ${kind}`, async (st) => {
+      const home = await tmp("mg-direct-home-");
+      st.after(() => rm(home, { recursive: true, force: true }));
+      useHome(st, home);
+      const rec = directGitRecord(
+        home,
+        kind === "not-directory" ? "child" : kind === "missing-subpath" ? "absent" : kind === "escaped" ? "escape" : "",
+      );
+      const root = path.join(home, "snapshots", rec.id, rec.snapshot!);
+      await mkdir(path.dirname(root), { recursive: true });
+      if (kind === "not-directory") await writeFile(root, "file");
+      else if (kind !== "missing-root") await mkdir(root);
+      if (kind === "escaped") {
+        const outside = path.join(home, "outside");
+        await mkdir(outside);
+        await fsp.symlink(outside, path.join(root, "escape"));
+      }
+      await seedIndex([newEntry(rec.id, "accepted")], [rec]);
+      const before = await directInventory();
+      if (kind === "null") {
+        const actual = fsp.realpath;
+        let injected = false;
+        mock.method(fsp, "realpath", ((p: string, ...args: unknown[]) => {
+          if (p === root && !injected) {
+            injected = true;
+            return Promise.reject(null);
+          }
+          return (actual as (...a: unknown[]) => Promise<string>)(p, ...args);
+        }) as typeof fsp.realpath);
+        syncBuiltinESMExports();
+        st.after(() => {
+          mock.restoreAll();
+          syncBuiltinESMExports();
+        });
+      }
+      const logs: string[] = [];
+      assert.deepEqual(await reindexAll({ log: (line) => logs.push(line), allowUnsafe: false }), { skills: 0, sources: 1 });
+      const message =
+        kind === "escaped"
+          ? 'refused subpath "escape": resolves outside the clone'
+          : kind === "null"
+            ? "null"
+            : "installed Git files differ from the accepted revision. Restore a verified lock or a known-good backup";
+      assert.deepEqual(logs, [`warning: ${rec.id}: ${message}; skipped`]);
+      assert.deepEqual(readSourceRecords(home), [rec]);
+      assert.deepEqual(await directInventory(), before);
+    });
+  }
+});
+
+test("source maintenance direct reindex retains local ENOTDIR text", async (t) => {
+  const home = await tmp("mg-direct-home-");
+  t.after(() => rm(home, { recursive: true, force: true }));
+  useHome(t, home);
+  const file = path.join(home, "file");
+  await writeFile(file, "file");
+  const local = await localSource("alpha");
+  t.after(() => rm(local.dir, { recursive: true, force: true }));
+  const rec = { ...local.record("local-direct"), path: path.join(file, "child") };
+  await seedIndex([newEntry(rec.id, "alpha")], [rec]);
+  const before = indexRows(home);
+  let message = "";
+  try {
+    await realpath(rec.path);
+  } catch (error) {
+    assert.ok(error instanceof Error);
+    assert.equal((error as NodeJS.ErrnoException).code, "ENOTDIR");
+    message = error.message;
+  }
+  const logs: string[] = [];
+  assert.deepEqual(await reindexAll({ log: (line) => logs.push(line), allowUnsafe: false }), { skills: 0, sources: 1 });
+  assert.deepEqual(logs, [`warning: ${rec.id}: ${message}; skipped`]);
+  assert.deepEqual(readSourceRecords(home), [rec]);
+  assert.deepEqual(indexRows(home), before);
+});
+
+test("source maintenance direct reindex rebuilds valid inventories and preserves drifted Git rows", async (t) => {
+  const home = await tmp("mg-direct-home-");
+  t.after(() => rm(home, { recursive: true, force: true }));
+  useHome(t, home);
+  const gitRecord = directGitRecord(home);
+  const root = path.join(home, "snapshots", gitRecord.id, gitRecord.snapshot!);
+  await mkdir(root, { recursive: true });
+  await writeSkill(root, "zeta", "zeta skill");
+  await writeSkill(root, "alpha", "alpha skill");
+  const local = await localSource("beta");
+  t.after(() => rm(local.dir, { recursive: true, force: true }));
+  const localRecord = local.record("local-direct");
+  const gitScan = await scanSource(root, { followSymlinks: false, boundary: root, strict: true });
+  const localScan = await scanSource(local.dir, { followSymlinks: true, strict: true });
+  await seedIndex(
+    [
+      ...toEntries(gitRecord.id, gitScan.skills, (dir) => path.relative(root, dir)),
+      ...toEntries(localRecord.id, localScan.skills, (dir) => dir),
+      newEntry("orphan", "lost"),
+    ],
+    [gitRecord, localRecord],
+  );
+  const original = indexRows(home);
+  const originalInventory = await directInventory();
+  const logs: string[] = [];
+  const ctx = { log: (line: string) => logs.push(line), allowUnsafe: false };
+  assert.deepEqual(await reindexAll(ctx), { skills: 3, sources: 2 });
+  assert.deepEqual(logs, []);
+  assert.deepEqual(
+    indexRows(home),
+    original.filter((row) => row.source !== "orphan"),
+  );
+  const rebuiltInventory = await directInventory();
+  assert.deepEqual(rebuiltInventory, originalInventory.slice(0, 3));
+  await writeSkill(root, "alpha", "changed git skill");
+  await writeSkill(local.dir, "beta", "changed local skill");
+  assert.deepEqual(await reindexAll(ctx), { skills: 1, sources: 2 });
+  assert.deepEqual(logs, [
+    `warning: ${gitRecord.id}: installed Git files differ from the accepted revision. Restore a verified lock or a known-good backup; skipped`,
+  ]);
+  const after = indexRows(home);
+  assert.deepEqual((await directInventory()).slice(0, 2), rebuiltInventory.slice(0, 2));
+  assert.deepEqual(
+    after.filter((row) => row.source === gitRecord.id),
+    original.filter((row) => row.source === gitRecord.id),
+  );
+  assert.notEqual(after.find((row) => row.source === localRecord.id)?.hash, original.find((row) => row.source === localRecord.id)?.hash);
+  assert.deepEqual(readSourceRecords(home), [gitRecord, localRecord]);
 });
