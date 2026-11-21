@@ -35,7 +35,7 @@
     "prepare": "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 lefthook install",
     "build": "tsrs && chmod +x dist/cli.js && node scripts/ensure-ripwire.mjs",
     "test": "c8 --check-coverage --100 --all --src src --include 'src/**/*.ts' --reporter=text --reporter=lcov node --import ./test/no-vendored-ripwire.ts --test test/",
-    "test:mutation": "stryker run",
+    "test:mutation": "node scripts/test-mutation.mjs",
     "lint": "oxlint --type-aware --type-check",
     "lint:fix": "oxlint --type-aware --fix",
     "format": "prettier --write .",
