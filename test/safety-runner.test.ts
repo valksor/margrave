@@ -45,6 +45,11 @@ test("parser unescapes once: &amp;quot; stays the text &quot;", () => {
   assert.equal(out.rows[0]?.p, "/r/&quot;.md:1");
 });
 
+test("parser accepts whitespace before equals and uses the first root and finding rows", () => {
+  const input = `<unrelated findings="99"/><skillscan findings ="1" verdict\t= 'warn'><unrelated p="ignored"/><f p ="/r/a.md:1" rule\t= 'R' sev ="warn"/></skillscan><skillscan findings="0" verdict="critical"/>`;
+  assert.deepEqual(parseScanXml(input, 1), { ok: true, rows: [{ p: "/r/a.md:1", rule: "R", sev: "warn" }] });
+});
+
 test("parser keeps a ':' in the path (the line is after the last ':')", () => {
   const out = parseScanXml(xml('findings="1" verdict="warn"', '<f p="/r/a:b:c.md:12" rule="R" sev="warn"/>'), 1);
   assert.ok(out.ok);
@@ -117,9 +122,17 @@ test("a vendored binary with a missing or wrong VERSION stamp is refused, and ne
     const vendored = await standIn("from-vendor");
     if (text !== null) await stamp(vendored, text);
     const r = await withPath(path.dirname(onPath), () => runRipwire("/nonexistent", vendored));
-    assert.equal(r.refusal, `vendored ripwire at ${vendored} is ${label}, not the pinned ${PINNED_RIPWIRE}; run: node ${ENSURE}`, label);
-    assert.equal(r.code, null, label);
-    assert.equal(r.missing, false, label);
+    assert.deepEqual(
+      r,
+      {
+        code: null,
+        stdout: "",
+        stderr: "",
+        missing: false,
+        refusal: `vendored ripwire at ${vendored} is ${label}, not the pinned ${PINNED_RIPWIRE}; run: node ${ENSURE}`,
+      },
+      label,
+    );
     assert.deepEqual(await calls(vendored), [], label);
     assert.deepEqual(await calls(onPath), [], label);
   }
@@ -159,8 +172,32 @@ test("ripwire on PATH runs when there is no vendored binary, after its --version
 test("ripwire is missing only when PATH and the vendored path both lack it", async () => {
   const none = path.join(await tmp("mg-novendor-"), "ripwire");
   const r = await withPath(await tmp("mg-emptybin-"), () => runRipwire("/nonexistent", none));
-  assert.equal(r.missing, true);
-  assert.equal(r.refusal, undefined);
+  assert.deepEqual(r, { code: "ENOENT", stdout: "", stderr: "", missing: true });
+});
+
+test("a successful scan returns complete distinct output beyond the default buffer", async () => {
+  const stdout = `scan:${"x".repeat(1024 * 1024 + 100)}`;
+  const stderr = "scan warning";
+  const bin = await scriptedRipwire({ stdout, stderr });
+  const r = await withScripted(bin, () => runRipwire("/nonexistent", NO_VENDOR));
+  assert.deepEqual(r, { code: 0, stdout, stderr, missing: false, version: PINNED_RIPWIRE });
+});
+
+test("a PATH binary removed after its version reports the scan as missing", async () => {
+  const bin = await tmp("mg-vanishing-");
+  const executable = path.join(bin, "ripwire");
+  await writeFile(executable, `#!/bin/sh\n/bin/mv "$0" "$0.moved"\nprintf 'ripwire ${PINNED_RIPWIRE}\\n'\n`);
+  await chmod(executable, 0o755);
+  const r = await withPath(bin, () => runRipwire("/nonexistent", NO_VENDOR));
+  assert.deepEqual(r, { code: "ENOENT", stdout: "", stderr: "", missing: true, version: PINNED_RIPWIRE });
+});
+
+test("an invalid scan path rejects with the spawn argument error", async () => {
+  const bin = await scriptedRipwire({});
+  await assert.rejects(
+    withScripted(bin, () => runRipwire("/synthetic/\0path", NO_VENDOR)),
+    { code: "ERR_INVALID_ARG_VALUE" },
+  );
 });
 
 test("a ripwire on PATH older than the pinned version is refused with the reason, and the scan does not run", async () => {
@@ -258,7 +295,7 @@ test("the --version time limit is 10 seconds by default", () => {
 test("a --version that hangs is killed at the time limit and refused", async () => {
   const slow = await standIn("from-path");
   // exec, so the SIGKILL at the time limit reaches the sleeping process itself.
-  await writeFile(slow, `#!/bin/sh\necho "$*" >> "$0.calls"\nexec /bin/sleep 30\n`);
+  await writeFile(slow, `#!/bin/sh\necho "$*" >> "$0.calls"\nexec /bin/sleep 1\n`);
   const started = Date.now();
   const r = await withPath(path.dirname(slow), () => runRipwire("/nonexistent", NO_VENDOR, 200));
   assert.ok(Date.now() - started < 10_000);
@@ -274,6 +311,10 @@ test("a ripwire on PATH at the pinned version or newer is accepted and runs the 
     assert.equal(r.code, 3, ok);
     assert.match(r.stderr, /from-path/u, ok);
   }
+  const onPath = await standIn("from-path", "ripwire 12.0.0");
+  const r = await withPath(path.dirname(onPath), () => runRipwire("/nonexistent", NO_VENDOR));
+  assert.equal(r.version, "12.0.0");
+  assert.equal(r.code, 3);
 });
 
 test("parser reads single-quoted attributes and leaves a code point that does not exist as written", () => {

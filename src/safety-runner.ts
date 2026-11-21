@@ -1,8 +1,9 @@
-import { execFile } from "node:child_process";
+import { execFile, type ExecException } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 type Sev = "warn" | "critical";
 
@@ -37,18 +38,17 @@ export const VERSION_TIMEOUT_MS = 10_000;
 const ENSURE_RIPWIRE = fileURLToPath(new URL("../scripts/ensure-ripwire.mjs", import.meta.url));
 /** The first line of `ripwire --version`: `ripwire <X.Y.Z>`, optionally with a `-<pre-release>` suffix, then a space or the end. */
 const VERSION_RE = /^ripwire (\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?=\s|$)/u;
+const execFileAsync = promisify(execFile);
 
-function exec(bin: string, dir: string): Promise<Execed> {
-  return new Promise((resolve) => {
-    execFile(bin, ["security", `--scan-skills=${dir}`], { maxBuffer: 64 * 1024 * 1024, encoding: "utf8" }, (err, stdout, stderr) => {
-      if (err === null) {
-        resolve({ code: 0, stdout, stderr, missing: false });
-        return;
-      }
-      const e = err as NodeJS.ErrnoException & { code?: number | string };
-      resolve({ code: e.code ?? null, stdout, stderr, missing: e.code === "ENOENT" });
-    });
-  });
+async function exec(bin: string, dir: string): Promise<Execed> {
+  const child = execFileAsync(bin, ["security", `--scan-skills=${dir}`], { maxBuffer: 64 * 1024 * 1024 });
+  try {
+    const { stdout, stderr } = await child;
+    return { code: 0, stdout, stderr, missing: false };
+  } catch (err) {
+    const e = err as ExecException & { stdout: string; stderr: string };
+    return { code: e.code ?? null, stdout: e.stdout, stderr: e.stderr, missing: e.code === "ENOENT" };
+  }
 }
 
 /**
@@ -56,38 +56,37 @@ function exec(bin: string, dir: string): Promise<Execed> {
  * A pre-release is older than the same `<major>.<minor>.<patch>` without one. `pinned` has no suffix.
  */
 function isOlder(found: string, pinned: string): boolean {
-  const dash = found.indexOf("-");
-  const a = (dash < 0 ? found : found.slice(0, dash)).split(".").map(Number);
+  const [version, prerelease] = found.split("-", 2);
+  const a = (version as string).split(".").map(Number);
   const b = pinned.split(".").map(Number);
-  for (let i = 0; i < b.length; i++) {
-    if (a[i] !== b[i]) return (a[i] as number) < (b[i] as number);
+  for (const [i, component] of b.entries()) {
+    const difference = (a[i] as number) - component;
+    if (difference !== 0) return Math.sign(difference) === -1;
   }
-  return dash >= 0;
+  return prerelease !== undefined;
 }
 
 type PathVersion =
   /** PATH has no ripwire. */
-  | { status: "missing" }
+  | null
   /** `--version` could not run, exited non-zero, or timed out. `why` names the cause. */
-  | { status: "failed"; why: string }
+  | { why: string }
   /** `--version` ran. `version` is null when its first line is not `ripwire <version>`. */
-  | { status: "ran"; version: string | null };
+  | { version: string | null };
 
 /** What `ripwire --version` on PATH reports. */
-function pathVersion(timeoutMs: number): Promise<PathVersion> {
-  return new Promise((resolve) => {
-    execFile("ripwire", ["--version"], { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL" }, (err, stdout) => {
-      if (err === null) {
-        resolve({ status: "ran", version: VERSION_RE.exec(stdout.split(/\r?\n/u, 1)[0] as string)?.[1] ?? null });
-        return;
-      }
-      const e = err;
-      if (e.code === "ENOENT") resolve({ status: "missing" });
-      else if (e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") resolve({ status: "failed", why: "output too large" });
-      else if (e.killed === true) resolve({ status: "failed", why: "timed out" });
-      else resolve({ status: "failed", why: typeof e.code === "number" ? `exit ${e.code}` : String(e.code ?? e.signal) });
-    });
-  });
+async function pathVersion(timeoutMs: number): Promise<PathVersion> {
+  const child = execFileAsync("ripwire", ["--version"], { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL" });
+  try {
+    const { stdout } = await child;
+    return { version: VERSION_RE.exec(stdout.split(/\r?\n/u, 1)[0] as string)?.[1] ?? null };
+  } catch (err) {
+    const e = err as ExecException;
+    if (e.code === "ENOENT") return null;
+    if (e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return { why: "output too large" };
+    if (e.killed === true) return { why: "timed out" };
+    return { why: typeof e.code === "number" ? `exit ${e.code}` : String(e.code ?? e.signal) };
+  }
 }
 
 /**
@@ -109,8 +108,8 @@ export async function runRipwire(dir: string, vendored: string = VENDORED_RIPWIR
     return { ...(await exec(vendored, dir)), missing: false, version: PINNED_RIPWIRE };
   }
   const found = await pathVersion(versionTimeoutMs);
-  if (found.status === "missing") return { code: "ENOENT", stdout: "", stderr: "", missing: true };
-  if (found.status === "failed") {
+  if (found === null) return { code: "ENOENT", stdout: "", stderr: "", missing: true };
+  if ("why" in found) {
     return refuse(`ripwire on PATH could not report its version (${found.why}); run: node ${ENSURE_RIPWIRE}, or update ripwire`);
   }
   if (found.version === null || isOlder(found.version, PINNED_RIPWIRE)) {
