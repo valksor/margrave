@@ -2,9 +2,31 @@ import { globSync } from "node:fs";
 import { sep } from "node:path";
 import { Stryker, StrykerCli } from "@stryker-mutator/core";
 
-if (process.argv.length > 2) {
-  new StrykerCli([...process.argv.slice(0, 2), "run", ...process.argv.slice(2)]).run();
-} else {
+const aggregateOptions = new Set(["concurrency", "maxConcurrentTestRunners", "logLevel", "fileLogLevel", "allowConsoleColors"]);
+if (process.argv.length === 3 && (process.argv[2] === "--help" || process.argv[2] === "-h")) {
+  console.log(
+    `pnpm run test:mutation runs the whole-source gate. Allowed options: ${[...aggregateOptions].map((option) => `--${option}`).join(", ")}.`,
+  );
+  console.log("Use --mutate, --dryRunOnly, or a config file for a Stryker diagnostic.\n");
+}
+
+new StrykerCli([...process.argv.slice(0, 2), "run", ...process.argv.slice(2)], undefined, async (options) => {
+  if (options.mutate !== undefined || options.configFile !== undefined || options.dryRunOnly !== undefined) {
+    return new Stryker(options).runMutationTest();
+  }
+
+  const unsupported = Object.keys(options).find((option) => !aggregateOptions.has(option));
+  if (unsupported) {
+    console.error(`Unsupported option for the whole-source mutation gate: --${unsupported}. Use pnpm exec stryker run for diagnostics.`);
+    process.exitCode = 1;
+    return [];
+  }
+
+  await runAll(options);
+  return [];
+}).run();
+
+async function runAll(options) {
   const targets = {
     bm25: ["test/bm25.test.ts"],
     text: ["test/text.test.ts"],
@@ -119,6 +141,7 @@ if (process.argv.length > 2) {
 
   for (const [target, testArgs] of Object.entries(targets)) {
     const stryker = new Stryker({
+      ...options,
       mutate: [`src/${target}.ts`],
       ...(target === "migration-backup" || target === "source-migration" ? { timeoutMS: 16_000 } : {}),
       ...(target === "migration-recovery" ? { timeoutMS: 75_000 } : {}),
