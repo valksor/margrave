@@ -13,14 +13,19 @@ if (process.argv.length > 2) {
     safety: ["test/safety.test.ts"],
     search: ["test/skills-sh.test.ts"],
     skills: ["test/index.test.ts", "test/guard.test.ts", "test/text.test.ts"],
+    "lock-format": [
+      "--test-name-pattern='^lock (validation|identity|parsing|inventory|export API|verification)'",
+      "test/lock-format.test.ts",
+      "test/lock.test.ts",
+    ],
     hosted: ["test/hosted.test.ts"],
   };
 
-  for (const [target, tests] of Object.entries(targets)) {
+  for (const [target, testArgs] of Object.entries(targets)) {
     const stryker = new Stryker({
       mutate: [`src/${target}.ts`],
       commandRunner: {
-        command: `node --import ./test/no-vendored-ripwire.ts --test --test-concurrency=1 ${tests.join(" ")}`,
+        command: `node --import ./test/no-vendored-ripwire.ts --test --test-concurrency=1 ${testArgs.join(" ")}`,
       },
       reporters: ["clear-text", "progress", "html", "json"],
       htmlReporter: { fileName: `coverage/mutation/${target}.html` },
