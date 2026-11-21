@@ -4,7 +4,18 @@
     "command": "node --import ./test/no-vendored-ripwire.ts --test test/bm25.test.ts"
   },
   "coverageAnalysis": "off",
-  "ignorePatterns": ["/*", "!/package.json", "!/src", "!/test", "/test/fixtures"],
+  "ignorePatterns": [
+    "/*",
+    "!/package.json",
+    "!/src",
+    "!/scripts",
+    "/scripts/*",
+    "!/scripts/ensure-ripwire.mjs",
+    "!/test",
+    "/test/fixtures/*",
+    "!/test/fixtures/store-v0.2.1",
+    "/test/fixtures/store-v0.2.1/store/sources"
+  ],
   "concurrency": 2,
   "thresholds": { "high": 100, "low": 100, "break": 100 },
   "reporters": ["clear-text", "progress", "html"],

@@ -34,7 +34,7 @@ import {
   cliSnapshot,
   sourceId,
   installLocalDir,
-  ROOT,
+  copyLegacyStoreFixture,
   hostedUseHome,
 } from "./helpers.ts";
 import { syncBuiltinESMExports } from "node:module";
@@ -1077,7 +1077,7 @@ test("a malformed or missing catalog requires restoration from a backup", async 
 test("store readers refuse legacy, empty, and missing catalogs", async (t) => {
   const home = await hostedUseHome(t);
   t.after(() => rm(home, { recursive: true, force: true }));
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   await assert.rejects(openIndexRead(), /store upgrade required/u);
   await rm(path.join(home, "index.db"));
   await assert.rejects(readSources(), /store upgrade required/u);

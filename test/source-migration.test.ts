@@ -8,7 +8,7 @@ import type { SourceRecord } from "../src/store.ts";
 import {
   catalogRecords,
   changeAtLock,
-  ROOT,
+  copyLegacyStoreFixture,
   tmp,
   useHome,
   fakeRipwire,
@@ -34,7 +34,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 
 test("a concurrent migration is recognized after acquiring the writer lock", async (t) => {
   const home = path.join(await tmp("mg-home-"), "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   useHome(t, home);
   const records = JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as SourceRecord[];
   const hook = changeAtLock(t, 1, () => {
@@ -54,7 +54,7 @@ test("migration accepts a store reached through a directory symlink", async () =
   const root = await tmp();
   const store = path.join(root, "store");
   const alias = path.join(root, "store-link");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), store, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(store);
   await link(store, alias);
   const migrated = await runCli(["migrate"], { home: alias });
   assert.equal(migrated.code, 0, migrated.stderr);
@@ -65,7 +65,7 @@ test("migration accepts a store reached through a directory symlink", async () =
 
 test("migration rejects changed legacy skill bytes without publishing", async () => {
   const home = path.join(await tmp(), "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const before = await readFile(path.join(home, "index.db"));
   const source = "example.invalid__fixtures__margrave-upgrade";
   await writeFile(path.join(home, "sources", source, "release-upgrade", "SKILL.md"), "changed bytes");
@@ -172,7 +172,7 @@ test("schema 3 migration rejects selection metadata", async () => {
 test("migration preserves a legacy local source with no indexed skills", async () => {
   const home = path.join(await tmp(), "store");
   const local = await tmp();
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const record = {
     id: "local__empty-123456",
     kind: "local",
@@ -204,7 +204,7 @@ test("migration preserves a legacy local source with no indexed skills", async (
 
 test("migration preserves a Git skill at the snapshot root", async () => {
   const home = path.join(await tmp(), "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const source = "example.invalid__fixtures__margrave-upgrade";
   const records = JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { snapshot: string }[];
   const snapshotDir = path.join(home, "snapshots", source, records[0]!.snapshot);
@@ -336,7 +336,7 @@ test("migration refuses incomplete and conflicting legacy catalogs", async () =>
   }
   for (const item of cases) {
     const home = path.join(await tmp(), "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     await item.mutate(home);
     const before = await readFile(path.join(home, "index.db"));
     const result = await runCli(["migrate"], { home });
@@ -360,7 +360,7 @@ test("migration refuses incomplete and conflicting legacy catalogs", async () =>
 
 test("migration rolls back a failed temporary catalog transaction", async () => {
   const home = path.join(await tmp(), "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const before = await readFile(path.join(home, "index.db"));
   const preload = path.join(await tmp(), "fail-migration-commit.mjs");
   await writeFile(
@@ -380,7 +380,7 @@ DatabaseSync.prototype.exec = function(sql) { if (sql === "PRAGMA user_version =
 test("migration reports source metadata access failures without changing the store", async () => {
   for (const legacyIndex of [false, true]) {
     const home = path.join(await tmp(), "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const index = path.join(home, "index.db");
     if (!legacyIndex) await rm(index);
     const before = legacyIndex ? await readFile(index) : null;
@@ -404,7 +404,7 @@ syncBuiltinESMExports();\n`,
 
 test("migration reports a non-Error metadata read failure", async () => {
   const home = path.join(await tmp(), "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const before = await readFile(path.join(home, "index.db"));
   const preload = path.join(await tmp(), "fail-source-read.mjs");
   await writeFile(
@@ -425,7 +425,7 @@ test("legacy source metadata failures after lock acquisition preserve the catalo
   for (const operation of ["lstat", "readFile"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const index = path.join(home, "index.db");
     const source = path.join(home, "sources.json");
     const before = await readFile(index);
@@ -453,14 +453,14 @@ test("migration handles catalog changes between its probes", async () => {
   for (const change of ["missing", "current", "journal", "gone", "probe-error"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const index = path.join(home, "index.db");
     const before = await readFile(index);
     const preload = path.join(parent, "change-probe.mjs");
     const replacement = path.join(parent, "current.db");
     if (change === "current") {
       const other = path.join(parent, "other");
-      await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), other, { recursive: true, verbatimSymlinks: true });
+      await copyLegacyStoreFixture(other);
       assert.equal((await runCli(["migrate"], { home: other })).code, 0);
       await cp(path.join(other, "index.db"), replacement);
     }
@@ -510,7 +510,7 @@ fs.lstat = async function(file, ...args) {
 test("migration rejects a non-file legacy source list", async () => {
   const parent = await tmp();
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const sourceFile = path.join(home, "sources.json");
   const original = await readFile(sourceFile);
   const index = await readFile(path.join(home, "index.db"));
@@ -529,7 +529,7 @@ test("migration rejects a non-file legacy source list", async () => {
 test("released v0.2.1 store remains usable after upgrade", async (t) => {
   const home = await hostedUseHome(t);
   t.after(() => rm(home, { recursive: true, force: true }));
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const source = "example.invalid__fixtures__margrave-upgrade";
   const id = `${source}/release-upgrade`;
   const body = "The installed upgrade skill survived.";
@@ -607,7 +607,7 @@ test("released v0.2.1 store remains usable after upgrade", async (t) => {
 test("stdio upgrades an untouched released store before serving", async (t) => {
   const parent = await tmp("mg-stdio-upgrade-");
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const child = spawn(process.execPath, [CLI, "mcp"], {
     env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home },
   });
@@ -651,7 +651,7 @@ test("stdio resumes interrupted legacy migrations", async (t) => {
   for (const checkpoint of ["before-record", "record", "nonhot", "changes", "committed"]) {
     const parent = await tmp("mg-stdio-retry-");
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const original = JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { id: string; ref: string; commit: string }[];
     const preload = path.join(parent, "stop.mjs");
     await writeFile(
@@ -719,7 +719,7 @@ test("concurrent first use publishes one backup", async (t) => {
   const parent = await tmp("mg-concurrent-upgrade-");
   const home = path.join(parent, "store");
   t.after(() => rm(parent, { recursive: true, force: true }));
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const results = await Promise.all([
     runCli(["find", "release upgrade", "--json"], { home }),
     runCli(["find", "release upgrade", "--json"], { home }),
@@ -736,7 +736,7 @@ test("usage and setup commands do not upgrade a legacy store", async (t) => {
   const parent = await tmp("mg-usage-upgrade-");
   const home = path.join(parent, "store");
   t.after(() => rm(parent, { recursive: true, force: true }));
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const index = await readFile(path.join(home, "index.db"));
   const sources = await readFile(path.join(home, "sources.json"));
   for (const args of [["--help"], ["version"], ["wrap", "generic"], ["find"], ["update", "source", "--ref", "bad"]]) {

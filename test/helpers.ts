@@ -43,6 +43,20 @@ export async function tmp(prefix = "mg-"): Promise<string> {
   return realpath(await mkdtemp(path.join(tmpdir(), prefix)));
 }
 
+export async function copyLegacyStoreFixture(destination: string): Promise<void> {
+  const fixture = path.join(ROOT, "test/fixtures/store-v0.2.1/store");
+  // Stryker omits the tracked directory symlink from the sandbox.
+  await fsp.cp(fixture, destination, {
+    recursive: true,
+    verbatimSymlinks: true,
+    filter: (source) => source !== path.join(fixture, "sources"),
+  });
+  const sources = JSON.parse(await readFile(path.join(destination, "sources.json"), "utf8")) as { id: string; snapshot: string }[];
+  for (const source of sources) {
+    await link(path.join("..", "snapshots", source.id, source.snapshot), path.join(destination, "sources", source.id));
+  }
+}
+
 /**
  * A fake ripwire, content-driven. It reads --scan-skills=<dir> and finds the marker lines
  * `FAKE-CRIT <rule>` and `FAKE-WARN <rule>` in that dir (symlinked files included). It prints real-shaped XML (absolute paths, findings=, verdict=)

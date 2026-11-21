@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { chmod, cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { CLI, ROOT, indexRows, runCli, tmp } from "./helpers.ts";
+import { CLI, copyLegacyStoreFixture, indexRows, runCli, tmp } from "./helpers.ts";
 
 test("migration retries after the prepared record is written", async () => {
   const home = path.join(await tmp(), "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const before = await readFile(path.join(home, "index.db"));
   const preload = path.join(await tmp(), "fail-journal.mjs");
   await writeFile(
@@ -32,7 +32,7 @@ test("migration retries after process termination at durable transitions", async
   for (const checkpoint of ["before-record", "record", "nonhot", "changes", "committed"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const preload = path.join(parent, "stop.mjs");
     await writeFile(
       preload,
@@ -75,7 +75,7 @@ DatabaseSync.prototype.exec = function(sql) {
 test("recovered migration retains the SQLite lock through catalog verification", async (t) => {
   const parent = await tmp();
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const index = path.join(home, "index.db");
   const crash = path.join(parent, "crash.mjs");
   await writeFile(
@@ -130,7 +130,7 @@ test("prepared journals accept the backup or catalog owner", async () => {
   for (const owner of ["backup", "catalog", "unrelated", "backup-hot", "catalog-hot", "unrelated-hot"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const crash = path.join(parent, "crash.mjs");
     await writeFile(
       crash,
@@ -169,7 +169,7 @@ test("hot journal recovery failure leaves the live files intact for retry", asyn
   for (const failure of ["timeout", "exclusive-error", "scratch-journal", "scratch-open", "wal-race", "short-header"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const crash = path.join(parent, "crash.mjs");
     await writeFile(
       crash,
@@ -229,7 +229,7 @@ test("recovery rejects a journal replaced after taking the exclusive lock", asyn
   for (const failure of ["digest", "owner"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const index = path.join(home, "index.db");
     const original = await readFile(index);
     const crash = path.join(parent, "crash.mjs");
@@ -269,7 +269,7 @@ test("recovery closes its lock after scratch cleanup fails", async () => {
   for (const point of ["allocation", "cleanup", "schema"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const index = path.join(home, "index.db");
     const original = await readFile(index);
     const crash = path.join(parent, "crash.mjs");
@@ -312,7 +312,7 @@ test("recovery rejects journal and catalog changes during scratch verification",
   for (const race of ["missing-journal", "changed-journal", "nonhot-catalog", "enoent-catalog"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const index = path.join(home, "index.db");
     const original = await readFile(index);
     const originalFile = path.join(parent, "original.db");
@@ -362,7 +362,7 @@ test("an older open connection can recover before the migration takes its exclus
   for (const point of ["journal-open", "exclusive"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const oldScript = `import { DatabaseSync } from "node:sqlite";
 import { readFile } from "node:fs/promises";
 const db = new DatabaseSync(${JSON.stringify(path.join(home, "index.db"))}, { timeout: 10000 });
@@ -462,7 +462,7 @@ test("prepared migration rejects a changed record, backup, or journal", async ()
   ]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const preload = path.join(parent, "stop.mjs");
     await writeFile(
       preload,
@@ -537,7 +537,7 @@ test("invalid directory metadata archives stop migration before live changes", a
   for (const damage of ["truncated", "size", "pax-space", "pax-length", "pax-record", "entry-type", "entry-name", "missing-entry"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const before = await readFile(path.join(home, "index.db"));
     const sources = await readFile(path.join(home, "sources.json"));
     const preload = path.join(parent, "archive-failure.mjs");
@@ -579,7 +579,7 @@ fs.open = async function(file, ...args) {
 test("recovery reports Error failures while reading the source list", async () => {
   const parent = await tmp();
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const before = await readFile(path.join(home, "index.db"));
   const preload = path.join(parent, "fail-read.mjs");
   await writeFile(

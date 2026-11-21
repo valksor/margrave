@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import fs, { chmod, cp, link as hardlink, lstat, mkdir, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import fs, { chmod, link as hardlink, lstat, mkdir, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import test, { mock } from "node:test";
 import { backupMigrationStore, writeMigrationRecord, lockLegacyCatalog, readLegacySources } from "../src/store.ts";
-import { ROOT, tmp, hostedUseHome as useHome, runCli } from "./helpers.ts";
+import { copyLegacyStoreFixture, tmp, hostedUseHome as useHome, runCli } from "./helpers.ts";
 
 test("legacy backup preserves catalog and registered snapshot", async (t) => {
   const home = await useHome(t);
   t.after(() => rm(home, { recursive: true, force: true }));
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   await mkdir(path.join(home, "snapshots", "unregistered"));
   await writeFile(path.join(home, "snapshots", "unregistered", "work"), "not part of the store");
   await writeFile(path.join(home, "work-in-progress"), "not part of the store");
@@ -93,7 +93,7 @@ test("legacy backup validates selected file types and completed backups", async 
     "abandoned",
   ]) {
     const home = path.join(parent, scenario);
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     process.env["MARGRAVE_HOME"] = home;
     const sources = await readLegacySources();
     const source = sources[0]!;
@@ -153,7 +153,7 @@ test("backup cleanup handles non-Error failures before and after staging", async
   const parent = await useHome(t);
   t.after(() => rm(parent, { recursive: true, force: true }));
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   process.env["MARGRAVE_HOME"] = home;
   const sources = await readLegacySources();
   const before = await readFile(path.join(home, "index.db"));
@@ -193,7 +193,7 @@ test("directory ACL changes create a distinct backup and survive restore", { ski
   const parent = await useHome(t);
   t.after(() => rm(parent, { recursive: true, force: true }));
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   process.env["MARGRAVE_HOME"] = home;
   const sources = await readLegacySources();
   const source = sources[0]!;
@@ -222,7 +222,7 @@ test("backup does not release the catalog lock for another hard link", async (t)
   const parent = await useHome(t);
   t.after(() => rm(parent, { recursive: true, force: true }));
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   process.env["MARGRAVE_HOME"] = home;
   const sources = await readLegacySources();
   const source = sources[0]!;
@@ -247,7 +247,7 @@ test("backup reports an unreadable catalog", { skip: process.getuid?.() === 0 },
   const parent = await useHome(t);
   t.after(() => rm(parent, { recursive: true, force: true }));
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   process.env["MARGRAVE_HOME"] = home;
   const sources = await readLegacySources();
   const index = path.join(home, "index.db");
@@ -265,7 +265,7 @@ test("prepared record refuses backup files linked to the live catalog", async (t
   t.after(() => rm(parent, { recursive: true, force: true }));
   for (const member of ["manifest.json", "store.tar"]) {
     const home = path.join(parent, member.replace(".", "-"));
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     process.env["MARGRAVE_HOME"] = home;
     const sources = await readLegacySources();
     const backup = await backupMigrationStore(2, sources);
@@ -284,7 +284,7 @@ test("backup and record hashing preserve the catalog when the source list is a h
   const parent = await useHome(t);
   t.after(() => rm(parent, { recursive: true, force: true }));
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   process.env["MARGRAVE_HOME"] = home;
   const index = path.join(home, "index.db");
   const sourceFile = path.join(home, "sources.json");
@@ -305,7 +305,7 @@ test("backup reuse rejects a directory with an extended ACL", { skip: process.pl
   const parent = await useHome(t);
   t.after(() => rm(parent, { recursive: true, force: true }));
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   process.env["MARGRAVE_HOME"] = home;
   const sources = await readLegacySources();
   const backup = await backupMigrationStore(2, sources);
@@ -321,7 +321,7 @@ test("backup reuse rejects a directory with an extended ACL", { skip: process.pl
 test("backup rejects a snapshot changed during archiving", async () => {
   const parent = await tmp();
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const record = (JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { id: string; snapshot: string }[])[0]!;
   const snapshotPath = path.join(home, "snapshots", record.id, record.snapshot);
   const skill = path.join(snapshotPath, "release-upgrade", "SKILL.md");
@@ -348,7 +348,7 @@ test("backup publication failures clean private staging and preserve the store",
   for (const point of ["before-stage", "after-stage"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const index = path.join(home, "index.db");
     const source = path.join(home, "sources.json");
     const beforeIndex = await readFile(index);

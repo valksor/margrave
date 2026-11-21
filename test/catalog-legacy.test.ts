@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { cp, mkdir, readFile, readdir, readlink, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, readlink, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { CLI, ROOT, catalogRecords, fakeRipwire, indexRows, makeRepo, runCli, tmp } from "./helpers.ts";
+import { CLI, copyLegacyStoreFixture, catalogRecords, fakeRipwire, indexRows, makeRepo, runCli, tmp } from "./helpers.ts";
 
 test("schema 3 catalog setup failure keeps the original for retry", async () => {
   const parent = await tmp();
@@ -66,7 +66,7 @@ test("legacy writers are fenced by the catalog transaction", async (t) => {
   for (const mode of ["active", "opened"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const original = JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { id: string; snapshot: string }[];
     const source = original[0]!;
     const linkPath = path.join(home, "sources", source.id);
@@ -168,7 +168,7 @@ DatabaseSync.prototype.exec = function(sql) { try { return exec.call(this, sql);
 test("migration retains the SQLite lock while preparing the source record", async (t) => {
   const parent = await tmp();
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const records = JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { id: string; snapshot: string }[];
   const source = records[0]!;
   const aliasPath = path.join(home, "sources", source.id);
@@ -224,7 +224,7 @@ try { db.exec("BEGIN IMMEDIATE"); process.exitCode = 2; } catch (err) { process.
 test("migration waits for a shared reader at commit", async (t) => {
   const parent = await tmp();
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const script = `import { DatabaseSync } from "node:sqlite";
 const db = new DatabaseSync(${JSON.stringify(path.join(home, "index.db"))}, { readOnly: true });
 db.exec("BEGIN"); db.prepare("SELECT count(*) FROM skills").get(); process.send("ready");
@@ -269,7 +269,7 @@ DatabaseSync.prototype.exec = function(sql) { if (sql === "PRAGMA user_version =
 test("legacy writer lock timeout preserves the store for retry", async () => {
   const parent = await tmp();
   const home = path.join(parent, "store");
-  await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+  await copyLegacyStoreFixture(home);
   const index = path.join(home, "index.db");
   const before = await readFile(index);
   const sources = await readFile(path.join(home, "sources.json"));
@@ -293,7 +293,7 @@ test("legacy migration refuses WAL sidecars and non-file journals", async () => 
   for (const sidecar of ["index.db-wal", "index.db-shm", "index.db-journal"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const before = await readFile(path.join(home, "index.db"));
     if (sidecar === "index.db-journal") await mkdir(path.join(home, sidecar));
     else await writeFile(path.join(home, sidecar), "unrelated");
@@ -308,7 +308,7 @@ test("migration refuses catalog probe and journal races before writing", async (
   for (const failure of ["probe", "open", "journal-directory"]) {
     const parent = await tmp();
     const home = path.join(parent, "store");
-    await cp(path.join(ROOT, "test/fixtures/store-v0.2.1/store"), home, { recursive: true, verbatimSymlinks: true });
+    await copyLegacyStoreFixture(home);
     const index = path.join(home, "index.db");
     const before = await readFile(index);
     const source = await readFile(path.join(home, "sources.json"));
