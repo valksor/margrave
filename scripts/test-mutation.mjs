@@ -19,6 +19,11 @@ if (process.argv.length > 2) {
       "test/lock-format.test.ts",
       "test/lock.test.ts",
     ],
+    lock: [
+      "--test-name-pattern='^(lock pending direct |lock restore direct |an empty store exports and restores|version 2 restores selected skills|restore syncs an interrupted snapshot|restore resumes a pending snapshot|restore keeps a competing source record|recovery refuses a competing source update|lock restore refuses staged edits|restore refuses a source installed after preflight|restore retains competing index changes|restore recreates the pending marker|restore keeps a competing marker|restore rejects a staged commit|lock round trips a SHA-256 Git repository|lock restore reports publication when marker cleanup fails)'",
+      "test/lock.test.ts",
+      "test/integration.test.ts",
+    ],
     "store-files": [
       "--test-name-pattern='^(store files |a missing sources|home|a sources.json that cannot be read|every field of a source record|atomic writes)'",
       "test/store-files.test.ts",

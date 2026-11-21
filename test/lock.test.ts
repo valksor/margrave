@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto, { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import fsp, { chmod, cp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
@@ -6,6 +7,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { pathToFileURL } from "node:url";
+import { insertSkills } from "../src/catalog.ts";
 import { parseLock, restoreLock } from "../src/lock.ts";
 import { exportLock, indexedEntries, matchesLock, sameInventory, verifyInstalled } from "../src/lock-format.ts";
 import { scanSource } from "../src/scan.ts";
@@ -481,6 +483,24 @@ async function directRestoreFixture(home: string, selected: boolean) {
   return { record, dir, entries, lock };
 }
 
+async function unrelatedLocalFixture(home: string, fixture: Awaited<ReturnType<typeof directRestoreFixture>>) {
+  const localDir = path.join(home, "local-source");
+  await mkdir(path.join(localDir, "other"), { recursive: true });
+  await writeFile(path.join(localDir, "other", "SKILL.md"), "---\nname: other\ndescription: Another skill\n---\n\nContent\n");
+  const scan = await scanSource(localDir, { followSymlinks: false, boundary: localDir, strict: true });
+  const local = {
+    id: "0-unrelated",
+    kind: "local" as const,
+    spec: localDir,
+    path: localDir,
+    subpath: "",
+    ref: null,
+    commit: null,
+    installedAt: fixture.record.installedAt,
+  };
+  return { local, entries: toEntries(local.id, scan.skills, (dir) => dir) };
+}
+
 async function directPending(home: string, fixture: Awaited<ReturnType<typeof directRestoreFixture>>) {
   const { record, dir, lock } = fixture;
   const scan = {
@@ -498,6 +518,490 @@ async function directPending(home: string, fixture: Awaited<ReturnType<typeof di
   await writeFile(marker, contents);
   return { marker, contents, scan };
 }
+
+test("lock restore direct propagates a pending destination lstat error", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(async () => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    await rm(home, { recursive: true, force: true });
+  });
+  const fixture = await directRestoreFixture(home, false);
+  await seedIndex(fixture.entries, [fixture.record]);
+  const { marker, contents } = await directPending(home, fixture);
+  const before = await readFile(path.join(home, "index.db"));
+  const error = Object.assign(new Error("destination denied"), { code: "EACCES" });
+  const real = fsp.lstat;
+  mock.method(fsp, "lstat", ((file: string, ...args: unknown[]) =>
+    file === fixture.dir ? Promise.reject(error) : (real as (...a: unknown[]) => Promise<unknown>)(file, ...args)) as typeof fsp.lstat);
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(
+      restoreLock(fixture.lock, { log: () => {}, allowUnsafe: false }, () => {}),
+      (err) => err === error,
+    );
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+  assert.equal(await readFile(marker, "utf8"), contents);
+  assert.deepEqual(await readFile(path.join(home, "index.db")), before);
+});
+
+for (const mode of ["success", "identity", "ref", "row", "already"] as const)
+  test(`lock restore direct handles an existing pending destination with ${mode}`, async (t) => {
+    const home = await tmp("mg-home-");
+    useHome(t, home);
+    t.after(async () => rm(home, { recursive: true, force: true }));
+    const fixture = await directRestoreFixture(home, false);
+    const { marker, scan } = await directPending(home, fixture);
+    const old = {
+      ...fixture.record,
+      snapshot: mode === "already" ? fixture.record.snapshot : `${fixture.record.commit}-${"e".repeat(16)}`,
+      ...(mode === "ref" ? { ref: "refs/heads/other" } : {}),
+      ...(mode === "already" ? { scan } : {}),
+    };
+    if (mode === "success") await cp(fixture.dir, path.join(home, "snapshots", old.id, old.snapshot), { recursive: true });
+    const { local, entries: localEntries } = await unrelatedLocalFixture(home, fixture);
+    assert.ok(local.id < fixture.record.id);
+    await seedIndex([...localEntries, ...fixture.entries], [local, old]);
+    if (mode === "row") {
+      const db = new DatabaseSync(path.join(home, "index.db"));
+      try {
+        db.prepare("UPDATE skills SET manifest = ? WHERE id = ?").run("changed", fixture.entries[0]!.id);
+      } finally {
+        db.close();
+      }
+    }
+    const originalRecord = catalogRecords(home).find((record) => record.id === fixture.record.id)!;
+    const db = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+    const rows = indexedEntries(db, fixture.record.id).map((row) => ({ ...row }));
+    const localRows = indexedEntries(db, local.id).map((row) => ({ ...row }));
+    if (mode === "success") {
+      await verifyInstalled(old, fixture.lock.sources[0]!, db);
+      await verifyInstalled({ ...fixture.record, scan }, fixture.lock.sources[0]!, db);
+    }
+    db.close();
+    const original = createHash("sha256")
+      .update(JSON.stringify([originalRecord, rows]))
+      .digest("hex");
+    const next = { ...fixture.record, scan };
+    const contents = JSON.stringify({
+      source: fixture.lock.sources[0],
+      record: next,
+      original: mode === "identity" ? "f".repeat(64) : original,
+    });
+    await writeFile(marker, contents);
+    const before = await readFile(path.join(home, "index.db"));
+    const output: string[] = [];
+    const restore = () => restoreLock(fixture.lock, { log: () => {}, allowUnsafe: false }, (line) => output.push(line));
+    if (mode === "identity" || mode === "ref" || mode === "row") {
+      const real = fsp.readdir;
+      let destinationReads = 0;
+      if (mode === "identity") {
+        mock.method(fsp, "readdir", ((dir: string, ...args: unknown[]) => {
+          if (dir === fixture.dir) destinationReads++;
+          return (real as (...a: unknown[]) => Promise<unknown>)(dir, ...args);
+        }) as typeof fsp.readdir);
+        syncBuiltinESMExports();
+      }
+      try {
+        await assert.rejects(restore(), { message: `installed source differs from the lock: ${fixture.record.id}` });
+        if (mode === "identity") assert.equal(destinationReads, 0);
+      } finally {
+        mock.restoreAll();
+        syncBuiltinESMExports();
+      }
+      assert.deepEqual(await readFile(path.join(home, "index.db")), before);
+      assert.equal(await readFile(marker, "utf8"), contents);
+      assert.deepEqual(output, []);
+    } else {
+      await restore();
+      assert.deepEqual(output, [`${mode === "already" ? "already restored" : "restored"} ${fixture.record.id}`]);
+      assert.deepEqual(catalogRecords(home), [local, mode === "already" ? originalRecord : next]);
+      const after = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+      try {
+        assert.deepEqual(
+          indexedEntries(after, fixture.record.id).map((row) => ({ ...row })),
+          rows,
+        );
+        assert.deepEqual(
+          indexedEntries(after, local.id).map((row) => ({ ...row })),
+          localRows,
+        );
+      } finally {
+        after.close();
+      }
+      if (mode === "already") assert.deepEqual(await readFile(path.join(home, "index.db")), before);
+      assert.equal(existsSync(marker), false);
+    }
+    assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+  });
+
+test("lock restore direct recovers a pending snapshot beside an unrelated catalog source", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(async () => rm(home, { recursive: true, force: true }));
+  const fixture = await directRestoreFixture(home, false);
+  const { local, entries: localEntries } = await unrelatedLocalFixture(home, fixture);
+  await seedIndex(localEntries, [local]);
+  const before = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+  const localRows = indexedEntries(before, local.id).map((row) => ({ ...row }));
+  before.close();
+  const { marker, scan: pendingScan } = await directPending(home, fixture);
+  const output: string[] = [];
+  await restoreLock(fixture.lock, { log: () => {}, allowUnsafe: false }, (line) => output.push(line));
+  assert.deepEqual(output, [`restored ${fixture.record.id}`]);
+  assert.deepEqual(catalogRecords(home), [local, { ...fixture.record, scan: pendingScan }]);
+  const after = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+  try {
+    assert.deepEqual(
+      indexedEntries(after, local.id).map((row) => ({ ...row })),
+      localRows,
+    );
+    assert.deepEqual(
+      indexedEntries(after, fixture.record.id).map((row) => ({ ...row })),
+      fixture.entries.map(({ id, revision, manifest, dir }) => ({ id, revision, manifest, dir })).sort((a, b) => a.id.localeCompare(b.id)),
+    );
+  } finally {
+    after.close();
+  }
+  assert.equal(existsSync(fixture.dir), true);
+  assert.equal(existsSync(marker), false);
+  assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+});
+
+for (const mode of ["ref", "snapshot", "matching"] as const)
+  test(`lock restore direct handles a competing pending source with ${mode}`, async (t) => {
+    const home = await tmp("mg-home-");
+    useHome(t, home);
+    t.after(async () => {
+      mock.restoreAll();
+      await rm(home, { recursive: true, force: true });
+    });
+    const fixture = await directRestoreFixture(home, false);
+    const { local, entries: localEntries } = await unrelatedLocalFixture(home, fixture);
+    await seedIndex(localEntries, [local]);
+    const db = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+    const localRows = indexedEntries(db, local.id).map((row) => ({ ...row }));
+    db.close();
+    const pending = await directPending(home, fixture);
+    const next = { ...fixture.record, scan: pending.scan };
+    const competing = {
+      ...next,
+      ...(mode === "ref" ? { ref: "refs/heads/other" } : {}),
+      ...(mode === "snapshot" ? { snapshot: `${fixture.record.commit}-${"e".repeat(16)}` } : {}),
+    };
+    const competingEntry = { ...fixture.entries[0]!, dir: "competing-directory" };
+    const hook = changeAtLock(t, 3, () => {
+      writeCatalogRecords(home, [local, competing]);
+      writeIndexRows(home, (writer) => insertSkills(writer, [competingEntry]));
+    });
+    const output: string[] = [];
+    const restore = () => restoreLock(fixture.lock, { log: () => {}, allowUnsafe: false }, (line) => output.push(line));
+    if (mode === "matching") {
+      await restore();
+      assert.deepEqual(output, [`restored ${fixture.record.id}`]);
+      assert.deepEqual(catalogRecords(home), [local, next]);
+      assert.equal(existsSync(pending.marker), false);
+    } else {
+      await assert.rejects(restore(), { message: `installed source differs from the lock: ${fixture.record.id}` });
+      assert.deepEqual(output, []);
+      assert.deepEqual(catalogRecords(home), [local, competing]);
+      assert.equal(await readFile(pending.marker, "utf8"), pending.contents);
+    }
+    assert.equal(hook.fired(), true);
+    const after = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+    try {
+      assert.deepEqual(
+        indexedEntries(after, local.id).map((row) => ({ ...row })),
+        localRows,
+      );
+      const expected = mode === "matching" ? fixture.entries : [competingEntry];
+      assert.deepEqual(
+        indexedEntries(after, fixture.record.id).map((row) => ({ ...row })),
+        expected.map(({ id, revision, manifest, dir }) => ({ id, revision, manifest, dir })).sort((a, b) => a.id.localeCompare(b.id)),
+      );
+    } finally {
+      after.close();
+    }
+    assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+  });
+
+test("lock restore direct verifies an installed source after an unrelated source", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(async () => rm(home, { recursive: true, force: true }));
+  const fixture = await directRestoreFixture(home, false);
+  const { local, entries: localEntries } = await unrelatedLocalFixture(home, fixture);
+  assert.ok(local.id < fixture.record.id);
+  await seedIndex([...localEntries, ...fixture.entries], [local, fixture.record]);
+  const before = await readFile(path.join(home, "index.db"));
+  const beforeRows = indexRows(home);
+  const output: string[] = [];
+  const prepare = mock.method(DatabaseSync.prototype, "prepare");
+  const close = mock.method(DatabaseSync.prototype, "close");
+  try {
+    await restoreLock(fixture.lock, { log: () => {}, allowUnsafe: false }, (line) => output.push(line));
+    const preflight = prepare.mock.calls.find(({ arguments: [sql] }) => sql === "SELECT id, record FROM sources ORDER BY position")?.this;
+    assert.ok(preflight);
+    assert.equal(close.mock.calls.filter((call) => call.this === preflight).length, 1);
+  } finally {
+    mock.restoreAll();
+  }
+  assert.deepEqual(output, [`already restored ${fixture.record.id}`]);
+  assert.deepEqual(catalogRecords(home), [local, fixture.record]);
+  assert.deepEqual(indexRows(home), beforeRows);
+  assert.deepEqual(await readFile(path.join(home, "index.db")), before);
+  assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+});
+
+test("lock restore direct records original identity before interrupted restage publication", async (t) => {
+  const home = await tmp("mg-home-");
+  const repo = await makeRepo();
+  const bin = await fakeRipwire();
+  const previousPath = process.env["PATH"];
+  useHome(t, home);
+  process.env["PATH"] = `${bin}:${previousPath ?? ""}`;
+  t.after(async () => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    if (previousPath === undefined) delete process.env["PATH"];
+    else process.env["PATH"] = previousPath;
+    await rm(home, { recursive: true, force: true });
+    await rm(repo.dir, { recursive: true, force: true });
+    await rm(bin, { recursive: true, force: true });
+  });
+  const ctx = { log: (): void => {}, allowUnsafe: false };
+  const { id } = await installSource(repo.url, null, ctx);
+  const lock = await exportLock([]);
+  const originalRecord = catalogRecords(home).find((record) => record.id === id)!;
+  const db = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+  const rows = indexedEntries(db, id).map((row) => ({ ...row }));
+  db.close();
+  const identity = createHash("sha256")
+    .update(JSON.stringify([originalRecord, rows]))
+    .digest("hex");
+  const catalog = await readFile(path.join(home, "index.db"));
+  await rm(path.join(home, "snapshots", id, originalRecord.snapshot!), { recursive: true });
+  const realRename = fsp.rename;
+  const realOpen = fsp.open;
+  let published: string | undefined;
+  const error = new Error("snapshot sync interrupted");
+  mock.method(fsp, "rename", (async (from: string, to: string) => {
+    await realRename(from, to);
+    if (from.startsWith(path.join(home, "staging", "restore-")) && path.dirname(to) === path.join(home, "snapshots", id)) published = to;
+  }) as typeof fsp.rename);
+  mock.method(fsp, "open", ((file: string, ...args: unknown[]) =>
+    file === published ? Promise.reject(error) : (realOpen as (...a: unknown[]) => Promise<unknown>)(file, ...args)) as typeof fsp.open);
+  syncBuiltinESMExports();
+  const output: string[] = [];
+  try {
+    await assert.rejects(
+      restoreLock(lock, ctx, (line) => output.push(line)),
+      (err) => err === error,
+    );
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+  assert.ok(published);
+  assert.equal(existsSync(published), true);
+  assert.deepEqual(output, []);
+  assert.deepEqual(await readFile(path.join(home, "index.db")), catalog);
+  assert.deepEqual(catalogRecords(home), [originalRecord]);
+  const after = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+  try {
+    assert.deepEqual(
+      indexedEntries(after, id).map((row) => ({ ...row })),
+      rows,
+    );
+  } finally {
+    after.close();
+  }
+  const marker = JSON.parse(await readFile(path.join(home, "restore-pending", `${id}.json`), "utf8")) as {
+    source: unknown;
+    record: { snapshot: string };
+    original: string;
+  };
+  assert.deepEqual(marker.source, lock.sources[0]);
+  assert.equal(marker.original, identity);
+  assert.equal(marker.record.snapshot, path.basename(published));
+  assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+});
+
+for (const mode of ["success", "row", "destination", "stat"] as const)
+  test(`lock restore direct restages an original-backed missing destination with ${mode}`, async (t) => {
+    const home = await tmp("mg-home-");
+    const repo = await makeRepo();
+    const bin = await fakeRipwire();
+    const previousPath = process.env["PATH"];
+    useHome(t, home);
+    process.env["PATH"] = `${bin}:${previousPath ?? ""}`;
+    t.after(async () => {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+      if (previousPath === undefined) delete process.env["PATH"];
+      else process.env["PATH"] = previousPath;
+      await rm(home, { recursive: true, force: true });
+      await rm(repo.dir, { recursive: true, force: true });
+      await rm(bin, { recursive: true, force: true });
+    });
+    const ctx = { log: (): void => {}, allowUnsafe: false };
+    const { id } = await installSource(repo.url, null, ctx);
+    const lock = await exportLock([]);
+    if (mode === "row") {
+      const db = new DatabaseSync(path.join(home, "index.db"));
+      try {
+        db.prepare("UPDATE skills SET manifest = ? WHERE id = ?").run("changed", lock.sources[0]!.skills[0]!.id);
+      } finally {
+        db.close();
+      }
+    }
+    const originalRecord = catalogRecords(home)[0]!;
+    const db = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+    const rows = indexedEntries(db, id).map((row) => ({ ...row }));
+    db.close();
+    const original = createHash("sha256")
+      .update(JSON.stringify([originalRecord, rows]))
+      .digest("hex");
+    const suffix = originalRecord.snapshot!.endsWith("e".repeat(16)) ? "d".repeat(16) : "e".repeat(16);
+    const next = { ...originalRecord, snapshot: `${originalRecord.commit}-${suffix}` };
+    const destination = path.join(home, "snapshots", id, next.snapshot);
+    const marker = path.join(home, "restore-pending", `${id}.json`);
+    await mkdir(path.dirname(marker), { recursive: true });
+    const contents = JSON.stringify({ source: lock.sources[0], record: next, original });
+    await writeFile(marker, contents);
+    const before = await readFile(path.join(home, "index.db"));
+    const output: string[] = [];
+    const error = Object.assign(new Error("final destination denied"), { code: "EACCES" });
+    let reads = 0;
+    if (mode === "stat") {
+      const real = fsp.lstat;
+      mock.method(fsp, "lstat", ((file: string, ...args: unknown[]) =>
+        file === destination && ++reads === 2
+          ? Promise.reject(error)
+          : (real as (...a: unknown[]) => Promise<unknown>)(file, ...args)) as typeof fsp.lstat);
+      syncBuiltinESMExports();
+    }
+    const hook =
+      mode === "destination"
+        ? changeAtLock(t, 3, () => {
+            mkdirSync(destination, { recursive: true });
+            writeFileSync(path.join(destination, "competitor"), "retained");
+          })
+        : undefined;
+    const restore = () => restoreLock(lock, ctx, (line) => output.push(line));
+    if (mode === "success") {
+      await restore();
+      assert.deepEqual(output, [`restored ${id}`]);
+      assert.deepEqual(catalogRecords(home), [next]);
+      const after = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+      try {
+        assert.deepEqual(
+          indexedEntries(after, id).map((row) => ({ ...row })),
+          rows,
+        );
+      } finally {
+        after.close();
+      }
+      assert.equal(existsSync(marker), false);
+    } else {
+      await assert.rejects(
+        restore(),
+        mode === "stat"
+          ? (err: unknown) => err === error
+          : {
+              message: `${mode === "row" ? "installed source differs from the lock" : "pending restore record is malformed"}: ${id}`,
+            },
+      );
+      assert.deepEqual(await readFile(path.join(home, "index.db")), before);
+      assert.equal(await readFile(marker, "utf8"), contents);
+      assert.deepEqual(output, []);
+      if (mode === "destination") {
+        assert.equal(hook!.fired(), true);
+        assert.equal(await readFile(path.join(destination, "competitor"), "utf8"), "retained");
+      }
+      if (mode === "stat") assert.equal(reads, 2);
+    }
+    assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+  });
+
+for (const mode of ["original-record", "original-row", "verified-row", "marker", "reuse"] as const)
+  test(`lock restore direct handles publication ${mode}`, async (t) => {
+    const home = await tmp("mg-home-");
+    useHome(t, home);
+    t.after(async () => {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+      await rm(home, { recursive: true, force: true });
+    });
+    const fixture = await directRestoreFixture(home, false);
+    const originalBacked = mode === "original-record" || mode === "original-row" || mode === "reuse";
+    const old = { ...fixture.record, snapshot: originalBacked ? `${fixture.record.commit}-${"e".repeat(16)}` : fixture.record.snapshot };
+    await seedIndex(fixture.entries, [old]);
+    const originalRecord = catalogRecords(home)[0]!;
+    const db = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+    const rows = indexedEntries(db, fixture.record.id).map((row) => ({ ...row }));
+    db.close();
+    const original = createHash("sha256")
+      .update(JSON.stringify([originalRecord, rows]))
+      .digest("hex");
+    const pending = await directPending(home, fixture);
+    const next = { ...fixture.record, scan: pending.scan };
+    const contents = JSON.stringify({ source: fixture.lock.sources[0], record: next, original });
+    if (originalBacked) await writeFile(pending.marker, contents);
+    else await rm(pending.marker);
+    if (mode === "reuse") {
+      const real = fsp.rename;
+      mock.method(fsp, "rename", ((from: string, to: string) =>
+        to === pending.marker ? Promise.reject(new Error("marker replacement attempted")) : real(from, to)) as typeof fsp.rename);
+      syncBuiltinESMExports();
+    }
+    const competing = catalogRecords(home);
+    competing[0]!.installedAt = "competing writer";
+    const hook =
+      mode === "reuse"
+        ? undefined
+        : changeAtLock(t, 3, () => {
+            if (mode === "original-record") writeCatalogRecords(home, competing);
+            else if (mode === "marker") writeFileSync(pending.marker, pending.contents);
+            else
+              writeIndexRows(home, (writer) => {
+                writer.prepare("UPDATE skills SET dir = ? WHERE id = ?").run("competing-directory", fixture.entries[0]!.id);
+              });
+          });
+    const output: string[] = [];
+    const restore = () => restoreLock(fixture.lock, { log: () => {}, allowUnsafe: false }, (line) => output.push(line));
+    if (mode === "reuse") {
+      await restore();
+      assert.deepEqual(output, [`restored ${fixture.record.id}`]);
+      assert.deepEqual(catalogRecords(home), [next]);
+      assert.equal(existsSync(pending.marker), false);
+    } else {
+      await assert.rejects(restore(), {
+        message: `${mode === "marker" ? "restore is pending for a different lock source" : "installed source differs from the lock"}: ${fixture.record.id}`,
+      });
+      assert.equal(hook!.fired(), true);
+      assert.deepEqual(output, []);
+      assert.deepEqual(catalogRecords(home), mode === "original-record" ? competing : [originalRecord]);
+      if (mode === "marker") assert.equal(await readFile(pending.marker, "utf8"), pending.contents);
+      if (originalBacked) assert.equal(await readFile(pending.marker, "utf8"), contents);
+      if (mode === "original-row" || mode === "verified-row") {
+        const after = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+        try {
+          assert.equal(
+            indexedEntries(after, fixture.record.id).find((row) => row.id === fixture.entries[0]!.id)?.dir,
+            "competing-directory",
+          );
+        } finally {
+          after.close();
+        }
+      }
+    }
+    assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+  });
 
 test("lock restore direct propagates both strict snapshot scan errors", async (t) => {
   const home = await tmp("mg-home-");
@@ -1302,6 +1806,42 @@ test("restore refuses a source installed after preflight", async (t) => {
   );
   assert.equal(hook.fired(), true);
   assert.deepEqual(catalogRecords(destination), competing);
+  mock.restoreAll();
+
+  const sameDestination = await tmp("mg-home-");
+  process.env["MARGRAVE_HOME"] = sameDestination;
+  await seedIndex([]);
+  const nonce = Buffer.from("1234567890abcdef", "hex");
+  const sameCompeting = competing.map((record) => ({ ...record, snapshot: `${lock.sources[0]!.commit}-${nonce.toString("hex")}` }));
+  const sameHook = changeAtLock(t, 3, () => writeCatalogRecords(sameDestination, sameCompeting));
+  const realRandomBytes = crypto.randomBytes;
+  let nonceUsed = false;
+  mock.method(crypto, "randomBytes", ((...args: unknown[]) => {
+    if (args.length === 1 && args[0] === 8) {
+      nonceUsed = true;
+      return nonce;
+    }
+    return (realRandomBytes as (...values: unknown[]) => unknown)(...args);
+  }) as typeof crypto.randomBytes);
+  syncBuiltinESMExports();
+  const output: string[] = [];
+  try {
+    await assert.rejects(
+      restoreLock(lock, ctx, (line) => output.push(line)),
+      {
+        message: `installed source differs from the lock: ${lock.sources[0]!.id}`,
+      },
+    );
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+  assert.equal(sameHook.fired(), true);
+  assert.equal(nonceUsed, true);
+  assert.deepEqual(catalogRecords(sameDestination), sameCompeting);
+  assert.deepEqual(output, []);
+  assert.equal(existsSync(path.join(sameDestination, "restore-pending", `${lock.sources[0]!.id}.json`)), false);
+  assert.equal(existsSync(path.join(sameDestination, "snapshots", lock.sources[0]!.id, sameCompeting[0]!.snapshot)), false);
 });
 
 test("restore retains competing index changes before publication", async (t) => {
