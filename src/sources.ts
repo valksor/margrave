@@ -41,7 +41,7 @@ export async function installSource(spec: string, refArg: string | null, ctx: Ct
     await migrateStore();
     return installLocal(spec, parsed.path, ctx, selection);
   }
-  if (ref !== null && qualifiedRef(ref)) await validateGitRef(ref);
+  if (qualifiedRef(ref)) await validateGitRef(ref);
   await migrateStore();
   return installGit(spec, parsed, ref, ctx, selection);
 }
@@ -61,13 +61,10 @@ function duplicate(id: string): MargraveError {
 }
 
 async function installLocal(spec: string, dir: string, ctx: Ctx, selection?: string[]): Promise<InstallResult> {
-  let real: string;
-  try {
-    real = await realpath(dir);
-    if (!(await stat(real)).isDirectory()) throw new Error("not a directory");
-  } catch {
-    throw new MargraveError(`${dir} is not a directory that exists`);
-  }
+  const real = await realpath(dir)
+    .then(async (resolved) => ((await stat(resolved)).isDirectory() ? resolved : null))
+    .catch(() => null);
+  if (real === null) throw new MargraveError(`${dir} is not a directory that exists`);
   const id = localId(real);
   await ensureDirs();
   const sources = await readSources();
@@ -90,7 +87,7 @@ async function installLocal(spec: string, dir: string, ctx: Ctx, selection?: str
     ref: null,
     commit: null,
     installedAt: new Date().toISOString(),
-    ...(selection === undefined ? {} : { selection }),
+    selection,
   };
   await commit(addSource(record, entries));
   return { id, skills: entries.map((e) => e.id) };
@@ -159,7 +156,7 @@ async function installGit(
       snapshot,
       scan: acceptedScan,
       installedAt: new Date().toISOString(),
-      ...(selection === undefined ? {} : { selection }),
+      selection,
     };
 
     await commit(addSource(record, entries));
@@ -204,10 +201,9 @@ export async function updateSources(
 }
 
 function updateTargets(sources: SourceRecord[], arg: string | null, expansion?: string[]): SourceRecord[] {
-  if (expansion !== undefined && (arg === null || !sources.some((s) => s.id === arg)))
-    throw new UsageError("skill selection requires an explicit source ID");
+  if (expansion !== undefined && !sources.some((s) => s.id === arg)) throw new UsageError("skill selection requires an explicit source ID");
   const targets = arg === null ? sources : [findSource(sources, arg)];
-  if (expansion !== undefined && targets[0]?.selection === undefined)
+  if (expansion !== undefined && targets[0]!.selection === undefined)
     throw new MargraveError(`source "${arg}" already installs all skills`);
   return targets;
 }
@@ -246,12 +242,12 @@ async function updateOne(id: string, ctx: Ctx, ref: string | null, expansion?: s
 async function updateLocal(rec: SourceRecord, ctx: Ctx, selection?: string[]): Promise<UpdateResult> {
   const id = rec.id;
   const diff: { value?: ReturnType<typeof diffEntries> } = {};
-  const entries = await scanLocal({ ...rec, ...(selection === undefined ? {} : { selection }) }, ctx);
+  const entries = await scanLocal({ ...rec, selection }, ctx);
   await commit((fresh, db) => {
     const current = fresh.find((s) => s.id === id);
     if (current === undefined) throw new MargraveError(`no source "${id}"`);
     if (JSON.stringify(current) !== JSON.stringify(rec)) throw new MargraveError("source changed during update; run margrave update again");
-    return replaceSource(id, entries, diff)(fresh, db).map((s) => (s.id === id && selection !== undefined ? { ...s, selection } : s));
+    return replaceSource(id, entries, diff)(fresh, db).map((s) => (s.id === id ? { ...s, selection } : s));
   });
   return { id, kind: "local", oldCommit: null, newCommit: null, ...(diff.value as ReturnType<typeof diffEntries>) };
 }
@@ -295,11 +291,7 @@ async function updateGit(rec: SourceRecord, ctx: Ctx, ref: string | null, select
       deleteSourceSkills(db, id);
       insertSkills(db, entries);
       diff.value = diffEntries(before, entries);
-      return fresh.map((s) =>
-        s.id === id
-          ? { ...s, commit: sha, snapshot, ref: selected, scan: acceptedScan, ...(selection === undefined ? {} : { selection }) }
-          : s,
-      );
+      return fresh.map((s) => (s.id === id ? { ...s, commit: sha, snapshot, ref: selected, scan: acceptedScan, selection } : s));
     });
     return { id, kind: "git" as const, oldCommit: rec.commit, newCommit: sha, ...(diff.value as ReturnType<typeof diffEntries>) };
   });

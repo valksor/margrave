@@ -49,6 +49,14 @@ if (process.argv.length > 2) {
       "--test-name-pattern='^(source maintenance direct |check reports a source record|check reports a metadata read|check scans valid skills|check reports an unavailable local Git remote|reindex: control characters|a reindex whose sources|a remove whose source)'",
       "test/source-maintenance.test.ts",
     ],
+    sources: [
+      "--test-name-pattern='^(sources (install|update) direct |Git install and update refuse staged changes|Git update preserves a source record|local selections expand and reject competing source changes|selection expansion rejects a source replaced between reads|Git update preserves another writer|update of all sources: a rejection|Git install preserves a competing record or alias|update proceeds when every finding is known|update applies install rules when the accepted scan is unknown)'",
+      "test/sources-install.test.ts",
+      "test/sources-update.test.ts",
+      "test/sources.test.ts",
+      "test/source-files.test.ts",
+      "test/integration.test.ts",
+    ],
     mcp: [
       "--test-name-pattern='^(MCP server direct |MCP smoke|MCP server version|a tool whose work rejects|MCP in-process|stdio source allowlists|stdio serves|hosted tools have|hosted: with no sources|hosted: find, load, read|hosted: a store failure|hosted source options|hosted file reads|CLI, stdio and hosted opt in)'",
       "test/mcp.test.ts",
