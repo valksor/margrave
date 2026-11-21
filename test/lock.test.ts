@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import fsp, { chmod, cp, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import fsp, { chmod, cp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
-import { exportLock, parseLock, restoreLock } from "../src/lock.ts";
+import { parseLock, restoreLock } from "../src/lock.ts";
+import { exportLock, indexedEntries, matchesLock, sameInventory, verifyInstalled } from "../src/lock-format.ts";
+import { scanSource } from "../src/scan.ts";
+import { toEntries } from "../src/source-files.ts";
+import { parseSpec } from "../src/source-git.ts";
 import { installSource } from "../src/sources.ts";
 import {
   catalogRecords,
@@ -13,12 +17,256 @@ import {
   fakeRipwire,
   indexRows,
   makeRepo,
+  newEntry,
   realExec,
   seedIndex,
   tmp,
   writeCatalogRecords,
   writeIndexRows,
 } from "./helpers.ts";
+
+test("lock inventory compares source identity and unordered skill revisions", () => {
+  const spec = "example/project/skills";
+  const parsed = parseSpec(spec);
+  assert.equal(parsed.kind, "git");
+  const rec = {
+    ...parsed,
+    spec,
+    ref: "refs/heads/main",
+    commit: "a".repeat(40),
+    installedAt: "2026-01-01T00:00:00.000Z",
+    snapshot: `${"a".repeat(40)}-${"d".repeat(16)}`,
+  };
+  const revision = `sha256:${"b".repeat(64)}`;
+  const locked = {
+    spec,
+    id: parsed.id,
+    url: parsed.url,
+    subpath: parsed.subpath,
+    ref: rec.ref,
+    commit: rec.commit,
+    skills: [
+      { id: `${parsed.id}/a`, revision },
+      { id: `${parsed.id}/b`, revision },
+    ],
+  };
+  assert.equal(matchesLock(rec, locked), true);
+  assert.equal(matchesLock(rec, { ...locked, selection: null }), true);
+  assert.equal(matchesLock({ ...rec, selection: ["a"] }, { ...locked, selection: ["a"] }), true);
+  assert.equal(matchesLock({ ...rec, selection: ["a"] }, { ...locked, selection: ["b"] }), false);
+  assert.equal(matchesLock({ ...rec, kind: "local" }, locked), false);
+  for (const field of ["id", "spec", "url", "subpath", "ref", "commit"] as const)
+    assert.equal(matchesLock({ ...rec, [field]: `${rec[field]}-other` }, locked), false, field);
+
+  const entries = [
+    { ...locked.skills[1]!, dir: "b", manifest: "b" },
+    { ...locked.skills[0]!, dir: "a", manifest: "a" },
+  ];
+  assert.equal(sameInventory(entries, locked), true);
+  assert.equal(sameInventory(entries.slice(1), locked), false);
+  assert.equal(sameInventory([...entries, { ...entries[0]!, id: `${parsed.id}/c` }], locked), false);
+  assert.equal(sameInventory([{ ...entries[0]!, id: `${parsed.id}/c` }, entries[1]!], locked), false);
+  assert.equal(sameInventory([{ ...entries[0]!, revision: `sha256:${"c".repeat(64)}` }, entries[1]!], locked), false);
+  const duplicate = { ...entries[1]!, revision: `sha256:${"d".repeat(64)}` };
+  const duplicateLock = { ...locked, skills: [locked.skills[0]!, { id: duplicate.id, revision: duplicate.revision }, locked.skills[1]!] };
+  assert.equal(sameInventory([entries[0]!, entries[1]!, duplicate], duplicateLock), true);
+  assert.equal(sameInventory([entries[0]!, duplicate, entries[1]!], duplicateLock), false);
+});
+
+test("lock export API reads sorted source entries and closes the catalog", async (t) => {
+  const previous = process.env["MARGRAVE_HOME"];
+  const home = await tmp("mg-home-");
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(() => {
+    mock.restoreAll();
+    if (previous === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previous;
+  });
+  assert.deepEqual(await exportLock([]), { version: 2, sources: [] });
+  await assert.rejects(exportLock(["missing"]), { message: "--source must be an installed Git source ID" });
+  await seedIndex([]);
+  assert.deepEqual(await exportLock([]), { version: 2, sources: [] });
+
+  const spec = "example/project";
+  const parsed = parseSpec(spec);
+  assert.equal(parsed.kind, "git");
+  const rec = {
+    ...parsed,
+    spec,
+    ref: "refs/heads/main",
+    commit: "a".repeat(40),
+    installedAt: "2026-01-01T00:00:00.000Z",
+    snapshot: `${"a".repeat(40)}-${"d".repeat(16)}`,
+  };
+  const local = {
+    id: "local",
+    kind: "local" as const,
+    spec: "/local",
+    path: "/local",
+    subpath: "",
+    ref: null,
+    commit: null,
+    installedAt: rec.installedAt,
+  };
+  const revision = `sha256:${"b".repeat(64)}`;
+  const a = { ...newEntry(rec.id, "a"), revision, manifest: '["a"]', dir: "skills/a" };
+  const b = { ...newEntry(rec.id, "b"), revision, manifest: '["b"]', dir: "skills/b" };
+  await rm(path.join(home, "index.db"));
+  await seedIndex([b, newEntry(local.id, "other"), a], [rec, local]);
+  const db = new DatabaseSync(path.join(home, "index.db"), { readOnly: true });
+  try {
+    assert.deepEqual(
+      indexedEntries(db, rec.id).map((row) => ({ ...row })),
+      [
+        { id: a.id, revision, manifest: a.manifest, dir: a.dir },
+        { id: b.id, revision, manifest: b.manifest, dir: b.dir },
+      ],
+    );
+    assert.deepEqual(indexedEntries(db, "missing"), []);
+  } finally {
+    db.close();
+  }
+  const closeDescriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "close");
+  assert.ok(closeDescriptor?.value);
+  let closes = 0;
+  mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    closes++;
+    return (closeDescriptor.value as typeof DatabaseSync.prototype.close).call(this);
+  });
+  await assert.rejects(exportLock([]), { message: "select Git sources with --source when the store contains local directories" });
+  assert.equal(closes, 1);
+  for (const id of ["missing", local.id])
+    await assert.rejects(exportLock([id]), { message: "--source must be an installed Git source ID" });
+  const wholeLock = {
+    version: 2,
+    sources: [
+      {
+        spec,
+        id: rec.id,
+        url: rec.url,
+        subpath: rec.subpath,
+        ref: rec.ref,
+        commit: rec.commit,
+        skills: [
+          { id: a.id, revision },
+          { id: b.id, revision },
+        ],
+        selection: null,
+      },
+    ],
+  };
+  assert.deepEqual(await exportLock([rec.id]), wholeLock);
+  assert.equal(closes, 4);
+  mock.restoreAll();
+  await rm(path.join(home, "index.db"));
+  await seedIndex([b, a], [rec]);
+  assert.deepEqual(await exportLock([]), wholeLock);
+  assert.deepEqual(await exportLock([rec.id]), wholeLock);
+  await rm(path.join(home, "index.db"));
+  await seedIndex([a], [{ ...rec, selection: ["a"] }, local]);
+  assert.deepEqual(await exportLock([rec.id]), {
+    version: 2,
+    sources: [
+      {
+        spec,
+        id: rec.id,
+        url: rec.url,
+        subpath: rec.subpath,
+        ref: rec.ref,
+        commit: rec.commit,
+        skills: [{ id: a.id, revision }],
+        selection: ["a"],
+      },
+    ],
+  });
+  for (const change of [{ spec: "https://example.invalid/repo?query" }, { url: "https://@example.invalid/repo" }]) {
+    await rm(path.join(home, "index.db"));
+    await seedIndex([a, b], [rec, { ...rec, id: "other", ...change }]);
+    const prepareDescriptor = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "prepare");
+    assert.ok(prepareDescriptor?.value);
+    const prepareMock = mock.method(DatabaseSync.prototype, "prepare", function (this: DatabaseSync, sql: string) {
+      if (sql === "SELECT id, hash AS revision, manifest, dir FROM skills WHERE source = ? ORDER BY id")
+        throw new Error("inventory query reached");
+      return (prepareDescriptor.value as typeof DatabaseSync.prototype.prepare).call(this, sql);
+    });
+    const closed: DatabaseSync[] = [];
+    const closeMock = mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+      closed.push(this);
+      return (closeDescriptor.value as typeof DatabaseSync.prototype.close).call(this);
+    });
+    try {
+      await assert.rejects(exportLock([rec.id, "other"]), {
+        message: "lock source URL must not contain credentials, a query, or a fragment",
+      });
+      assert.equal(closed.length, 1);
+      assert.equal(closed[0]?.isOpen, false);
+    } finally {
+      prepareMock.mock.restore();
+      closeMock.mock.restore();
+    }
+  }
+});
+
+test("lock verification compares the real snapshot, indexed inventory, manifest and directory", async (t) => {
+  const previous = process.env["MARGRAVE_HOME"];
+  const home = await tmp("mg-home-");
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(() => {
+    if (previous === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previous;
+  });
+  const spec = "example/project";
+  const parsed = parseSpec(spec);
+  assert.equal(parsed.kind, "git");
+  const rec = {
+    ...parsed,
+    spec,
+    ref: "refs/heads/main",
+    commit: "a".repeat(40),
+    installedAt: "2026-01-01T00:00:00.000Z",
+    snapshot: `${"a".repeat(40)}-${"d".repeat(16)}`,
+  };
+  const dir = path.join(home, "snapshots", rec.id, rec.snapshot);
+  for (const name of ["skill", "second"]) {
+    await mkdir(path.join(dir, name), { recursive: true });
+    await writeFile(path.join(dir, name, "SKILL.md"), `---\nname: ${name}\ndescription: A skill\n---\n\nContent\n`);
+  }
+  await symlink(path.join(dir, "skill"), path.join(dir, "link"));
+  const scan = await scanSource(dir, { followSymlinks: false, boundary: dir, strict: true });
+  assert.ok(scan.warnings.length > 0);
+  const entries = toEntries(rec.id, scan.skills, (d) => path.relative(dir, d));
+  assert.equal(entries.length, 2);
+  const entry = entries[0]!;
+  const locked = {
+    spec,
+    id: rec.id,
+    url: rec.url,
+    subpath: rec.subpath,
+    ref: rec.ref,
+    commit: rec.commit,
+    skills: entries.map(({ id, revision }) => ({ id, revision })),
+  };
+  await seedIndex(entries, [rec]);
+  const db = new DatabaseSync(path.join(home, "index.db"));
+  t.after(() => db.close());
+  await verifyInstalled(rec, locked, db);
+  const stale = `sha256:${"c".repeat(64)}`;
+  const failure = { message: `installed source differs from the lock: ${rec.id}` };
+  db.prepare("UPDATE skills SET hash = ? WHERE id = ?").run(stale, entry.id);
+  await assert.rejects(
+    verifyInstalled(
+      rec,
+      { ...locked, skills: locked.skills.map((skill) => (skill.id === entry.id ? { ...skill, revision: stale } : skill)) },
+      db,
+    ),
+    failure,
+  );
+  await assert.rejects(verifyInstalled(rec, locked, db), failure);
+  db.prepare("UPDATE skills SET hash = ?, manifest = ? WHERE id = ?").run(entry.revision, "changed", entry.id);
+  await assert.rejects(verifyInstalled(rec, locked, db), failure);
+  db.prepare("UPDATE skills SET manifest = ?, dir = ? WHERE id = ?").run(entry.manifest, "changed", entry.id);
+  await assert.rejects(verifyInstalled(rec, locked, db), failure);
+});
 
 test("an empty store exports and restores an empty lock", async (t) => {
   const previous = process.env["MARGRAVE_HOME"];

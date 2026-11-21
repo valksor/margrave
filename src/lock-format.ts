@@ -33,7 +33,7 @@ const keys = (value: Record<string, unknown>, expected: string[]): boolean =>
 const digest = (s: string): boolean => s.startsWith("sha256:") && isSha256(s.slice(7));
 const commitHash = (s: string): boolean => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(s);
 const refValid = (s: string): boolean =>
-  /^refs\/(heads|tags)\/.+/u.test(s) &&
+  /^refs\/(heads|tags)\/./u.test(s) &&
   !s.split("").some((char) => char.charCodeAt(0) <= 32 || char.charCodeAt(0) === 127 || "~^:?*[\\".includes(char)) &&
   !s.includes("..") &&
   !s.includes("@{") &&
@@ -72,25 +72,25 @@ export function parseLock(value: unknown): LockFile {
       if (typeof source["spec"] === "string") checkLockUrl(source["spec"]);
       if (typeof source["url"] === "string") checkLockUrl(source["url"]);
     }
-  const sources: LockedSource[] = [];
-  const ids = new Set<string>();
-  for (const source of value["sources"]) sources.push(parseLockedSource(source, version, ids));
-  sources.sort((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)));
-  return { version, sources };
+  const sources = new Map<string, LockedSource>();
+  for (const source of value["sources"]) {
+    const parsed = parseLockedSource(source, version, sources);
+    sources.set(parsed.id, parsed);
+  }
+  return { version, sources: [...sources.keys()].sort().map((id) => sources.get(id)!) };
 }
 
 export async function readLock(file: string): Promise<LockFile> {
-  const data = await readFile(file, "utf8");
-  let value: unknown;
+  const data = await readFile(file);
   try {
-    value = JSON.parse(data);
-  } catch {
-    return malformed();
+    return parseLock(JSON.parse(data.toString()));
+  } catch (error) {
+    if (error instanceof SyntaxError) return malformed();
+    throw error;
   }
-  return parseLock(value);
 }
 
-function parseLockedSource(source: unknown, version: 1 | 2, ids: Set<string>): LockedSource {
+function parseLockedSource(source: unknown, version: 1 | 2, ids: Map<string, LockedSource>): LockedSource {
   if (
     !isRecord(source) ||
     !keys(source, ["spec", "id", "url", "subpath", "ref", "commit", "skills", ...(version === 2 ? ["selection"] : [])])
@@ -111,17 +111,15 @@ function parseLockedSource(source: unknown, version: 1 | 2, ids: Set<string>): L
     ids.has(id)
   )
     return malformed();
-  let parsed;
+  let parsed: { kind: "git" | "local"; id?: string; url?: string; subpath?: string };
   try {
     parsed = parseSpec(spec);
   } catch {
     throw new MargraveError("lock source does not match its install spec");
   }
-  if (parsed.kind !== "git" || parsed.id !== id || parsed.url !== url || parsed.subpath !== subpath)
+  if (parsed.id !== id || parsed.url !== url || parsed.subpath !== subpath)
     throw new MargraveError("lock source does not match its install spec");
-  ids.add(id);
-  const entries: LockedSkill[] = [];
-  const skillIds = new Set<string>();
+  const skillIds = new Map<string, LockedSkill>();
   for (const skill of skills) {
     if (
       !isRecord(skill) ||
@@ -135,14 +133,13 @@ function parseLockedSource(source: unknown, version: 1 | 2, ids: Set<string>): L
       skillIds.has(skill["id"])
     )
       return malformed();
-    skillIds.add(skill["id"]);
-    entries.push({ id: skill["id"], revision: skill["revision"] });
+    skillIds.set(skill["id"], { id: skill["id"], revision: skill["revision"] });
   }
-  entries.sort((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)));
+  const entries = [...skillIds.keys()].sort().map((skillId) => skillIds.get(skillId)!);
   const selection = source["selection"] as string[] | null | undefined;
   if (
     Array.isArray(selection) &&
-    JSON.stringify(selection.map((name) => `${id}/${name}`).sort()) !== JSON.stringify(entries.map((entry) => entry.id))
+    JSON.stringify(selection.map((name) => `${id}/${name}`)) !== JSON.stringify(entries.map((entry) => entry.id))
   )
     return malformed();
   return {
@@ -158,7 +155,8 @@ function parseLockedSource(source: unknown, version: 1 | 2, ids: Set<string>): L
 }
 
 function lockInventory(entries: readonly { id: string; revision: string }[]): { id: string; revision: string }[] {
-  return entries.map(({ id, revision }) => ({ id, revision })).sort((a, b) => Number(a.id > b.id) - Number(a.id < b.id));
+  const groups = Map.groupBy(entries, (entry) => entry.id);
+  return [...groups.keys()].sort().flatMap((id) => groups.get(id)!.map(({ revision }) => ({ id, revision })));
 }
 
 export function sameInventory(entries: readonly { id: string; revision: string }[], locked: LockedSource): boolean {
@@ -189,7 +187,7 @@ export function indexedEntries(db: DatabaseSync, id: string): { id: string; revi
 
 export async function verifyInstalled(rec: SourceRecord, locked: LockedSource, db: DatabaseSync): Promise<void> {
   try {
-    const scanned = await scanInstalledSource(rec, { log: () => {}, allowUnsafe: false });
+    const scanned = await scanInstalledSource(rec, { log: () => {} });
     const indexed = indexedEntries(db, rec.id);
     if (!sameInventory(scanned, locked) || !sameInventory(indexed, locked)) throw new Error();
     const manifests = new Map(indexed.map((e) => [e.id, JSON.stringify([e.manifest, e.dir])]));
@@ -219,7 +217,6 @@ export async function exportLock(selected: string[]): Promise<LockFile> {
       checkLockUrl(rec.spec);
       checkLockUrl(rec.url as string);
     }
-    if (targets.length === 0) return { version: 2, sources: [] };
     const locked: LockedSource[] = [];
     for (const rec of targets) {
       locked.push({

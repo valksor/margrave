@@ -322,7 +322,7 @@ export async function commit(
   }
 }
 
-export function logWarnings(ctx: Ctx, warnings: readonly string[]): void {
+export function logWarnings(ctx: Pick<Ctx, "log">, warnings: readonly string[]): void {
   for (const w of warnings) ctx.log(`warning: ${esc(w)}`);
 }
 
@@ -352,7 +352,7 @@ export function selectSkills(
   return scan.skills.filter((skill) => selection.includes(skill.name));
 }
 
-export async function scanLocal(rec: SourceRecord, ctx: Ctx): Promise<NewEntry[]> {
+export async function scanLocal(rec: SourceRecord, ctx: Pick<Ctx, "log">): Promise<NewEntry[]> {
   // readSources() only returns a local record with a path.
   const root = await realpath(rec.path as string).catch((err: NodeJS.ErrnoException) => {
     if (err.code === "ENOENT") throw new MargraveError(`${rec.path} is not readable; remove the source or restore the directory`);
@@ -363,7 +363,7 @@ export async function scanLocal(rec: SourceRecord, ctx: Ctx): Promise<NewEntry[]
   return toEntries(rec.id, selectSkills(rec.id, scan, rec.selection, true), (d) => d);
 }
 
-export async function scanInstalledSource(rec: SourceRecord, ctx: Ctx): Promise<NewEntry[]> {
+export async function scanInstalledSource(rec: SourceRecord, ctx: Pick<Ctx, "log">): Promise<NewEntry[]> {
   if (rec.kind === "local") return scanLocal(rec, ctx);
   const dir = gitDir(rec);
   const root = await resolveScanRoot(dir, rec.subpath);

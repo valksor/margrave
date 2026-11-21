@@ -49,7 +49,7 @@ export async function checkSources(arg: string | null): Promise<CheckResult[]> {
       };
       try {
         const before = skillHashes(db, rec.id);
-        const entries = await scanInstalledSource(rec, { log: () => {}, allowUnsafe: false });
+        const entries = await scanInstalledSource(rec, { log: () => {} });
         Object.assign(result, diffEntries(before, entries));
         if (rec.kind === "git") {
           const remote = await trackingRef(rec);

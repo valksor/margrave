@@ -114,7 +114,7 @@ async function verifyMigrationContents(
         const expected = path.join(await realpath(home()), "snapshots", rec.id, rec.snapshot as string);
         if (!st.isDirectory() || st.isSymbolicLink() || (await realpath(snapshot)) !== expected) throw conflict();
       }
-      const scanned = await scanInstalledSource(rec, { log: () => {}, allowUnsafe: false });
+      const scanned = await scanInstalledSource(rec, { log: () => {} });
       const indexed = rows.filter((row) => row.source === rec.id);
       if (indexed.length !== scanned.length) throw conflict();
       for (const entry of scanned) {
