@@ -74,7 +74,7 @@ export async function atomicWrite(file: string, data: string): Promise<void> {
   try {
     const fh = await open(tmp, "w");
     try {
-      await fh.writeFile(data, "utf8");
+      await fh.writeFile(data);
       await fh.sync();
     } finally {
       await fh.close();
@@ -109,24 +109,21 @@ function validSourceLocation(v: Record<string, unknown>): boolean {
   return (
     v["kind"] === "git" &&
     typeof v["snapshot"] === "string" &&
-    typeof v["commit"] === "string" &&
     /^(?:[0-9a-f]{40}|[0-9a-f]{64})-[0-9a-f]{16}$/u.test(v["snapshot"]) &&
-    v["snapshot"].startsWith(`${v["commit"]}-`)
+    v["snapshot"].startsWith(`${String(v["commit"])}-`)
   );
 }
 
 function validSourceFields(v: Record<string, unknown>): boolean {
   if (v["selection"] !== undefined && !validSelection(v["selection"])) return false;
-  if (typeof v["id"] !== "string" || typeof v["spec"] !== "string") return false;
-  if (v["kind"] !== "git" && v["kind"] !== "local") return false;
+  if (typeof v["spec"] !== "string") return false;
   if (typeof v["subpath"] !== "string") return false;
-  if (v["ref"] !== null && typeof v["ref"] !== "string") return false;
   if (v["commit"] !== null && typeof v["commit"] !== "string") return false;
   if (typeof v["installedAt"] !== "string") return false;
   if (!validSourceLocation(v)) return false;
   if (v["kind"] === "git")
-    return typeof v["url"] === "string" && typeof v["ref"] === "string" && /^refs\/(?:heads|tags)\/.+/u.test(v["ref"]);
-  return true;
+    return typeof v["url"] === "string" && typeof v["ref"] === "string" && /^refs\/(?:heads|tags)\/./u.test(v["ref"]);
+  return v["ref"] === null || typeof v["ref"] === "string";
 }
 
 export function validSelection(value: unknown): value is string[] {
@@ -143,19 +140,22 @@ export function validSource(v: unknown): v is SourceRecord {
 
 export function validScan(value: unknown): value is ScanOutcome {
   if (!isRecord(value) || Object.keys(value).sort().join(",") !== "code,files,keys,overridden,tree,verdict,version") return false;
-  if (value["tree"] !== null && (typeof value["tree"] !== "string" || !/^[0-9a-f]{64}$/u.test(value["tree"]))) return false;
+  if (value["tree"] !== null && !isSha256(value["tree"])) return false;
   if (!(value["version"] === null || typeof value["version"] === "string") || typeof value["overridden"] !== "boolean") return false;
   const verdict = value["verdict"];
-  if (!(["clean", "warn", "critical", "failed"] as unknown[]).includes(verdict)) return false;
-  if (
-    (verdict === "clean" && value["code"] !== 0) ||
-    (verdict === "warn" && value["code"] !== 1) ||
-    (verdict === "critical" && value["code"] !== 2)
-  )
-    return false;
-  if (verdict === "failed" && value["code"] !== null && typeof value["code"] !== "number") return false;
+  if (verdict === "failed") {
+    if (value["code"] !== null && typeof value["code"] !== "number") return false;
+  } else {
+    if (!(["clean", "warn", "critical"] as unknown[]).includes(verdict)) return false;
+    if (
+      (verdict === "clean" && value["code"] !== 0) ||
+      (verdict === "warn" && value["code"] !== 1) ||
+      (verdict === "critical" && value["code"] !== 2)
+    )
+      return false;
+  }
   const relative = (s: unknown): s is string =>
-    typeof s === "string" && s !== "" && !path.isAbsolute(s) && !s.split(path.sep).some((p) => p === ".." || p === "");
+    typeof s === "string" && !path.isAbsolute(s) && !s.split(path.sep).some((p) => p === ".." || p === "");
   if (!Array.isArray(value["keys"]) || !Array.isArray(value["files"])) return false;
   for (const item of value["keys"]) {
     if (!Array.isArray(item) || item.length !== 2 || typeof item[0] !== "string" || !Number.isSafeInteger(item[1]) || item[1] < 1)
@@ -168,18 +168,14 @@ export function validScan(value: unknown): value is ScanOutcome {
         !relative(key[0]) ||
         typeof key[1] !== "string" ||
         !["warn", "critical"].includes(key[2]) ||
-        typeof key[3] !== "string" ||
-        !/^[0-9a-f]{64}$/u.test(key[3])
+        !isSha256(key[3])
       )
         return false;
     } catch {
       return false;
     }
   }
-  return value["files"].every(
-    (item: unknown) =>
-      Array.isArray(item) && item.length === 2 && relative(item[0]) && typeof item[1] === "string" && /^[0-9a-f]{64}$/u.test(item[1]),
-  );
+  return value["files"].every((item: unknown) => Array.isArray(item) && item.length === 2 && relative(item[0]) && isSha256(item[1]));
 }
 
 /** A missing file is an empty list. A malformed file is an error. */
