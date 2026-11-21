@@ -30,6 +30,47 @@ test("find with no hits says no match and suggests list --skills", () => {
   assert.match(formatFind([]), /^no match\n.*margrave list --skills/u);
 });
 
+test("find formats weak, exact, and mixed evidence with the correct load hint", () => {
+  const base = { id: "s/one", name: "one", description: "First", revision: "sha256:abc", score: 1 };
+  assert.equal(formatFind([{ ...base, recommended: false }]), "1. s/one  (score 1.000, weak match)\n   First\n   revision: sha256:abc");
+  assert.equal(
+    formatFind([{ ...base, recommended: true, exact: true, matchedTerms: { name: [], description: [], headings: [], body: [] } }]),
+    "1. s/one  (score 1.000)\n   First\n   revision: sha256:abc\n   exact name or id\nload: margrave load s/one",
+  );
+  assert.equal(
+    formatFind([{ ...base, matchedTerms: { name: ["alpha", "beta"], description: [], headings: ["gamma"], body: ["delta", "epsilon"] } }]),
+    "1. s/one  (score 1.000)\n   First\n   revision: sha256:abc\n   matches in name (alpha, beta), headings (gamma), body (delta, epsilon)\nload: margrave load s/one",
+  );
+  const sparse = new Array<typeof base>(2);
+  sparse[1] = base;
+  assert.equal(formatFind(sparse), "2. s/one  (score 1.000)\n   First\n   revision: sha256:abc");
+});
+
+test("load formats host paths and the complete frontmatter and body", () => {
+  const result: LoadResult = {
+    id: "s/one",
+    source: "s",
+    spec: "owner/repo",
+    commit: "abc",
+    base: "/local/base",
+    frontmatter: "name: one\ndescription: example",
+    files: ["SKILL.md"],
+    body: "# Body\ntext\n",
+  };
+  const hosted =
+    "skill: s/one\nsource: s\ncommit: abc\nfrontmatter:\n---\nname: one\ndescription: example\n---\nfiles:\n- SKILL.md\nbody:\n# Body\ntext\n";
+  const local =
+    "skill: s/one\nsource: s (owner/repo)\ncommit: abc\nbase: /local/base\nfrontmatter:\n---\nname: one\ndescription: example\n---\nfiles:\n- SKILL.md\nbody:\n# Body\ntext\n";
+  assert.equal(formatLoad(result), local);
+  assert.equal(formatLoad(result, { hostPaths: true }), local);
+  assert.equal(formatLoad(result, { hostPaths: false }), hosted);
+  const files = Array.from({ length: 200 }, (_, i) => `file${i}`);
+  assert.equal(
+    formatLoad({ ...result, files }),
+    `skill: s/one\nsource: s (owner/repo)\ncommit: abc\nbase: /local/base\nfrontmatter:\n---\nname: one\ndescription: example\n---\nfiles:\n${files.map((file) => `- ${file}`).join("\n")}\nbody:\n# Body\ntext\n`,
+  );
+});
+
 test("load cleans the header but never changes the body", () => {
   const body = "# Title\n\u001b[31mcolored\u001b[0m \u0007 bell\n";
   const r: LoadResult = {

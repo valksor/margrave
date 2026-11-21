@@ -1,14 +1,164 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import fsp, { mkdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import test, { mock } from "node:test";
-import { MargraveError } from "../src/store.ts";
-import { readSkillFileBytes } from "../src/skill-files.ts";
-import { listFiles, loadSkill, readSkillFile } from "../src/skills.ts";
-import type { IndexEntry } from "../src/store.ts";
+import { MargraveError, RequestError } from "../src/store.ts";
+import { HostedSizeError, readSkillFileBytes } from "../src/skill-files.ts";
+import { listFiles, loadSkill, readSelectedFile, readSelectedFileBytes, readSkillFile } from "../src/skills.ts";
+import type { IndexEntry, SourceRecord } from "../src/store.ts";
 import { link, mkfifo, releaseFifo, tmp, writeSkill } from "./helpers.ts";
+
+test("selected reads verify revision, manifest, bytes, and operational errors", async (t) => {
+  const root = await tmp();
+  const dir = path.join(root, "skill");
+  await mkdir(dir);
+  const content = "inside";
+  await writeFile(path.join(dir, "ref.md"), content);
+  await link(path.join(dir, "ref.md"), path.join(dir, "alias.md"));
+  const revision = `sha256:${"a".repeat(64)}`;
+  const digest = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+  const manifest = [
+    { path: "ref.md", size: content.length, digest },
+    { path: "alias.md", size: content.length, digest },
+    { path: "missing", size: 6, digest },
+    { path: "ref.md/child", size: 6, digest },
+  ];
+  const entry: IndexEntry = {
+    id: "s/skill",
+    name: "skill",
+    description: "test",
+    source: "s",
+    dir,
+    revision,
+    manifest: JSON.stringify(manifest),
+    frontmatter: "",
+  };
+  assert.equal(await readSelectedFile(entry, "ref.md"), content);
+  assert.equal(await readSelectedFile(entry, "ref.md", revision), content);
+  assert.deepEqual(await readSelectedFileBytes(entry, "alias.md", revision), Buffer.from(content));
+  await assert.rejects(readSelectedFileBytes(entry, "ref.md", "bad"), { name: "Error", message: "revision must be a SHA-256 digest" });
+  await assert.rejects(readSelectedFileBytes(entry, "ref.md", `sha256:${"b".repeat(64)}`), {
+    constructor: RequestError,
+    message: "skill revision changed; search again",
+  });
+  await assert.rejects(readSelectedFileBytes(entry, "unlisted", revision), {
+    constructor: RequestError,
+    message: "file is not in the selected skill revision",
+  });
+  await assert.rejects(readSelectedFileBytes(entry, "ref.md", revision, undefined, 5), {
+    constructor: HostedSizeError,
+    message: "skill file exceeds the hosted size limit",
+  });
+  const ordinary = "skill files changed since indexing; ask the store operator to run margrave reindex, then search again";
+  const cli = "installed Git files differ from the accepted revision. Restore a verified lock or a known-good backup";
+  const mcp = "skill files differ from the accepted revision. Ask the store operator to restore a verified copy";
+  const wrongSize = { ...entry, manifest: JSON.stringify([{ ...manifest[0], size: content.length + 1 }]) };
+  await assert.rejects(readSelectedFileBytes(wrongSize, "ref.md", revision), { constructor: RequestError, message: ordinary });
+  await writeFile(path.join(dir, "ref.md"), "outside".slice(0, content.length));
+  await assert.rejects(readSelectedFileBytes(entry, "ref.md", revision, "cli"), { constructor: RequestError, message: cli });
+  await assert.rejects(readSelectedFile(entry, "ref.md", revision, "mcp"), { constructor: RequestError, message: mcp });
+  for (const rel of ["missing", "ref.md/child"])
+    await assert.rejects(readSelectedFileBytes(entry, rel, revision), { constructor: RequestError, message: ordinary });
+  await assert.rejects(readSelectedFileBytes({ ...entry, dir: path.join(root, "gone") }, "ref.md", revision), {
+    constructor: RequestError,
+    message: ordinary,
+  });
+  const original = fsp.realpath;
+  const denied = Object.assign(new Error("injected denial"), { code: "EACCES" });
+  mock.method(fsp, "realpath", ((p: string, ...args: unknown[]) =>
+    p === dir ? Promise.reject(denied) : (original as (...a: unknown[]) => unknown)(p, ...args)) as typeof fsp.realpath);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  await assert.rejects(readSelectedFileBytes(entry, "ref.md", revision), (err) => err === denied);
+});
+
+test("load selects commits only from valid Git snapshot keys", async (t) => {
+  const root = await tmp();
+  const oldHome = process.env["MARGRAVE_HOME"];
+  process.env["MARGRAVE_HOME"] = root;
+  t.after(() => {
+    if (oldHome === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = oldHome;
+  });
+  const revision = `sha256:${"c".repeat(64)}`;
+  const content = "---\nname: example\ndescription: test\n---\n# Body\n";
+  const digest = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+  const manifest = [
+    { path: "z.md", size: 1, digest: `sha256:${createHash("sha256").update("z").digest("hex")}` },
+    { path: "SKILL.md", size: Buffer.byteLength(content), digest },
+  ];
+  const source: SourceRecord = { id: "s", kind: "git", spec: "owner/repo", subpath: "", ref: null, commit: "fallback", installedAt: "now" };
+  const other: SourceRecord = { ...source, id: "other", spec: "wrong", commit: "wrong" };
+  const a40 = "a".repeat(40);
+  const b64 = "b".repeat(64);
+  const suffix = "c".repeat(16);
+  const cases: [string, string][] = [
+    [`${a40}-${suffix}`, a40],
+    [`${b64}-${suffix}`, b64],
+    [`a-${suffix}`, "fallback"],
+    [`b-${suffix}`, "fallback"],
+    [`${"G".repeat(40)}-${suffix}`, "fallback"],
+    [`${"G".repeat(64)}-${suffix}`, "fallback"],
+    [`${a40}-c`, "fallback"],
+    [`${a40}-${"G".repeat(16)}`, "fallback"],
+    [`${a40}-${"c".repeat(15)}`, "fallback"],
+    [`x${a40}-${suffix}`, "fallback"],
+    [`${a40}-${suffix}x`, "fallback"],
+  ];
+  for (const [key, commit] of cases) {
+    const dir = path.join(root, "snapshots", "s", key, "nested", "skill");
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "SKILL.md"), content);
+    await writeFile(path.join(dir, "z.md"), "z");
+    const entry: IndexEntry = {
+      id: "s/example",
+      name: "example",
+      description: "test",
+      source: "s",
+      dir,
+      revision,
+      manifest: JSON.stringify(manifest),
+      frontmatter: "",
+    };
+    const expected = {
+      id: entry.id,
+      source: "s",
+      spec: "owner/repo",
+      commit,
+      base: dir,
+      frontmatter: "name: example\ndescription: test",
+      files: ["z.md", "SKILL.md"],
+      body: "# Body\n",
+    };
+    assert.deepEqual(await loadSkill(entry, [other, source], revision), expected, key);
+    if (commit === a40) {
+      assert.deepEqual(await loadSkill(entry, [], revision), { ...expected, spec: "", commit: null });
+      assert.deepEqual(await loadSkill(entry, [{ ...source, kind: "local", commit: null }], revision), { ...expected, commit: null });
+      assert.deepEqual(await loadSkill(entry, [source]), { ...expected, files: ["SKILL.md", "z.md"] });
+      const original = fsp.lstat;
+      const denied = Object.assign(new Error("injected lstat"), { code: "EACCES" });
+      mock.method(fsp, "lstat", ((p: string, ...args: unknown[]) =>
+        p === dir ? Promise.reject(denied) : (original as (...a: unknown[]) => unknown)(p, ...args)) as typeof fsp.lstat);
+      syncBuiltinESMExports();
+      try {
+        await assert.rejects(loadSkill(entry, [source]), {
+          constructor: MargraveError,
+          message: `skill directory ${dir} is gone; run: margrave reindex`,
+        });
+        assert.deepEqual(await loadSkill(entry, [source], revision), expected);
+      } finally {
+        mock.restoreAll();
+        syncBuiltinESMExports();
+      }
+    }
+  }
+});
 
 test("--file refuses ../, an absolute path, and a symlink out of the dir", async () => {
   const root = await tmp();

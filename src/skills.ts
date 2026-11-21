@@ -60,8 +60,8 @@ export function resolveSkill(
   const byName = (db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE name = ?`).all(input) as IndexEntry[]).filter(
     (entry) => allowedSources === undefined || allowedSources.has(entry.source),
   );
-  if (byName.length === 1 && byName[0] !== undefined) return resolveDirectory(db, byName[0], mcp);
-  if (byName.length > 1) {
+  if (byName.length === 1) return resolveDirectory(db, byName[0]!, mcp);
+  if (byName.length !== 0) {
     const ids = byName
       .map((s) => `  ${clean(s.id)}`)
       .sort()
@@ -84,10 +84,10 @@ function resolveDirectory(db: DatabaseSync, entry: IndexEntry, mcp: boolean): In
   if (rel === ".." || rel.startsWith(`..${path.sep}`)) throw new MargraveError(`invalid snapshot path for source "${id}"`);
   try {
     const realRoot = path.join(realpathSync(home()), "snapshots", id, source.snapshot as string);
-    if (realpathSync(root) !== realRoot || realpathSync(dir) !== path.join(realRoot, rel)) throw new Error("snapshot path differs");
+    if (realpathSync(root) !== realRoot || realpathSync(dir) !== path.join(realRoot, rel)) throw new Error();
   } catch (err) {
-    if (["ENOENT", "ENOTDIR"].includes((err as NodeJS.ErrnoException).code ?? ""))
-      throw new RequestError(gitDriftMessage(mcp ? "mcp" : "cli"));
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") throw new RequestError(gitDriftMessage(mcp));
     throw new MargraveError(`invalid snapshot path for source "${id}"`);
   }
   return { ...entry, dir };
@@ -120,7 +120,7 @@ FROM cand c JOIN skills k ON k.rowid = c.rowid
 WHERE (? IS NULL OR k.source IN (SELECT value FROM json_each(?)))`;
 
 function rankEvidence(
-  ranked: (FindHit & { recommended: boolean; exact: boolean; matchedTerms: MatchedTerms })[],
+  ranked: (FindHit & { exact: boolean; matchedTerms: MatchedTerms })[],
   terms: string[],
   limit: unknown,
   explain: boolean,
@@ -146,17 +146,19 @@ export function findSkills(db: DatabaseSync, task: string, limit: unknown, expla
   const q = task.trim().toLowerCase();
   const exact = [q, q, q, q, q, q];
   const scopeJson = scope === undefined ? null : JSON.stringify([...scope]);
-  type Row = {
-    rowid: number;
-    id: string | null;
-    name: string | null;
-    description: string | null;
-    revision: string | null;
-    score: number;
-    exact: number;
-    col: Field | null;
-    term: string | null;
-  };
+  type Row =
+    | {
+        rowid: number;
+        id: string;
+        name: string;
+        description: string;
+        revision: string;
+        score: number;
+        exact: number;
+        col: null;
+        term: null;
+      }
+    | { rowid: number; id: null; name: null; description: null; revision: null; score: number; exact: number; col: Field; term: string };
   let rows: Row[];
   if (terms.length === 0) {
     rows = db
@@ -173,23 +175,21 @@ export function findSkills(db: DatabaseSync, task: string, limit: unknown, expla
       ORDER BY kind, exact DESC, score DESC, id, col, term`;
     rows = db.prepare(sql).all(terms.map((t) => `"${t}"`).join(" OR "), ...exact, scopeJson, scopeJson, ...terms) as Row[];
   }
-  const hits = new Map<number, FindHit & { recommended: boolean; exact: boolean; matchedTerms: MatchedTerms }>();
+  const hits = new Map<number, FindHit & { exact: boolean; matchedTerms: MatchedTerms }>();
   for (const row of rows) {
-    let hit = hits.get(row.rowid);
-    if (hit === undefined && row.id !== null && row.name !== null && row.description !== null && row.revision !== null) {
-      hit = {
+    if (row.id !== null) {
+      hits.set(row.rowid, {
         id: row.id,
         name: row.name,
         description: row.description,
         revision: row.revision,
         score: row.score,
-        recommended: false,
         exact: Boolean(row.exact),
         matchedTerms: { name: [], description: [], headings: [], body: [] },
-      };
-      hits.set(row.rowid, hit);
+      });
+    } else {
+      hits.get(row.rowid)?.matchedTerms[row.col].push(row.term);
     }
-    if (hit !== undefined && row.col !== null && row.term !== null) hit.matchedTerms[row.col].push(row.term);
   }
   return rankEvidence([...hits.values()], terms, limit, explain);
 }
@@ -237,10 +237,10 @@ export interface LoadResult {
   body: string;
 }
 
-function gitDriftMessage(surface: "cli" | "mcp"): string {
-  return surface === "cli"
-    ? "installed Git files differ from the accepted revision. Restore a verified lock or a known-good backup"
-    : "skill files differ from the accepted revision. Ask the store operator to restore a verified copy";
+function gitDriftMessage(mcp: boolean): string {
+  return mcp
+    ? "skill files differ from the accepted revision. Ask the store operator to restore a verified copy"
+    : "installed Git files differ from the accepted revision. Restore a verified lock or a known-good backup";
 }
 
 export async function readSelectedFileBytes(
@@ -262,10 +262,8 @@ export async function readSelectedFileBytes(
     const code = (err as NodeJS.ErrnoException).code;
     if (!(err instanceof RequestError) && code !== "ENOENT" && code !== "ENOTDIR") throw err;
   }
-  const mismatch =
-    bytes === undefined || bytes.length !== item.size || `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== item.digest;
-  if (mismatch || bytes === undefined) {
-    if (gitDrift !== undefined) throw new RequestError(gitDriftMessage(gitDrift));
+  if (bytes === undefined || bytes.length !== item.size || `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== item.digest) {
+    if (gitDrift !== undefined) throw new RequestError(gitDriftMessage(gitDrift !== "cli"));
     throw new RequestError("skill files changed since indexing; ask the store operator to run margrave reindex, then search again");
   }
   return bytes;
@@ -289,8 +287,13 @@ export async function loadSkill(
   gitDrift?: "cli" | "mcp",
   limit?: number,
 ): Promise<LoadResult> {
-  const st = revision === undefined ? await lstat(entry.dir).catch(() => null) : true;
-  if (st === null) throw new MargraveError(`skill directory ${clean(entry.dir)} is gone; run: margrave reindex`);
+  if (revision === undefined) {
+    try {
+      await lstat(entry.dir);
+    } catch {
+      throw new MargraveError(`skill directory ${clean(entry.dir)} is gone; run: margrave reindex`);
+    }
+  }
   const text = await readSelectedFile(entry, "SKILL.md", revision, gitDrift, limit);
   const { rawFrontmatter, body } = splitSkillMd(text);
   const src = sources.find((s) => s.id === entry.source);

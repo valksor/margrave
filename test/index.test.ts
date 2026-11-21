@@ -18,13 +18,22 @@ import {
   writeIndexRows,
 } from "./helpers.ts";
 import assert from "node:assert/strict";
-import fsp, { realpath, rm, writeFile } from "node:fs/promises";
+import fs from "node:fs";
+import fsp, { mkdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { MAX_QUERY_TERMS } from "../src/bm25.ts";
-import { findSkills, formatFind, readSelectedFile, resolveSkill } from "../src/skills.ts";
+import {
+  findSkills,
+  formatFind,
+  loadContext,
+  NO_SOURCES_MESSAGE,
+  readSelectedFile,
+  resolveSkill,
+  validateRevision,
+} from "../src/skills.ts";
 import { installSource, localId, updateSources } from "../src/sources.ts";
 import { insertSkills, openIndexRead } from "../src/store.ts";
 import type { NewEntry } from "../src/store.ts";
@@ -53,6 +62,216 @@ async function ranked(entries: NewEntry[], task: string, limit?: number, explain
 }
 
 const ids = (hits: { id: string }[]): string[] => hits.map((h) => h.id);
+
+test("context opens populated catalogs and closes empty and malformed catalogs", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  assert.equal(NO_SOURCES_MESSAGE, "no skill sources installed; run: margrave install <owner/repo|path>");
+  assert.equal(await loadContext(), null);
+  await seedIndex([]);
+  const close = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "close")!.value as DatabaseSync["close"];
+  const spy = mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    return close.call(this);
+  });
+  try {
+    assert.equal(await loadContext(), null);
+    assert.equal(spy.mock.callCount(), 1);
+  } finally {
+    spy.mock.restore();
+  }
+  await rm(path.join(home, "index.db"));
+  await seedIndex([newEntry("s", "one")]);
+  const context = await loadContext();
+  assert.ok(context);
+  try {
+    assert.equal(context.sources[0]?.id, "s");
+    assert.equal(resolveSkill(context.db, "s/one").id, "s/one");
+  } finally {
+    context.db.close();
+  }
+  writeIndexRows(home, (db) => db.prepare("UPDATE sources SET record = ?").run("{}"));
+  const malformedClose = mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    return close.call(this);
+  });
+  try {
+    await assert.rejects(loadContext(), { message: "cannot upgrade the v0.2.1 catalog: malformed source records" });
+    assert.equal(malformedClose.mock.callCount(), 1);
+  } finally {
+    malformedClose.mock.restore();
+  }
+});
+
+test("revision validation requires a lowercase SHA-256 digest", () => {
+  validateRevision(undefined);
+  validateRevision(`sha256:${"a".repeat(64)}`);
+  for (const revision of [
+    `SHA256:${"a".repeat(64)}`,
+    `sha256:${"g".repeat(64)}`,
+    `sha256:${"A".repeat(64)}`,
+    `sha256:${"a".repeat(63)}`,
+    `xsha256:${"a".repeat(64)}`,
+    `sha256:${"a".repeat(64)}x`,
+  ]) {
+    assert.throws(() => validateRevision(revision), { message: "revision must be a SHA-256 digest" });
+  }
+});
+
+test("Git snapshot resolution checks lexical and canonical paths and reports drift", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  const commit = "a".repeat(40);
+  const snapshot = `${commit}-${"b".repeat(16)}`;
+  const root = path.join(home, "snapshots", "git", snapshot);
+  await mkdir(path.join(root, "child..name"), { recursive: true });
+  await mkdir(path.join(root, "target"));
+  await writeFile(path.join(root, "file"), "file");
+  await symlink("target", path.join(root, "link"));
+  const dirs = [".", "child..name", "missing", "file/child", "/absolute", "..", "../escape", "link", path.join(root, "child..name")];
+  await seedIndex(
+    [...dirs.map((dir, i) => ({ ...newEntry("git", `item${i}`), dir })), newEntry("absent", "orphan")],
+    [
+      {
+        id: "local",
+        kind: "local",
+        spec: "/x/local",
+        path: "/x/local",
+        subpath: "",
+        ref: null,
+        commit: null,
+        installedAt: "2026-01-01T00:00:00.000Z",
+      },
+      {
+        id: "git",
+        kind: "git",
+        spec: "owner/repo",
+        url: "https://example.com/owner/repo.git",
+        subpath: "",
+        ref: "refs/heads/main",
+        commit,
+        snapshot,
+        installedAt: "2026-01-01T00:00:00.000Z",
+      },
+    ],
+  );
+  const db = await openIndexRead();
+  const invalid = 'invalid snapshot path for source "git"';
+  const cli = "installed Git files differ from the accepted revision. Restore a verified lock or a known-good backup";
+  const mcp = "skill files differ from the accepted revision. Ask the store operator to restore a verified copy";
+  try {
+    assert.equal(resolveSkill(db, "git/item0").dir, root);
+    assert.equal(resolveSkill(db, "git/item1").dir, path.join(root, "child..name"));
+    for (const i of [2, 3]) {
+      assert.throws(() => resolveSkill(db, `git/item${i}`), { message: cli });
+      assert.throws(() => resolveSkill(db, `git/item${i}`, undefined, undefined, true), { message: mcp });
+    }
+    for (const i of [4, 5, 6, 7, 8]) assert.throws(() => resolveSkill(db, `git/item${i}`), { message: invalid });
+    assert.throws(() => resolveSkill(db, "absent/orphan"), { message: 'invalid snapshot path for source "absent"' });
+    await rename(root, `${root}-actual`);
+    assert.throws(() => resolveSkill(db, "git/item0"), { message: cli });
+    await symlink(path.basename(`${root}-actual`), root);
+    assert.throws(() => resolveSkill(db, "git/item0"), { message: invalid });
+    await rm(root);
+    await rename(`${root}-actual`, root);
+    const actualRealpath = fs.realpathSync;
+    const child = path.join(root, "child..name");
+    const canonicalRoot = actualRealpath(root);
+    const canonicalChild = actualRealpath(child);
+    const alternate = mock.method(fs, "realpathSync", ((p: fs.PathLike, ...args: unknown[]) => {
+      if (p === root) return `${canonicalRoot}-alternate`;
+      if (p === child) return canonicalChild;
+      return Reflect.apply(actualRealpath, fs, [p, ...args]);
+    }) as typeof fs.realpathSync);
+    syncBuiltinESMExports();
+    try {
+      assert.throws(() => resolveSkill(db, "git/item1"), { message: invalid });
+    } finally {
+      alternate.mock.restore();
+      syncBuiltinESMExports();
+    }
+    const injected = mock.method(fs, "realpathSync", ((p: fs.PathLike, ...args: unknown[]) => {
+      if (p === root) throw Object.assign(new Error("synthetic failure"), { code: "EACCES" });
+      return Reflect.apply(actualRealpath, fs, [p, ...args]);
+    }) as typeof fs.realpathSync);
+    syncBuiltinESMExports();
+    try {
+      assert.throws(() => resolveSkill(db, "git/item0"), { message: invalid });
+    } finally {
+      injected.mock.restore();
+      syncBuiltinESMExports();
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test("recommendation evidence and SQL scope use only visible hits", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  await seedIndex([
+    newEntry("a", "one", "solitary comet"),
+    newEntry("a", "two", "shared nebula"),
+    newEntry("a", "three", "shared nebula"),
+    newEntry("a", "four", "orbit", "planet"),
+    newEntry("a", "other", "unrelated", "comet orbit"),
+    newEntry("a", "extra", "unrelated", "comet"),
+    newEntry("b", "comet", "shared nebula", "orbit planet"),
+  ]);
+  const db = await openIndexRead();
+  try {
+    const scope = new Set(["a"]);
+    const one = findSkills(db, "comet", 10, true, scope);
+    assert.deepEqual(
+      [one[0]?.id, one[0]?.recommended, one[0]?.matchedTerms],
+      ["a/one", true, { name: [], description: ["comet"], headings: [], body: [] }],
+    );
+    assert.deepEqual(
+      Object.fromEntries(one.slice(1).map((h) => [h.id, [h.recommended, h.matchedTerms]])),
+      Object.fromEntries(["a/extra", "a/other"].map((id) => [id, [false, { name: [], description: [], headings: [], body: ["comet"] }]])),
+    );
+    const two = findSkills(db, "nebula", 10, true, scope);
+    assert.deepEqual(
+      Object.fromEntries(two.map((h) => [h.id, [h.recommended, h.matchedTerms]])),
+      Object.fromEntries(["a/three", "a/two"].map((id) => [id, [false, { name: [], description: ["nebula"], headings: [], body: [] }]])),
+    );
+    const multi = findSkills(db, "orbit planet", 10, true, scope);
+    assert.deepEqual(
+      multi.map((h) => [h.id, h.recommended, h.matchedTerms]),
+      [
+        ["a/four", true, { name: [], description: ["orbit"], headings: [], body: ["planet"] }],
+        ["a/other", false, { name: [], description: [], headings: [], body: ["orbit"] }],
+      ],
+    );
+    const partial = findSkills(db, "orbit unknown", 10, true, scope);
+    assert.deepEqual(Object.fromEntries(partial.map((h) => [h.id, [h.recommended, h.matchedTerms]])), {
+      "a/four": [false, { name: [], description: ["orbit"], headings: [], body: [] }],
+      "a/other": [false, { name: [], description: [], headings: [], body: ["orbit"] }],
+    });
+    assert.deepEqual(findSkills(db, "comet", 10, true, new Set()), []);
+    assert.deepEqual(ids(findSkills(db, "comet", 1, true, scope)), ["a/one"]);
+    assert.deepEqual(ids(findSkills(db, "orbit planet", 1, true, scope)), ["a/four"]);
+  } finally {
+    db.close();
+  }
+});
+
+test("resolution respects source scope and revision diagnostics", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  await seedIndex([newEntry("z", "shared"), newEntry("a", "shared")]);
+  const db = await openIndexRead();
+  try {
+    assert.equal(resolveSkill(db, "z/shared").id, "z/shared");
+    assert.equal(resolveSkill(db, "shared", undefined, new Set(["a"])).id, "a/shared");
+    const missing = 'no skill "z/shared"; run: margrave find "<task>" or margrave list --skills';
+    assert.throws(() => resolveSkill(db, "z/shared", undefined, new Set(["a"])), { message: missing });
+    assert.throws(() => resolveSkill(db, "shared", undefined, new Set()), {
+      message: 'no skill "shared"; run: margrave find "<task>" or margrave list --skills',
+    });
+    assert.throws(() => resolveSkill(db, "shared"), { message: '"shared" is ambiguous; use one of these ids:\n  a/shared\n  z/shared' });
+    assert.throws(() => resolveSkill(db, "missing", `sha256:${"a".repeat(64)}`), { message: "skill revision changed; search again" });
+    assert.throws(() => resolveSkill(db, "missing", "bad"), { message: "revision must be a SHA-256 digest" });
+  } finally {
+    db.close();
+  }
+});
 
 // ---- ranking ----
 
