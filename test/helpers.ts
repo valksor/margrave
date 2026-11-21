@@ -23,6 +23,11 @@ export const CLI = path.join(ROOT, "src", "cli.ts");
 // No vendored ripwire for these tests: a developer's real vendor/ripwire must not change what they check.
 export const NO_VENDORED_PRELOAD = path.join(ROOT, "test", "no-vendored-ripwire.ts");
 
+export function stdioTestEnv(env: Record<string, string>): Record<string, string> {
+  const mutant = process.env["__STRYKER_ACTIVE_MUTANT__"];
+  return mutant === undefined ? env : { ...env, __STRYKER_ACTIVE_MUTANT__: mutant };
+}
+
 const execFileAsync = promisify(execFile);
 
 /** Make a FIFO (named pipe) at `file`. Node has no mkfifo API. */

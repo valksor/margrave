@@ -25,6 +25,7 @@ import {
   call,
   connectHosted,
   hostedUseHome,
+  stdioTestEnv,
 } from "./helpers.ts";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
@@ -573,7 +574,7 @@ test("released v0.2.1 store remains usable after upgrade", async (t) => {
     new StdioClientTransport({
       command: process.execPath,
       args: [CLI, "mcp"],
-      env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home },
+      env: stdioTestEnv({ PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home }),
     }),
   );
   const hosted = await connectHosted(t);

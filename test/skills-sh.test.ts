@@ -7,7 +7,7 @@ import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/cli
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { formatSuggestions, searchSkills } from "../src/search.ts";
 import { handleHostedMcp } from "../src/hosted.ts";
-import { CLI, newEntry, runCli, seedIndex, tmp, writeCatalogRecords } from "./helpers.ts";
+import { CLI, newEntry, runCli, seedIndex, stdioTestEnv, tmp, writeCatalogRecords } from "./helpers.ts";
 
 test("catalog fallback uses visible sources and validates responses", async (t) => {
   const home = await tmp("mg-catalog-");
@@ -423,7 +423,7 @@ test("CLI, stdio and hosted opt in through trusted configuration", async (t) => 
     new StdioClientTransport({
       command: process.execPath,
       args: ["--import", preload, CLI, "mcp"],
-      env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home, ...extra },
+      env: stdioTestEnv({ PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home, ...extra }),
     }),
   );
   try {

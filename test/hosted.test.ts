@@ -10,6 +10,7 @@ import {
   makeRepo,
   runCli,
   skillMd,
+  stdioTestEnv,
   tmp,
   writeSkill,
 } from "./helpers.ts";
@@ -71,7 +72,7 @@ test("a moved Git store loads from its new path through CLI and MCP", async (t) 
     new StdioClientTransport({
       command: process.execPath,
       args: [CLI, "mcp"],
-      env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: moved },
+      env: stdioTestEnv({ PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: moved }),
     }),
   );
   const hosted = await connectHosted(t);

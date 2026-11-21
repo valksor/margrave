@@ -8,7 +8,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { BODY_TOKEN_LIMIT, FIELD_WEIGHTS, NAME_BONUS, buildFieldTokens, queryTerms } from "../src/bm25.ts";
 import { findSkills } from "../src/skills.ts";
 import { insertSkills, temporaryCatalog } from "../src/store.ts";
-import { CLI, fakeRipwire, runCli, tmp, writeSkill } from "./helpers.ts";
+import { CLI, fakeRipwire, runCli, stdioTestEnv, tmp, writeSkill } from "./helpers.ts";
 
 test("frozen search benchmark", async (t) => {
   const home = await tmp("mg-benchmark-");
@@ -279,7 +279,7 @@ test("search relevance and CLI/MCP parity on an installed corpus", async (t) => 
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [CLI, "mcp"],
-      env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home },
+      env: stdioTestEnv({ PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home }),
     });
     await client.connect(transport);
     try {

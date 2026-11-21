@@ -11,7 +11,7 @@ import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/cli
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { SUPPORTED_PROTOCOL_VERSIONS, createMcpHandler } from "@modelcontextprotocol/server";
 import { FIND_DESCRIPTION, LOAD_DESCRIPTION, READ_DESCRIPTION, SERVER_INSTRUCTIONS, createServer } from "../src/mcp.ts";
-import { CLI, fakeRipwire, newEntry, runCli, seedIndex, tmp, writeSkill } from "./helpers.ts";
+import { CLI, fakeRipwire, newEntry, runCli, seedIndex, stdioTestEnv, tmp, writeSkill } from "./helpers.ts";
 
 interface ToolText {
   isError: boolean;
@@ -29,7 +29,7 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [CLI, "mcp"],
-    env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home },
+    env: stdioTestEnv({ PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home }),
   });
   const client = new Client({ name: "margrave-test", version: "0.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
   await client.connect(transport);
@@ -309,7 +309,7 @@ test("stdio source allowlists scope search and both reads", async (t) => {
     const env: Record<string, string> = { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home };
     if (scope !== undefined) env["MARGRAVE_ALLOWED_SOURCES"] = scope;
     const client = new Client({ name: "scope-test", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
-    await client.connect(new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp"], env }));
+    await client.connect(new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp"], env: stdioTestEnv(env) }));
     t.after(() => client.close());
     const found = await call(client, "find_skills", { task: "terraform modules", limit: 1, explain: true });
     if (scope === "") assert.match(found.text, /no match/u);
@@ -456,7 +456,7 @@ test("Skills extension serves verified scoped pages over stdio", async (t) => {
     new StdioClientTransport({
       command: process.execPath,
       args: [CLI, "mcp"],
-      env: { PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home, MARGRAVE_ALLOWED_SOURCES: source },
+      env: stdioTestEnv({ PATH: process.env["PATH"] ?? "", MARGRAVE_HOME: home, MARGRAVE_ALLOWED_SOURCES: source }),
     }),
   );
   t.after(() => client.close());
