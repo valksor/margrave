@@ -295,12 +295,13 @@ test("the --version time limit is 10 seconds by default", () => {
 test("a --version that hangs is killed at the time limit and refused", async () => {
   const slow = await standIn("from-path");
   // exec, so the SIGKILL at the time limit reaches the sleeping process itself.
-  await writeFile(slow, `#!/bin/sh\necho "$*" >> "$0.calls"\nexec /bin/sleep 1\n`);
+  await writeFile(slow, '#!/bin/sh\n[ "$*" = "--version" ] || exit 2\nexec /bin/sleep 1\n');
   const started = Date.now();
   const r = await withPath(path.dirname(slow), () => runRipwire("/nonexistent", NO_VENDOR, 200));
   assert.ok(Date.now() - started < 10_000);
   assert.ok(r.refusal?.startsWith("ripwire on PATH could not report its version (timed out); run: node ") === true, String(r.refusal));
-  assert.deepEqual(await calls(slow), ["--version"]);
+  assert.equal(r.code, null);
+  assert.equal(r.missing, false);
 });
 
 test("a ripwire on PATH at the pinned version or newer is accepted and runs the scan", async () => {
