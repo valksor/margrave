@@ -10,6 +10,7 @@ if (process.argv.length > 2) {
     scan: ["test/scan.test.ts"],
     "skill-files": ["test/guard.test.ts"],
     "safety-runner": ["test/safety-runner.test.ts", "test/no-vendored-ripwire.test.ts"],
+    safety: ["test/safety.test.ts"],
   };
 
   for (const [target, tests] of Object.entries(targets)) {
