@@ -28,16 +28,28 @@ test("frontmatter with a missing field is skipped, with a warning", async () => 
   assert.match(r.warnings.join("\n"), /missing description/u);
   assert.match(r.warnings.join("\n"), /missing name/u);
   assert.match(r.warnings.join("\n"), /no frontmatter/u);
+  const invalid = parseSkillMd("---\nname: [unclosed\ndescription: x\n---\n");
+  assert.equal(invalid.ok, false);
+  if (!invalid.ok) assert.match(invalid.reason, /^frontmatter is not valid YAML \(.{2,}\)$/u);
 });
 
 test("a skill carries the four token strings, with headings in their own column, and no frontmatter or headings list", () => {
-  const p = parseSkillMd("---\nname: xy-tool\ndescription: Tunes things\nallowed-tools: Bash(git:*), Read\n---\n# Title here\nbody text\n");
+  const p = parseSkillMd(
+    "---\nname: ' xy-tool '\ndescription: ' Tunes things '\nallowed-tools: Bash(git:*), Read\n---\n# Title here\nbody text\n",
+  );
   assert.equal(p.ok, true);
   if (p.ok) {
+    assert.equal(p.skill.name, "xy-tool");
+    assert.equal(p.skill.description, "Tunes things");
     assert.deepEqual(p.skill.tokens, { name: "xy tool", description: "tune thing", headings: "titl here", body: "titl here bodi text" });
     assert.equal("frontmatter" in p.skill, false);
     assert.equal("headings" in p.skill, false);
   }
+});
+
+test("quoted whitespace-only skill fields are missing", () => {
+  assert.deepEqual(parseSkillMd("---\nname: '  '\ndescription: valid\n---\n"), { ok: false, reason: "missing name" });
+  assert.deepEqual(parseSkillMd("---\nname: valid\ndescription: '  '\n---\n"), { ok: false, reason: "missing description" });
 });
 
 test("skill fields retain normalized Unicode tokens", () => {
@@ -53,9 +65,30 @@ test("splitSkillMd handles CRLF and a BOM, and returns the body unchanged", () =
   assert.equal(s.body, "body \u001b[31mred\u001b[0m\r\n");
 });
 
+test("splitSkillMd retains bodies without valid frontmatter delimiters", () => {
+  for (const body of [
+    "paragraph\uFEFF\n---\nname: x\n---\nbody",
+    "paragraph\n---\n---\nbody",
+    "---junk\nname: x\n---\nbody",
+    "---\nname: x\n---junk",
+    "---junk\n---",
+  ]) {
+    assert.deepEqual(splitSkillMd(body), { rawFrontmatter: null, body });
+  }
+});
+
+test("splitSkillMd accepts whitespace on delimiters at EOF", () => {
+  assert.deepEqual(splitSkillMd("--- \t\nname: x\n--- \t"), { rawFrontmatter: "name: x", body: "" });
+  assert.deepEqual(splitSkillMd("--- \t\n--- \t"), { rawFrontmatter: "", body: "" });
+});
+
 test("headings skip fenced code blocks", () => {
   const body = "# One\ntext\n```sh\n# not a heading\n```\n## Two ##\n";
   assert.deepEqual(extractHeadings(body), ["One", "Two"]);
+});
+
+test("headings require a heading marker at up to three spaces of indentation", () => {
+  assert.deepEqual(extractHeadings("text # inline\n   ##   Indented heading ###\n    # too deep"), ["Indented heading"]);
 });
 
 for (const marker of ["`", "~"]) {
@@ -140,27 +173,62 @@ test("local rules: directory symlinks are followed", async () => {
   assert.deepEqual(r.skills.map((s) => s.name).sort(), ["linked-skill", "plain"]);
 });
 
-test("local rules: a symlink cycle terminates", async () => {
+test("local rules: a symlink cycle terminates", async (t) => {
   const root = await tmp("mg-cycle-");
   await writeSkill(path.join(root, "a"), "inner", "x");
   await link(root, path.join(root, "a", "back-to-root"));
   await link(path.join(root, "a"), path.join(root, "b"));
-  const r = await scanSource(root, { followSymlinks: true });
+  const real = fsp.realpath;
+  let observations = 0;
+  mock.method(fsp, "realpath", ((p: string, ...args: unknown[]) => {
+    if ((p === root || p.startsWith(root + path.sep)) && ++observations > 20) throw new Error("cycle observation budget exceeded");
+    return (real as (...a: unknown[]) => unknown)(p, ...args);
+  }) as typeof fsp.realpath);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  const r = await scanSource(root, { followSymlinks: true, strict: true });
   assert.deepEqual(
     r.skills.map((s) => s.name),
     ["inner"],
   );
+  assert.deepEqual(r.warnings, []);
+  assert.deepEqual(r.duplicates, []);
 });
 
-test("a duplicate name inside one source keeps the first and warns", async () => {
+test("a duplicate name inside one source keeps the first and warns", async (t) => {
   const root = await tmp();
   await mkdir(path.join(root, "a"), { recursive: true });
   await mkdir(path.join(root, "b"), { recursive: true });
-  await writeFile(path.join(root, "a", "SKILL.md"), skillMd("same", "first"));
-  await writeFile(path.join(root, "b", "SKILL.md"), skillMd("same", "second"));
+  await writeFile(path.join(root, "a", "SKILL.md"), skillMd("z-name", "first"));
+  await writeFile(path.join(root, "b", "SKILL.md"), skillMd("z-name", "second"));
+  await mkdir(path.join(root, "c"));
+  await mkdir(path.join(root, "d"));
+  await writeFile(path.join(root, "c", "SKILL.md"), skillMd("a-name", "first"));
+  await writeFile(path.join(root, "d", "SKILL.md"), skillMd("a-name", "second"));
+  const real = fsp.readdir;
+  mock.method(fsp, "readdir", (async (p: string, ...args: unknown[]) => {
+    const entries = await (real as (...a: unknown[]) => Promise<{ name: string }[]>)(p, ...args);
+    return p === root ? entries.sort((a, b) => (a.name < b.name ? 1 : -1)) : entries;
+  }) as typeof fsp.readdir);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
   const r = await scanSource(root, { followSymlinks: false });
-  assert.equal(r.skills.length, 1);
-  assert.equal(r.skills[0]?.description, "first");
+  assert.deepEqual(
+    r.skills.map((s) => [s.name, s.description]),
+    [
+      ["a-name", "first"],
+      ["z-name", "first"],
+    ],
+  );
+  assert.deepEqual(r.duplicates, ["a-name", "z-name"]);
+  assert.match(r.warnings[0] ?? "", /duplicate skill name "z-name"/u);
+  assert.match(r.warnings[1] ?? "", /duplicate skill name "a-name"/u);
   assert.match(r.warnings.join("\n"), /duplicate skill name/u);
 });
 
@@ -251,7 +319,7 @@ test("a dangling symlink is ignored, for git rules and for local rules", async (
 test("a directory that vanishes between the listing and the walk is skipped", async (t) => {
   const root = await tmp();
   await writeSkill(root, "good", "a good skill");
-  await mkdir(path.join(root, "ghost"));
+  await writeSkill(path.join(root, "ghost"), "hidden", "unread");
   const real = fsp.realpath;
   mock.method(fsp, "realpath", (p: string, ...rest: never[]) =>
     p.endsWith("ghost") ? Promise.reject(new Error("ENOENT: vanished")) : (real as (...a: unknown[]) => Promise<string>)(p, ...rest),
@@ -267,6 +335,29 @@ test("a directory that vanishes between the listing and the walk is skipped", as
     ["good"],
   );
   assert.deepEqual(r.warnings, []);
+});
+
+test("strict scans ignore ordinary files at the source root", async (t) => {
+  const root = await tmp();
+  await writeSkill(root, "good", "a good skill");
+  const file = path.join(root, "ordinary.txt");
+  await writeFile(file, "ordinary");
+  const real = fsp.stat;
+  mock.method(fsp, "stat", ((p: string, ...args: unknown[]) => {
+    if (p === file) throw new Error("ordinary file was inspected");
+    return (real as (...a: unknown[]) => unknown)(p, ...args);
+  }) as typeof fsp.stat);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  const result = await scanSource(root, { followSymlinks: false, strict: true });
+  assert.deepEqual(
+    result.skills.map((s) => s.name),
+    ["good"],
+  );
+  assert.deepEqual(result.warnings, []);
 });
 
 test("the result is sorted by skill name, whatever order the directories and the filesystem list them in", async (t) => {
@@ -304,8 +395,8 @@ test("splitSkillMd reads an empty frontmatter block", () => {
   assert.deepEqual(splitSkillMd("---\n---\nbody\n"), { rawFrontmatter: "", body: "body\n" });
 });
 
-test("manifests fingerprint sorted paths and binary bytes", async () => {
-  const root = await tmp();
+test("manifests fingerprint sorted paths and binary bytes", async (t) => {
+  const root = await fsp.realpath(await tmp());
   const dir = await writeSkill(root, "asset", "asset skill");
   const scan = async () => (await scanSource(root, { followSymlinks: false, strict: true })).skills[0]!;
   const before = await scan();
@@ -315,13 +406,34 @@ test("manifests fingerprint sorted paths and binary bytes", async () => {
   await link(path.join(dir, "SKILL.md"), path.join(dir, "alias.md"));
   await writeFile(path.join(dir, "references", "z.bin"), Buffer.from([0, 255, 1]));
   await writeFile(path.join(dir, "references", "a.bin"), Buffer.from([1, 2]));
+  const realOpen = fsp.open;
+  let skillOpens = 0;
+  mock.method(fsp, "open", ((p: string, ...args: unknown[]) => {
+    if (p === path.join(dir, "SKILL.md")) skillOpens++;
+    return (realOpen as (...a: unknown[]) => unknown)(p, ...args);
+  }) as typeof fsp.open);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
   const first = await scan();
+  assert.equal(skillOpens, 1);
+  mock.restoreAll();
+  syncBuiltinESMExports();
   assert.notEqual(first.revision, before.revision);
   assert.deepEqual(
     first.manifest.map((e) => e.path),
     ["SKILL.md", "references/a.bin", "references/z.bin"],
   );
   assert.equal(first.manifest[2]?.size, 3);
+  const tuples = [
+    ["SKILL.md", Buffer.from(skillMd("asset", "asset skill"))],
+    ["references/a.bin", Buffer.from([1, 2])],
+    ["references/z.bin", Buffer.from([0, 255, 1])],
+  ] as const;
+  const expected = tuples.map(([name, bytes]) => [name, `sha256:${createHash("sha256").update(bytes).digest("hex")}`, bytes.length]);
+  assert.equal(first.revision, `sha256:${createHash("sha256").update(JSON.stringify(expected)).digest("hex")}`);
   assert.match(first.manifest[2]?.digest ?? "", /^sha256:[0-9a-f]{64}$/u);
   assert.equal(
     first.manifest[2]?.digest,
@@ -348,6 +460,61 @@ test("manifests fingerprint sorted paths and binary bytes", async () => {
     ["SKILL.md", "references/b.bin"],
   );
   assert.notEqual(removed.revision, renamed.revision);
+});
+
+test("manifest listing errors propagate or skip the skill", async (t) => {
+  const root = await fsp.realpath(await tmp());
+  const dir = await writeSkill(root, "good", "skill");
+  const references = path.join(dir, "references");
+  await mkdir(references);
+  const denied = Object.assign(new Error("nested listing denied"), { code: "EACCES" });
+  const real = fsp.readdir;
+  mock.method(fsp, "readdir", ((p: string, ...args: unknown[]) =>
+    p === references ? Promise.reject(denied) : (real as (...a: unknown[]) => unknown)(p, ...args)) as typeof fsp.readdir);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  await assert.rejects(scanSource(root, { followSymlinks: false, strict: true }), (err) => err === denied);
+  const result = await scanSource(root, { followSymlinks: false });
+  assert.deepEqual(result.skills, []);
+  assert.match(result.warnings[0] ?? "", /skipped .*SKILL\.md: nested listing denied/u);
+});
+
+test("a reference missing after listing propagates its original error", async (t) => {
+  const root = await fsp.realpath(await tmp());
+  const dir = await writeSkill(root, "good", "skill");
+  const reference = path.join(dir, "reference.txt");
+  await writeFile(reference, "reference");
+  const missing = Object.assign(new Error("reference disappeared"), { code: "ENOENT" });
+  const real = fsp.realpath;
+  mock.method(fsp, "realpath", ((p: string, ...args: unknown[]) =>
+    p === reference ? Promise.reject(missing) : (real as (...a: unknown[]) => unknown)(p, ...args)) as typeof fsp.realpath);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  await assert.rejects(scanSource(root, { followSymlinks: false, strict: true }), (err) => err === missing);
+});
+
+test("a reference whose canonical path changes is rejected", async (t) => {
+  const root = await fsp.realpath(await tmp());
+  const dir = await writeSkill(root, "good", "skill");
+  const reference = path.join(dir, "reference.txt");
+  const other = path.join(dir, "other.txt");
+  await writeFile(reference, "reference");
+  await writeFile(other, "other");
+  const real = fsp.realpath;
+  mock.method(fsp, "realpath", ((p: string, ...args: unknown[]) =>
+    p === reference ? Promise.resolve(other) : (real as (...a: unknown[]) => unknown)(p, ...args)) as typeof fsp.realpath);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  await assert.rejects(scanSource(root, { followSymlinks: false, strict: true }), /file path changed during manifest construction/u);
 });
 
 test("strict scans propagate directory, symlink, and skill read errors", async (t) => {
@@ -396,11 +563,13 @@ test("strict scans propagate directory, symlink, and skill read errors", async (
 test("a skill file removed during enumeration aborts its manifest", async (t) => {
   const root = await tmp();
   const dir = await writeSkill(root, "good", "skill");
+  await writeFile(path.join(dir, "reference.txt"), "reference");
   const actual = fsp.readdir;
   let reads = 0;
-  mock.method(fsp, "readdir", ((p: string, ...args: unknown[]) => {
-    if (p === dir && ++reads === 2) return Promise.resolve([]);
-    return (actual as (...a: unknown[]) => unknown)(p, ...args);
+  mock.method(fsp, "readdir", (async (p: string, ...args: unknown[]) => {
+    const entries = await (actual as (...a: unknown[]) => Promise<{ name: string }[]>)(p, ...args);
+    if (p === dir && ++reads === 2) return entries.filter((entry) => entry.name !== "SKILL.md");
+    return entries;
   }) as typeof fsp.readdir);
   syncBuiltinESMExports();
   t.after(() => {

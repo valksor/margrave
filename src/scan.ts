@@ -81,12 +81,12 @@ export function extractHeadings(body: string): string[] {
     if (f !== null) {
       const marker = f[1] as string;
       if (fence === null) fence = marker;
-      else if (f[2] !== undefined && marker.startsWith(fence)) fence = null;
+      else if (f[2] !== undefined && marker[0] === fence[0] && marker.length >= fence.length) fence = null;
       continue;
     }
     if (fence !== null) continue;
     const h = /^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/u.exec(line);
-    if (h !== null && h[1] !== undefined) out.push(h[1]);
+    if (h !== null) out.push(h[1] as string);
   }
   return out;
 }
@@ -122,7 +122,7 @@ export function parseSkillMd(text: string): Parsed {
     skill: {
       name: name.trim(),
       description: description.trim(),
-      tokens: buildFieldTokens({ name: name.trim(), description: description.trim(), headings, body }),
+      tokens: buildFieldTokens({ name, description, headings, body }),
     },
   };
 }
@@ -131,9 +131,8 @@ interface ScanState {
   opts: ScanOptions;
   boundary: string;
   visited: Set<string>;
-  names: Set<string>;
   duplicates: Set<string>;
-  skills: ScannedSkill[];
+  skills: Map<string, ScannedSkill>;
   warnings: string[];
 }
 
@@ -184,7 +183,7 @@ async function ingestSkill(state: ScanState, dir: string, skillMdIsSymlink: bool
     state.warnings.push(`skipped ${file}: ${parsed.reason}`);
     return;
   }
-  if (state.names.has(parsed.skill.name)) {
+  if (state.skills.has(parsed.skill.name)) {
     state.duplicates.add(parsed.skill.name);
     state.warnings.push(`skipped ${file}: duplicate skill name "${parsed.skill.name}" in this source`);
     return;
@@ -197,8 +196,7 @@ async function ingestSkill(state: ScanState, dir: string, skillMdIsSymlink: bool
     state.warnings.push(`skipped ${file}: ${(err as Error).message}`);
     return;
   }
-  state.names.add(parsed.skill.name);
-  state.skills.push({ ...parsed.skill, ...collected, frontmatter: splitSkillMd(text).rawFrontmatter as string, dir });
+  state.skills.set(parsed.skill.name, { ...parsed.skill, ...collected, frontmatter: splitSkillMd(text).rawFrontmatter as string, dir });
 }
 
 async function walkSource(state: ScanState, dir: string): Promise<void> {
@@ -216,15 +214,16 @@ async function walkSource(state: ScanState, dir: string): Promise<void> {
     state.warnings.push(`cannot read ${dir}: ${(err as Error).message}`);
     return;
   }
-  entries.sort((a, b) => (a.name < b.name ? -1 : 1));
-  const skillMd = entries.find((entry) => entry.name === "SKILL.md");
+  const entriesByName = new Map(entries.map((entry) => [entry.name, entry]));
+  const skillMd = entriesByName.get("SKILL.md");
   if (skillMd !== undefined) {
     await ingestSkill(state, dir, skillMd.isSymbolicLink());
     return;
   }
-  for (const entry of entries) {
-    if (entry.name.toLowerCase() === ".git" || SKIP_DIRS.has(entry.name)) continue;
-    const child = path.join(dir, entry.name);
+  for (const name of [...entriesByName.keys()].sort()) {
+    const entry = entriesByName.get(name)!;
+    if (name.toLowerCase() === ".git" || SKIP_DIRS.has(name)) continue;
+    const child = path.join(dir, name);
     if (entry.isDirectory()) {
       await walkSource(state, child);
     } else if (entry.isSymbolicLink()) {
@@ -246,12 +245,11 @@ export async function scanSource(root: string, opts: ScanOptions): Promise<ScanR
     opts,
     boundary: opts.boundary !== undefined ? await realpath(opts.boundary) : realRoot,
     visited: new Set(),
-    names: new Set(),
     duplicates: new Set(),
-    skills: [],
+    skills: new Map(),
     warnings: [],
   };
   await walkSource(state, root);
-  state.skills.sort((a, b) => (a.name < b.name ? -1 : 1));
-  return { skills: state.skills, warnings: state.warnings, duplicates: [...state.duplicates].sort() };
+  const skills = [...state.skills.keys()].sort().map((name) => state.skills.get(name)!);
+  return { skills, warnings: state.warnings, duplicates: [...state.duplicates].sort() };
 }
