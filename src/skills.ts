@@ -57,7 +57,7 @@ export function resolveSkill(
   validateRevision(revision);
   const exact = db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE id = ?`).get(input) as IndexEntry | undefined;
   if (exact !== undefined && (allowedSources === undefined || allowedSources.has(exact.source))) return resolveDirectory(db, exact, mcp);
-  const byName = (db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE name = ?`).all(input) as unknown as IndexEntry[]).filter(
+  const byName = (db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE name = ?`).all(input) as IndexEntry[]).filter(
     (entry) => allowedSources === undefined || allowedSources.has(entry.source),
   );
   if (byName.length === 1 && byName[0] !== undefined) return resolveDirectory(db, byName[0], mcp);
@@ -163,7 +163,7 @@ export function findSkills(db: DatabaseSync, task: string, limit: unknown, expla
       .prepare(
         `${FIND_EXACT_ONLY} SELECT ranked.*, NULL AS col, NULL AS term FROM (${FIND_TAIL}) ranked ORDER BY exact DESC, score DESC, id`,
       )
-      .all(q, q, q, q, q, q, scopeJson, scopeJson) as unknown as Row[];
+      .all(q, q, q, q, q, q, scopeJson, scopeJson) as Row[];
   } else {
     db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS temp.find_vocab USING fts5vocab(main, fts, instance)");
     const sql = `${FIND_FTS}, ranked AS MATERIALIZED (${FIND_TAIL}), evidence AS MATERIALIZED (
@@ -171,7 +171,7 @@ export function findSkills(db: DatabaseSync, task: string, limit: unknown, expla
     ) SELECT rowid, id, name, description, revision, exact, score, NULL AS col, NULL AS term, 0 AS kind FROM ranked
       UNION ALL SELECT doc, NULL, NULL, NULL, NULL, 0, 0, col, term, 1 FROM evidence
       ORDER BY kind, exact DESC, score DESC, id, col, term`;
-    rows = db.prepare(sql).all(terms.map((t) => `"${t}"`).join(" OR "), ...exact, scopeJson, scopeJson, ...terms) as unknown as Row[];
+    rows = db.prepare(sql).all(terms.map((t) => `"${t}"`).join(" OR "), ...exact, scopeJson, scopeJson, ...terms) as Row[];
   }
   const hits = new Map<number, FindHit & { recommended: boolean; exact: boolean; matchedTerms: MatchedTerms }>();
   for (const row of rows) {

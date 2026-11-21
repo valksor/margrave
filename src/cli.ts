@@ -149,6 +149,112 @@ async function checkCommand(rest: string[]): Promise<void> {
   return;
 }
 
+async function lockCommand(rest: string[]): Promise<void> {
+  const ctx = (allowUnsafe: boolean): Ctx => ({ log: err, allowUnsafe });
+  const [action, ...args] = rest;
+  if (action === "export") {
+    const p = parse(args, { source: { type: "string", multiple: true } });
+    positionals(p, 0, 0, "lock export [--source <id> ...]");
+    await migrateStore();
+    json(await exportLock((p.values["source"] as string[] | undefined) ?? []));
+    return;
+  }
+  if (action === "restore") {
+    const [file] = positionals(parse(args, {}), 1, 1, "lock restore <file>");
+    const locked = await readLock(file as string);
+    await migrateStore();
+    await restoreLock(locked, ctx(false), out);
+    return;
+  }
+  throw new UsageError("expected lock export or lock restore");
+}
+
+async function listCommand(rest: string[]): Promise<void> {
+  const p = parse(rest, { skills: { type: "boolean" }, json: { type: "boolean" } });
+  positionals(p, 0, 0, "list [--skills] [--json]");
+  await migrateStore();
+  const withSkills = p.values["skills"] === true;
+  const { sources, skills } = await listSources(withSkills);
+  if (p.values["json"] === true) {
+    json({
+      sources,
+      ...(withSkills ? { skills: skills.map((s) => ({ id: s.id, name: s.name, description: s.description })) } : {}),
+    });
+    return;
+  }
+  if (sources.length === 0) {
+    out(NO_SOURCES_MESSAGE);
+    return;
+  }
+  for (const s of sources) {
+    out(`${clean(s.id)}  ${s.kind}  ref=${s.ref === null ? "-" : clean(s.ref)}  commit=${short(s.commit)}  skills=${s.skillCount}`);
+    if (withSkills) {
+      for (const e of skills) {
+        if (e.source === s.id) out(`  ${clean(e.id)}: ${clean(e.description)}`);
+      }
+    }
+  }
+  return;
+}
+
+async function findCommand(rest: string[]): Promise<void> {
+  const p = parse(rest, {
+    limit: { type: "string" },
+    json: { type: "boolean" },
+    explain: { type: "boolean" },
+    "catalog-query": { type: "string" },
+  });
+  const words = positionals(p, 1, Number.POSITIVE_INFINITY, 'find "<task>"');
+  const task = words.join(" ");
+  await migrateStore();
+  const { hits, noSources, suggestions } = await searchSkills(
+    task,
+    p.values["limit"],
+    p.values["explain"] === true,
+    process.env["MARGRAVE_SKILLS_SH"] === "1",
+    undefined,
+    typeof p.values["catalog-query"] === "string" ? p.values["catalog-query"] : undefined,
+  );
+  if (p.values["json"] === true)
+    json({
+      task,
+      results: hits,
+      ...(noSources ? { message: NO_SOURCES_MESSAGE } : {}),
+      ...(suggestions.length > 0 ? { suggestions } : {}),
+    });
+  else out((noSources ? NO_SOURCES_MESSAGE : formatFind(hits)) + formatSuggestions(suggestions));
+  return;
+}
+
+async function loadCommand(rest: string[]): Promise<void> {
+  const p = parse(rest, { json: { type: "boolean" }, file: { type: "string" }, revision: { type: "string" } });
+  const revision = typeof p.values["revision"] === "string" ? p.values["revision"] : undefined;
+  validateRevision(revision);
+  const [id] = positionals(p, 1, 1, "load <id>");
+  await migrateStore();
+  const c = await loadContext();
+  if (c === null)
+    throw revision === undefined ? new MargraveError(NO_SOURCES_MESSAGE) : new RequestError("skill revision changed; search again");
+  let entry;
+  try {
+    entry = resolveSkill(c.db, id as string, revision);
+  } finally {
+    c.db.close();
+  }
+  const gitDrift = c.sources.some((s) => s.id === entry.source && s.kind === "git") ? "cli" : undefined;
+  if (typeof p.values["file"] === "string") {
+    const content = await readSelectedFile(entry, p.values["file"], revision, gitDrift);
+    if (p.values["json"] === true) json({ id: entry.id, path: p.values["file"], content });
+    else process.stdout.write(content);
+    return;
+  }
+  const r = await loadSkill(entry, c.sources, revision, gitDrift);
+  // Written as is: the body is the payload, so no newline is added.
+  if (p.values["json"] === true) json(r);
+  else process.stdout.write(formatLoad(r));
+  return;
+}
+
 async function run(argv: string[]): Promise<void> {
   const [command, ...rest] = argv;
   if (command === undefined) throw new UsageError("missing command");
@@ -163,24 +269,8 @@ async function run(argv: string[]): Promise<void> {
   const ctx = (allowUnsafe: boolean): Ctx => ({ log: err, allowUnsafe });
 
   switch (command) {
-    case "lock": {
-      const [action, ...args] = rest;
-      if (action === "export") {
-        const p = parse(args, { source: { type: "string", multiple: true } });
-        positionals(p, 0, 0, "lock export [--source <id> ...]");
-        await migrateStore();
-        json(await exportLock((p.values["source"] as string[] | undefined) ?? []));
-        return;
-      }
-      if (action === "restore") {
-        const [file] = positionals(parse(args, {}), 1, 1, "lock restore <file>");
-        const locked = await readLock(file as string);
-        await migrateStore();
-        await restoreLock(locked, ctx(false), out);
-        return;
-      }
-      throw new UsageError("expected lock export or lock restore");
-    }
+    case "lock":
+      return lockCommand(rest);
     case "install": {
       const p = parse(rest, { ref: { type: "string" }, "allow-unsafe": { type: "boolean" }, skill: { type: "string", multiple: true } });
       const [spec] = positionals(p, 1, 1, "install <spec>");
@@ -206,89 +296,12 @@ async function run(argv: string[]): Promise<void> {
       out(rec.kind === "local" ? `unregistered ${clean(rec.id)} (the directory was not touched)` : `removed ${clean(rec.id)}`);
       return;
     }
-    case "list": {
-      const p = parse(rest, { skills: { type: "boolean" }, json: { type: "boolean" } });
-      positionals(p, 0, 0, "list [--skills] [--json]");
-      await migrateStore();
-      const withSkills = p.values["skills"] === true;
-      const { sources, skills } = await listSources(withSkills);
-      if (p.values["json"] === true) {
-        json({
-          sources,
-          ...(withSkills ? { skills: skills.map((s) => ({ id: s.id, name: s.name, description: s.description })) } : {}),
-        });
-        return;
-      }
-      if (sources.length === 0) {
-        out(NO_SOURCES_MESSAGE);
-        return;
-      }
-      for (const s of sources) {
-        out(`${clean(s.id)}  ${s.kind}  ref=${s.ref === null ? "-" : clean(s.ref)}  commit=${short(s.commit)}  skills=${s.skillCount}`);
-        if (withSkills) {
-          for (const e of skills) {
-            if (e.source === s.id) out(`  ${clean(e.id)}: ${clean(e.description)}`);
-          }
-        }
-      }
-      return;
-    }
-    case "find": {
-      const p = parse(rest, {
-        limit: { type: "string" },
-        json: { type: "boolean" },
-        explain: { type: "boolean" },
-        "catalog-query": { type: "string" },
-      });
-      const words = positionals(p, 1, Number.POSITIVE_INFINITY, 'find "<task>"');
-      const task = words.join(" ");
-      await migrateStore();
-      const { hits, noSources, suggestions } = await searchSkills(
-        task,
-        p.values["limit"],
-        p.values["explain"] === true,
-        process.env["MARGRAVE_SKILLS_SH"] === "1",
-        undefined,
-        typeof p.values["catalog-query"] === "string" ? p.values["catalog-query"] : undefined,
-      );
-      if (p.values["json"] === true)
-        json({
-          task,
-          results: hits,
-          ...(noSources ? { message: NO_SOURCES_MESSAGE } : {}),
-          ...(suggestions.length > 0 ? { suggestions } : {}),
-        });
-      else out((noSources ? NO_SOURCES_MESSAGE : formatFind(hits)) + formatSuggestions(suggestions));
-      return;
-    }
-    case "load": {
-      const p = parse(rest, { json: { type: "boolean" }, file: { type: "string" }, revision: { type: "string" } });
-      const revision = typeof p.values["revision"] === "string" ? p.values["revision"] : undefined;
-      validateRevision(revision);
-      const [id] = positionals(p, 1, 1, "load <id>");
-      await migrateStore();
-      const c = await loadContext();
-      if (c === null)
-        throw revision === undefined ? new MargraveError(NO_SOURCES_MESSAGE) : new RequestError("skill revision changed; search again");
-      let entry;
-      try {
-        entry = resolveSkill(c.db, id as string, revision);
-      } finally {
-        c.db.close();
-      }
-      const gitDrift = c.sources.some((s) => s.id === entry.source && s.kind === "git") ? "cli" : undefined;
-      if (typeof p.values["file"] === "string") {
-        const content = await readSelectedFile(entry, p.values["file"], revision, gitDrift);
-        if (p.values["json"] === true) json({ id: entry.id, path: p.values["file"], content });
-        else process.stdout.write(content);
-        return;
-      }
-      const r = await loadSkill(entry, c.sources, revision, gitDrift);
-      // Written as is: the body is the payload, so no newline is added.
-      if (p.values["json"] === true) json(r);
-      else process.stdout.write(formatLoad(r));
-      return;
-    }
+    case "list":
+      return listCommand(rest);
+    case "find":
+      return findCommand(rest);
+    case "load":
+      return loadCommand(rest);
     case "reindex": {
       positionals(parse(rest, {}), 0, 0, "reindex");
       await migrateStore();

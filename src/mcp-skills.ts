@@ -125,7 +125,7 @@ export function attachMargraveSkills(
               .prepare(
                 `SELECT ${columns} FROM skills WHERE id > ? AND (? IS NULL OR source IN (SELECT value FROM json_each(?))) ORDER BY id COLLATE BINARY LIMIT 51`,
               )
-              .all(after, scopeJson, scopeJson) as unknown as IndexEntry[];
+              .all(after, scopeJson, scopeJson) as IndexEntry[];
             for (const row of rows) {
               after = row.id;
               const skill = entrySkill(row, limit);

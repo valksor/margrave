@@ -20,6 +20,7 @@ export interface Suggestion {
   installCommand: string;
 }
 
+const SKILLS_SH_ORIGIN = "https://skills.sh";
 const component = /^(?!-)(?!\.{1,2}$)[a-zA-Z0-9._-]+$/u;
 
 function installedRepo(record: SourceRecord): string | undefined {
@@ -34,7 +35,7 @@ function installedRepo(record: SourceRecord): string | undefined {
 async function catalog(catalogQuery: string, limit: number, installed: Map<string, SourceRecord[]>): Promise<Suggestion[]> {
   try {
     const query = new URLSearchParams({ q: catalogQuery, limit: String(installed.size > 0 ? MAX_LIMIT : limit) });
-    const response = await fetch(`https://skills.sh/api/search?${query}`, { signal: AbortSignal.timeout(2500), redirect: "error" });
+    const response = await fetch(`${SKILLS_SH_ORIGIN}/api/search?${query}`, { signal: AbortSignal.timeout(2500), redirect: "error" });
     if (!response.ok) return [];
     const body: unknown = await response.json();
     if (typeof body !== "object" || body === null || !("skills" in body) || !Array.isArray(body.skills)) return [];
@@ -61,7 +62,7 @@ async function catalog(catalogQuery: string, limit: number, installed: Map<strin
       result.push({
         id,
         source: row.source,
-        url: `https://skills.sh/${id}`,
+        url: `${SKILLS_SH_ORIGIN}/${id}`,
         installCommand:
           existing.length === 0
             ? `margrave install ${row.source} --skill ${row.skillId}`
