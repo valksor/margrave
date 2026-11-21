@@ -5,6 +5,7 @@ import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
+import { pathToFileURL } from "node:url";
 import { parseLock, restoreLock } from "../src/lock.ts";
 import { exportLock, indexedEntries, matchesLock, sameInventory, verifyInstalled } from "../src/lock-format.ts";
 import { scanSource } from "../src/scan.ts";
@@ -24,6 +25,155 @@ import {
   writeCatalogRecords,
   writeIndexRows,
 } from "./helpers.ts";
+
+test("lock pending direct validates markers before touching sources", async (t) => {
+  const previous = process.env["MARGRAVE_HOME"];
+  const home = await tmp("mg-home-");
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(async () => {
+    if (previous === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previous;
+    await rm(home, { recursive: true, force: true });
+  });
+  const spec = pathToFileURL(path.join(home, "nonexistent-repository")).href;
+  const parsed = parseSpec(spec);
+  assert.equal(parsed.kind, "git");
+  const commit = "a".repeat(40);
+  const source = {
+    spec,
+    id: parsed.id,
+    url: parsed.url,
+    subpath: parsed.subpath,
+    ref: "refs/heads/main",
+    commit,
+    skills: [{ id: `${parsed.id}/skill`, revision: `sha256:${"b".repeat(64)}` }],
+  };
+  const record = {
+    ...parsed,
+    spec,
+    ref: source.ref,
+    commit,
+    installedAt: "2026-01-01T00:00:00.000Z",
+    snapshot: `${commit}-${"d".repeat(16)}`,
+  };
+  const scan = { code: 0, files: [], keys: [], overridden: false, tree: null, verdict: "clean", version: null };
+  const lock = parseLock({ version: 1, sources: [source] });
+  const selectedSource = { ...source, selection: ["skill"] };
+  const selectedLock = parseLock({ version: 2, sources: [selectedSource] });
+  const ctx = { log: (): void => {}, allowUnsafe: false };
+  const marker = path.join(home, "restore-pending", `${source.id}.json`);
+  const sentinel = path.join(home, "sources");
+  await mkdir(path.dirname(marker), { recursive: true });
+  await writeFile(sentinel, "sentinel");
+
+  const check = async (contents: string, expected: object, expectedLock = lock): Promise<void> => {
+    await writeFile(marker, contents);
+    await assert.rejects(
+      restoreLock(expectedLock, ctx, () => {}),
+      expected,
+    );
+    assert.equal(await readFile(marker, "utf8"), contents);
+    assert.equal(await readFile(sentinel, "utf8"), "sentinel");
+  };
+  const malformed = { message: `pending restore record is malformed: ${source.id}` };
+  for (const [pending, expectedLock] of [
+    [{ source, record }, lock],
+    [{ source, record: { ...record, scan }, original: "c".repeat(64) }, lock],
+    [{ source: selectedSource, record: { ...record, selection: ["skill"] } }, selectedLock],
+    [{ source: selectedSource, record: { ...record, scan, selection: ["skill"] } }, selectedLock],
+  ] as const) {
+    await check(JSON.stringify(pending), { code: "EEXIST" }, expectedLock);
+  }
+  await rm(marker);
+  await assert.rejects(
+    restoreLock(lock, ctx, () => {}),
+    { code: "EEXIST" },
+  );
+  assert.equal(existsSync(marker), false);
+  assert.equal(await readFile(sentinel, "utf8"), "sentinel");
+  await mkdir(marker);
+  await assert.rejects(
+    restoreLock(lock, ctx, () => {}),
+    { code: "EISDIR" },
+  );
+  assert.equal((await fsp.stat(marker)).isDirectory(), true);
+  assert.equal(await readFile(sentinel, "utf8"), "sentinel");
+  await rm(marker, { recursive: true });
+
+  const otherParsed = parseSpec(pathToFileURL(path.join(home, "other-repository")).href);
+  assert.equal(otherParsed.kind, "git");
+  const invalidMarkers: unknown[] = [
+    null,
+    [],
+    "marker",
+    {},
+    { source },
+    { source, record, extra: true },
+    ...[null, 1, [], ["c".repeat(64)], "c".repeat(63), "c".repeat(65), "C".repeat(64), `x${"c".repeat(64)}`, `${"c".repeat(64)}x`].map(
+      (original) => ({
+        source,
+        record,
+        original,
+      }),
+    ),
+    { source: null, record },
+    { source: { ...source, extra: true }, record },
+    { source: { ...source, ref: "main" }, record },
+    { source: { ...source, spec: otherParsed.url, id: otherParsed.id, url: otherParsed.url }, record },
+    {
+      source: {
+        ...source,
+        spec: otherParsed.url,
+        id: otherParsed.id,
+        url: otherParsed.url,
+        subpath: otherParsed.subpath,
+        skills: [{ id: `${otherParsed.id}/skill`, revision: source.skills[0]!.revision }],
+      },
+      record: { ...record, ...otherParsed, spec: otherParsed.url },
+    },
+  ];
+  const { installedAt: _installedAt, ...missingInstalledAt } = record;
+  const invalidRecords: unknown[] = [
+    null,
+    [],
+    "record",
+    missingInstalledAt,
+    { ...record, extra: true },
+    { ...record, installedAt: null },
+    { ...record, scan: null },
+    { ...record, selection: null },
+    { ...record, selection: ["other"] },
+    { ...record, id: "wrong" },
+    { ...record, kind: "local" },
+    { ...record, ref: "refs/heads/other" },
+    { ...record, snapshot: 1 },
+    { ...record, snapshot: `x${record.snapshot}` },
+    { ...record, snapshot: `${record.snapshot}x` },
+    { ...record, snapshot: `${"e".repeat(40)}-${"d".repeat(16)}` },
+    { ...record, snapshot: `${commit}-${"d".repeat(15)}` },
+    { ...record, snapshot: `${commit}-${"D".repeat(16)}` },
+    { ...record, snapshot: [record.snapshot] },
+  ];
+  await check("{", malformed);
+  for (const pending of invalidMarkers) await check(JSON.stringify(pending), malformed);
+  for (const invalidRecord of invalidRecords) await check(JSON.stringify({ source, record: invalidRecord }), malformed);
+  const otherSource = { ...source, ref: "refs/heads/other" };
+  await check(JSON.stringify({ source: otherSource, record: { ...record, ref: otherSource.ref } }), {
+    message: `restore is pending for a different lock source: ${source.id}`,
+  });
+
+  await rm(sentinel);
+  const originalMarker = JSON.stringify({ source, record, original: "c".repeat(64) });
+  await writeFile(marker, originalMarker);
+  await assert.rejects(
+    restoreLock(lock, ctx, () => {}),
+    { message: `installed source differs from the lock: ${source.id}` },
+  );
+  assert.equal(await readFile(marker, "utf8"), originalMarker);
+  assert.equal(existsSync(path.join(home, "index.db")), false);
+  assert.equal(existsSync(path.join(home, "sources", source.id)), false);
+  assert.equal(existsSync(path.join(home, "snapshots", source.id)), false);
+});
 
 test("lock inventory compares source identity and unordered skill revisions", () => {
   const spec = "example/project/skills";

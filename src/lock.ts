@@ -8,7 +8,7 @@ import type { ScanOutcome } from "./safety.ts";
 import { git } from "./source-git.ts";
 import { commit, gitDir, logWarnings, ownedStage, resolveScanRoot, selectSkills, syncSnapshot, toEntries } from "./source-files.ts";
 import type { Ctx } from "./source-files.ts";
-import { MargraveError, atomicWrite, ensureDirs, home, isRecord, validScan, validSelection } from "./store-files.ts";
+import { MargraveError, atomicWrite, ensureDirs, home, isRecord, isSha256, validSource } from "./store-files.ts";
 import { catalogSources, deleteSourceSkills, insertSkills, openCatalogReadOptional } from "./catalog.ts";
 import type { NewEntry, SourceRecord } from "./store-files.ts";
 
@@ -25,16 +25,16 @@ const recoveryIdentity = (rec: SourceRecord, rows: unknown): string =>
 const pendingPath = (id: string): string => path.join(home(), "restore-pending", `${id}.json`);
 
 async function readPending(source: LockedSource): Promise<PendingRestore | undefined> {
-  let data: string;
+  let data: Buffer;
   try {
-    data = await readFile(pendingPath(source.id), "utf8");
+    data = await readFile(pendingPath(source.id));
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw err;
   }
   let pending: PendingRestore;
   try {
-    const raw: unknown = JSON.parse(data);
+    const raw: unknown = JSON.parse(data.toString());
     pending = validatePending(raw, source);
   } catch {
     throw new MargraveError(`pending restore record is malformed: ${source.id}`);
@@ -46,33 +46,27 @@ async function readPending(source: LockedSource): Promise<PendingRestore | undef
 
 function validatePending(raw: unknown, source: LockedSource): PendingRestore {
   if (!isRecord(raw) || !["record,source", "original,record,source"].includes(Object.keys(raw).sort().join(","))) throw new Error();
-  if (raw["original"] !== undefined && (typeof raw["original"] !== "string" || !/^[0-9a-f]{64}$/u.test(raw["original"]))) throw new Error();
+  const original = raw["original"];
+  if (original !== undefined && !isSha256(original)) throw new Error();
   const locked = parseLock({
     version: isRecord(raw["source"]) && Object.hasOwn(raw["source"], "selection") ? 2 : 1,
     sources: [raw["source"]],
-  }).sources[0];
-  const record = raw["record"] as SourceRecord;
+  }).sources[0]!;
+  const record = raw["record"];
   if (
-    locked === undefined ||
     locked.id !== source.id ||
-    typeof record !== "object" ||
-    record === null ||
+    !validSource(record) ||
     ![
       "commit,id,installedAt,kind,ref,snapshot,spec,subpath,url",
       "commit,id,installedAt,kind,ref,scan,snapshot,spec,subpath,url",
       "commit,id,installedAt,kind,ref,scan,selection,snapshot,spec,subpath,url",
       "commit,id,installedAt,kind,ref,selection,snapshot,spec,subpath,url",
     ].includes(Object.keys(record).sort().join(",")) ||
-    (record.selection !== undefined && !validSelection(record.selection)) ||
-    (record.scan !== undefined && !validScan(record.scan)) ||
-    typeof record.installedAt !== "string" ||
-    typeof record.snapshot !== "string" ||
-    !new RegExp(`^${locked.commit}-[0-9a-f]{16}$`, "u").test(record.snapshot) ||
     !matchesLock(record, locked)
   ) {
     throw new Error();
   }
-  return { source: locked, record, ...(typeof raw["original"] === "string" ? { original: raw["original"] } : {}) };
+  return { source: locked, record, original };
 }
 
 async function scanLockedDirectory(
