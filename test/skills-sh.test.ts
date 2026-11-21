@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import test from "node:test";
+import test, { mock } from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { formatSuggestions, searchSkills } from "../src/search.ts";
@@ -95,6 +95,7 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
   const scoped = await searchSkills("private-prompt-marker", 2, false, true, new Set(), "terraform modules");
   assert.equal(scoped.suggestions[0]?.id, "Owner/Repo/one");
   const visible = await searchSkills("private-prompt-marker", 2, false, true, undefined, "  terraform modules  ");
+  assert.equal(visible.noSources, false);
   assert.equal(visible.suggestions[0]?.id, "other/project/two");
   assert.deepEqual(limits, ["2", "2", "25"]);
   assert.ok((await searchSkills("", 2, false, true, undefined, "terraform modules")).suggestions.length > 0);
@@ -136,8 +137,8 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
   const privateSource = await searchSkills("nothing", 1, false, true, new Set(), "terraform modules");
   assert.equal(privateSource.suggestions[0]?.installCommand, "margrave install owner/repo --skill first");
   writeCatalogRecords(home, [
-    { ...sources[0], id: "a", selection: ["second"] },
     { ...sources[0], id: "z", selection: ["first"] },
+    { ...sources[0], id: "a", selection: ["second"] },
   ]);
   globalThis.fetch = () =>
     Promise.resolve(
@@ -177,9 +178,15 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
   assert.deepEqual((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions, []);
   globalThis.fetch = () => Promise.resolve(Response.json(null));
   assert.deepEqual((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions, []);
+  for (const body of [42, "primitive", {}, { skills: null }]) {
+    globalThis.fetch = () => Promise.resolve(Response.json(body));
+    assert.deepEqual((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions, []);
+  }
   globalThis.fetch = () => Promise.resolve(new Response("not json"));
   assert.deepEqual((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions, []);
   globalThis.fetch = () => Promise.resolve(new Response(null, { status: 500 }));
+  assert.deepEqual((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions, []);
+  globalThis.fetch = () => Promise.resolve(Response.json({ skills: [{ source: "other/project", skillId: "two" }] }, { status: 500 }));
   assert.deepEqual((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions, []);
   globalThis.fetch = () => Promise.reject(new Error("offline"));
   assert.deepEqual((await searchSkills("nothing", 2, false, true, undefined, "terraform modules")).suggestions, []);
@@ -187,6 +194,8 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
   for (const [spec, url, subpath, suppressed] of [
     ["git@github.com:OWNER/REPO.git", "git@github.com:OWNER/REPO.git", "", true],
     ["owner/repo", "https://github.com/owner/repo.git", "", true],
+    ["owner/repo", "https://github.com/owner/repo", "", true],
+    ["owner/repo", "https://example.com/https://github.com/owner/repo.git", "", false],
     ["owner/repo", "https://example.com/owner/repo.git", "", false],
     ["https://github.com/owner/repo.git", "https://github.com/owner/repo.git", "skills/one", false],
     ["https://example.com/owner/repo.git", "https://example.com/owner/repo.git", "", false],
@@ -215,6 +224,151 @@ test("catalog fallback uses visible sources and validates responses", async (t) 
   };
   await assert.rejects(searchSkills("nothing", 2, false, true, undefined, "terraform modules"));
   assert.equal(unexpectedCalls, 0);
+});
+
+test("catalog fallback validates component boundaries and local source URLs", async (t) => {
+  const home = await tmp("mg-catalog-components-");
+  const previous = process.env["MARGRAVE_HOME"];
+  const originalFetch = globalThis.fetch;
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(async () => {
+    if (previous === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previous;
+    globalThis.fetch = originalFetch;
+    await rm(home, { recursive: true, force: true });
+  });
+  await seedIndex(
+    [],
+    [
+      {
+        id: "local",
+        kind: "local",
+        spec: home,
+        path: home,
+        url: "https://github.com/owner/repo.git",
+        subpath: "",
+        ref: null,
+        commit: null,
+        installedAt: "now",
+      },
+    ],
+  );
+  globalThis.fetch = (input) => {
+    assert.equal(new URL(input as string).searchParams.get("limit"), "20");
+    return Promise.resolve(
+      Response.json({
+        skills: [
+          { source: "owner/.repo", skillId: ".skill" },
+          { source: "owner/..repo", skillId: "..skill" },
+          { source: "owner/.", skillId: "ok" },
+          { source: "owner/..", skillId: "ok" },
+          { source: "owner/repo", skillId: "." },
+          { source: "owner/repo", skillId: ".." },
+          { source: `${"a".repeat(39)}/repo`, skillId: "ok" },
+          { source: `${"a".repeat(40)}/repo`, skillId: "ok" },
+          { source: "abc-defghi/repo", skillId: "ok" },
+          { source: "abc!/repo", skillId: "ok" },
+          { source: "abc-def!/repo", skillId: "ok" },
+          { source: "owner/repo.git-extra", skillId: "ok" },
+          { source: "owner/repo", skillId: "one" },
+        ],
+      }),
+    );
+  };
+  const result = await searchSkills("nothing", 20, false, true, undefined, "public");
+  assert.deepEqual(
+    result.suggestions.map((item) => item.id),
+    [
+      "owner/.repo/.skill",
+      "owner/..repo/..skill",
+      `${"a".repeat(39)}/repo/ok`,
+      "abc-defghi/repo/ok",
+      "owner/repo.git-extra/ok",
+      "owner/repo/one",
+    ],
+  );
+});
+
+test("catalog fallback enriches matching sources and closes the database", async (t) => {
+  const home = await tmp("mg-catalog-metadata-");
+  const previous = process.env["MARGRAVE_HOME"];
+  process.env["MARGRAVE_HOME"] = home;
+  t.after(async () => {
+    mock.restoreAll();
+    if (previous === undefined) delete process.env["MARGRAVE_HOME"];
+    else process.env["MARGRAVE_HOME"] = previous;
+    await rm(home, { recursive: true, force: true });
+  });
+  const git = {
+    kind: "git",
+    spec: "owner/repo",
+    url: "https://github.com/owner/repo",
+    subpath: "",
+    ref: "refs/heads/main",
+    commit: "a".repeat(40),
+    snapshot: `${"a".repeat(40)}-${"b".repeat(16)}`,
+    installedAt: "now",
+  } as const;
+  const scan = { code: 1, overridden: true, version: "1", verdict: "warn", keys: [], files: [], tree: "c".repeat(64) } as const;
+  const entries = [
+    { ...newEntry("scanned", "one", "shared topic"), frontmatter: "license: MIT" },
+    { ...newEntry("unbound", "two", "shared topic"), frontmatter: "license: 42" },
+    { ...newEntry("old", "three", "shared topic"), frontmatter: "" },
+    { ...newEntry("local", "four", "shared topic"), frontmatter: "scalar" },
+  ];
+  await seedIndex(entries, [
+    { ...git, id: "scanned", scan: { ...scan, keys: [], files: [] } },
+    {
+      ...git,
+      id: "unbound",
+      commit: "d".repeat(40),
+      snapshot: `${"d".repeat(40)}-${"b".repeat(16)}`,
+      scan: { ...scan, keys: [], files: [], tree: null },
+    },
+    { ...git, id: "old", commit: "e".repeat(40), snapshot: `${"e".repeat(40)}-${"b".repeat(16)}` },
+    { id: "local", kind: "local", spec: home, path: home, subpath: "", ref: null, commit: null, installedAt: "now" },
+  ]);
+  const close = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, "close")!.value as DatabaseSync["close"];
+  let closed = 0;
+  mock.method(DatabaseSync.prototype, "close", function (this: DatabaseSync) {
+    closed++;
+    return close.call(this);
+  });
+  const fetch = mock.method(globalThis, "fetch", () => Promise.reject(new Error("catalog fetch is disabled")));
+  const result = await searchSkills("shared topic", 10, false, false);
+  assert.equal(result.noSources, false);
+  assert.equal(closed, 1);
+  assert.equal(fetch.mock.calls.length, 0);
+  assert.deepEqual(
+    Object.fromEntries(
+      result.hits.map(({ id, source, commit, license, scanVerdict, scanOverridden }) => [
+        id,
+        { source, commit, license, scanVerdict, scanOverridden },
+      ]),
+    ),
+    {
+      "scanned/one": { source: "scanned", commit: "a".repeat(40), license: "MIT", scanVerdict: "warn", scanOverridden: true },
+      "unbound/two": { source: "unbound", commit: "d".repeat(40), license: null, scanVerdict: "unknown", scanOverridden: null },
+      "old/three": { source: "old", commit: "e".repeat(40), license: null, scanVerdict: "unknown", scanOverridden: null },
+      "local/four": { source: "local", commit: null, license: null, scanVerdict: "unknown", scanOverridden: null },
+    },
+  );
+});
+
+test("catalog fallback formats install and update suggestions exactly", () => {
+  const install = { id: "o/r/s", source: "o/r", url: "https://skills.sh/o/r/s", installCommand: "margrave install o/r --skill s" };
+  const update = { id: "o/r/t", source: "o/r", url: "https://skills.sh/o/r/t", installCommand: "margrave update local --skill t" };
+  const installText = "\n\nskills.sh suggestions\n  https://skills.sh/o/r/s\n  Manual install: margrave install o/r --skill s";
+  const mixedText = `${installText}\n  https://skills.sh/o/r/t\n  Manual update: margrave update local --skill t`;
+  assert.equal(formatSuggestions([]), "");
+  assert.equal(formatSuggestions([], true), "");
+  assert.equal(formatSuggestions([install]), installText);
+  assert.equal(formatSuggestions([install], true), `${installText}\nAsk the store operator to install a source on this server.`);
+  assert.equal(formatSuggestions([install, update]), mixedText);
+  assert.equal(
+    formatSuggestions([install, update], true),
+    `${mixedText}\nAsk the store operator to run the suggested command on this server.`,
+  );
 });
 
 test("CLI, stdio and hosted opt in through trusted configuration", async (t) => {

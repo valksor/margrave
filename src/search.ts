@@ -33,47 +33,48 @@ function installedRepo(record: SourceRecord): string | undefined {
 }
 
 async function catalog(catalogQuery: string, limit: number, installed: Map<string, SourceRecord[]>): Promise<Suggestion[]> {
+  let body: { skills?: unknown } | null;
   try {
     const query = new URLSearchParams({ q: catalogQuery, limit: String(installed.size > 0 ? MAX_LIMIT : limit) });
     const response = await fetch(`${SKILLS_SH_ORIGIN}/api/search?${query}`, { signal: AbortSignal.timeout(2500), redirect: "error" });
     if (!response.ok) return [];
-    const body: unknown = await response.json();
-    if (typeof body !== "object" || body === null || !("skills" in body) || !Array.isArray(body.skills)) return [];
-    const result: Suggestion[] = [];
-    const seen = new Set<string>();
-    for (const row of body.skills as unknown[]) {
-      if (typeof row !== "object" || row === null || !("source" in row) || !("skillId" in row)) continue;
-      if (typeof row.source !== "string" || typeof row.skillId !== "string") continue;
-      const parts = row.source.split("/");
-      if (
-        parts.length !== 2 ||
-        !/^(?=.{1,39}$)[a-z0-9]+(?:-[a-z0-9]+)*$/iu.test(parts[0] as string) ||
-        !component.test(parts[1] as string) ||
-        /\.git$/iu.test(parts[1] as string)
-      )
-        continue;
-      if (!component.test(row.skillId)) continue;
-      const skillName = row.skillId;
-      const id = `${row.source}/${row.skillId}`;
-      const existing = installed.get(row.source.toLowerCase()) ?? [];
-      if (seen.has(id.toLowerCase()) || existing.some((source) => source.selection === undefined || source.selection.includes(skillName)))
-        continue;
-      seen.add(id.toLowerCase());
-      result.push({
-        id,
-        source: row.source,
-        url: `${SKILLS_SH_ORIGIN}/${id}`,
-        installCommand:
-          existing.length === 0
-            ? `margrave install ${row.source} --skill ${row.skillId}`
-            : `margrave update ${existing[0]!.id} --skill ${row.skillId}`,
-      });
-      if (result.length === limit) break;
-    }
-    return result;
+    body = (await response.json()) as { skills?: unknown } | null;
   } catch {
     return [];
   }
+  if (body === null || !Array.isArray(body.skills)) return [];
+  const result: Suggestion[] = [];
+  const seen = new Set<string>();
+  for (const row of body.skills as unknown[]) {
+    if (typeof row !== "object" || row === null || !("source" in row) || !("skillId" in row)) continue;
+    if (typeof row.source !== "string" || typeof row.skillId !== "string") continue;
+    const parts = row.source.split("/");
+    if (
+      parts.length !== 2 ||
+      !/^(?=.{1,39}$)[a-z0-9]+(?:-[a-z0-9]+)*$/iu.test(parts[0] as string) ||
+      !component.test(parts[1] as string) ||
+      /\.git$/iu.test(parts[1] as string)
+    )
+      continue;
+    if (!component.test(row.skillId)) continue;
+    const skillName = row.skillId;
+    const id = `${row.source}/${row.skillId}`;
+    const existing = installed.get(row.source.toLowerCase()) ?? [];
+    if (seen.has(id.toLowerCase()) || existing.some((source) => source.selection === undefined || source.selection.includes(skillName)))
+      continue;
+    seen.add(id.toLowerCase());
+    result.push({
+      id,
+      source: row.source,
+      url: `${SKILLS_SH_ORIGIN}/${id}`,
+      installCommand:
+        existing.length === 0
+          ? `margrave install ${row.source} --skill ${row.skillId}`
+          : `margrave update ${existing[0]!.id} --skill ${row.skillId}`,
+    });
+    if (result.length === limit) break;
+  }
+  return result;
 }
 
 function enrichRecommendations(ctx: Context, hits: FindHit[]): Recommendation[] {
@@ -86,7 +87,7 @@ function enrichRecommendations(ctx: Context, hits: FindHit[]): Recommendation[] 
     const source = ctx.sources.find((item) => item.id === row.source);
     const frontmatter = parseFrontmatter(row.frontmatter);
     const license = typeof frontmatter === "object" && frontmatter !== null && "license" in frontmatter ? frontmatter.license : null;
-    const scan = source?.kind === "git" && source.scan?.tree != null ? source.scan : undefined;
+    const scan = source?.scan?.tree != null ? source.scan : undefined;
     return {
       ...hit,
       source: row.source,
@@ -119,7 +120,9 @@ export async function searchSkills(
   const publicQuery = catalogQuery?.trim();
   if (!skillsSh || !publicQuery || hits.some((hit) => hit.recommended !== false)) return { hits, noSources, suggestions: [] };
   const installed = new Map<string, SourceRecord[]>();
-  for (const source of [...(ctx?.sources ?? [])].sort((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)))) {
+  const sources = new Map(ctx?.sources.map((source) => [source.id, source] as const));
+  for (const id of [...sources.keys()].sort()) {
+    const source = sources.get(id) as SourceRecord;
     if (allowedSources !== undefined && !allowedSources.has(source.id)) continue;
     const repo = installedRepo(source);
     if (repo !== undefined) installed.set(repo, [...(installed.get(repo) ?? []), source]);
