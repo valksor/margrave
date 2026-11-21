@@ -21,12 +21,11 @@ async function readOpenedFile(fh: FileHandle, rel: string, limit?: number): Prom
   if (stat.size > limit) throw new HostedSizeError();
   const bytes = Buffer.allocUnsafe(limit + 1);
   let offset = 0;
-  while (offset < bytes.length) {
-    const { bytesRead } = await fh.read(bytes, offset, bytes.length - offset, null);
-    if (bytesRead === 0) break;
-    offset += bytesRead;
+  let result;
+  while ((result = await fh.read(bytes, offset, bytes.length - offset, null)).bytesRead) {
+    offset += result.bytesRead;
+    if (offset > limit) throw new HostedSizeError();
   }
-  if (offset > limit) throw new HostedSizeError();
   return bytes.subarray(0, offset);
 }
 

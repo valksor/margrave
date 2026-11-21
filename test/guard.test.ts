@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { constants } from "node:fs";
 import fsp, { mkdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
@@ -133,12 +134,47 @@ test("readSkillFile refuses a FIFO without blocking, and reads a regular file be
   await mkfifo(fifo);
   t.after(() => releaseFifo(fifo));
   await writeFile(path.join(dir, "ref.md"), "regular\n");
+  const realFifo = await fsp.realpath(fifo);
+  const originalOpen = fsp.open;
+  mock.method(fsp, "open", (async (p: Parameters<typeof fsp.open>[0], flags: number, mode?: Parameters<typeof fsp.open>[2]) => {
+    if (p === realFifo) {
+      assert.ok(flags & constants.O_NONBLOCK);
+      assert.ok(flags & constants.O_NOFOLLOW);
+    }
+    return originalOpen(p, flags, mode);
+  }) as typeof fsp.open);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
   await assert.rejects(readSkillFile(dir, "pipe.md"), /not a file: pipe\.md/u);
   assert.equal(await readSkillFile(dir, "ref.md"), "regular\n");
 });
 
 test("listFiles of a directory that cannot be read is an empty list", async () => {
-  assert.deepEqual(await listFiles(path.join(await tmp(), "does-not-exist")), []);
+  const missing = path.join(await tmp(), "does-not-exist");
+  assert.deepEqual(await listFiles(missing), []);
+  await assert.rejects(listFiles(missing, true), { code: "ENOENT" });
+});
+
+test("listFiles skips metadata and symlinks and sorts regular files", async (t) => {
+  const dir = await tmp();
+  for (const name of ["dir", ".GiT", "node_modules"]) await mkdir(path.join(dir, name));
+  for (const name of ["z.md", "a.md", "dir/b.md", ".GiT/hidden", "node_modules/hidden"]) await writeFile(path.join(dir, name), "x");
+  await link(path.join(dir, "z.md"), path.join(dir, "alias.md"));
+
+  const original = fsp.readdir;
+  mock.method(fsp, "readdir", (async (p: string, ...args: unknown[]) => {
+    const entries = await (original as (...a: unknown[]) => Promise<{ name: string }[]>)(p, ...args);
+    return p === dir ? entries.sort((a, b) => (a.name < b.name ? 1 : -1)) : entries;
+  }) as typeof fsp.readdir);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  assert.deepEqual(await listFiles(dir), ["a.md", "dir/b.md", "z.md"]);
 });
 
 test("load of a SKILL.md without frontmatter returns an empty frontmatter and the whole text as body", async () => {
@@ -167,6 +203,9 @@ test("byte reads preserve missing, access, and canonical path failures", async (
   const ref = path.join(dir, "ref.md");
   await writeFile(ref, "inside");
   await link(ref, path.join(dir, "alias.md"));
+  await assert.rejects(readSkillFileBytes(dir, ""), { message: "path is empty" });
+  await assert.rejects(readSkillFileBytes(dir, "ref\u0000.md"), { message: "no such file in the skill directory: ref.md" });
+  assert.deepEqual(await readSkillFileBytes(dir, "ref.md", true, true), Buffer.from("inside"));
   await assert.rejects(readSkillFileBytes(dir, "alias.md", true, true), /path changed/u);
   await assert.rejects(readSkillFileBytes(dir, "missing", true), /ENOENT/u);
   await assert.rejects(readSkillFileBytes(path.join(root, "missing"), "x", true), /ENOENT/u);
@@ -180,10 +219,92 @@ test("byte reads preserve missing, access, and canonical path failures", async (
     syncBuiltinESMExports();
   });
   await assert.rejects(readSkillFileBytes(dir, "ref.md", true), /injected denial/u);
+  await assert.rejects(readSkillFileBytes(dir, "ref.md"), { code: "EACCES" });
   mock.restoreAll();
   syncBuiltinESMExports();
   mock.method(fsp, "realpath", ((p: string, ...args: unknown[]) =>
     p === ref ? Promise.reject(denied) : (original as (...a: unknown[]) => unknown)(p, ...args)) as typeof fsp.realpath);
   syncBuiltinESMExports();
   await assert.rejects(readSkillFileBytes(dir, "ref.md", true), /injected denial/u);
+  await assert.rejects(readSkillFileBytes(dir, "ref.md"), { code: "EACCES" });
+});
+
+test("bounded skill reads accept the exact size and reject larger files", async (t) => {
+  const dir = await tmp();
+  const file = path.join(dir, "ref.md");
+  const bytes = Buffer.from([0, 1, 2, 3]);
+  await writeFile(file, bytes);
+  const realFile = await fsp.realpath(file);
+  const originalOpen = fsp.open;
+  const reads: [number, number][][] = [];
+  const closes: boolean[] = [];
+  let grow = false;
+  let failRead = false;
+  const readError = new Error("injected read failure");
+  mock.method(fsp, "open", (async (p: Parameters<typeof fsp.open>[0], flags: number, mode?: Parameters<typeof fsp.open>[2]) => {
+    const handle = await originalOpen(p, flags, mode);
+    if (p !== realFile) return handle;
+    const calls: [number, number][] = [];
+    reads.push(calls);
+    const index = closes.push(false) - 1;
+    const originalRead = handle.read.bind(handle);
+    const originalClose = handle.close.bind(handle);
+    const originalStat = handle.stat.bind(handle);
+    t.mock.method(handle, "read", (async (buffer: Buffer, offset: number, length: number, position: null) => {
+      calls.push([offset, length]);
+      assert.ok(calls.length <= 5, "read budget exceeded");
+      if (failRead) throw readError;
+      return originalRead(buffer, offset, Math.min(length, 2), position);
+    }) as typeof handle.read);
+    t.mock.method(handle, "close", async () => {
+      closes[index] = true;
+      await originalClose();
+    });
+    t.mock.method(handle, "stat", (async (...args: Parameters<typeof handle.stat>) => {
+      const result = await originalStat(...args);
+      if (grow) await fsp.appendFile(file, "x");
+      return result;
+    }) as typeof handle.stat);
+    return handle;
+  }) as typeof fsp.open);
+  syncBuiltinESMExports();
+  t.after(() => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+
+  await assert.rejects(readSkillFileBytes(dir, "ref.md", false, false, 3), {
+    message: "skill file exceeds the hosted size limit",
+  });
+  assert.deepEqual(reads[0], []);
+  assert.equal(closes[0], true);
+  assert.deepEqual(await readSkillFileBytes(dir, "ref.md", false, false, 5), bytes);
+  assert.deepEqual(reads[1], [
+    [0, 6],
+    [2, 4],
+    [4, 2],
+  ]);
+  assert.equal(closes[1], true);
+  assert.deepEqual(await readSkillFileBytes(dir, "ref.md", false, false, 4), bytes);
+  assert.deepEqual(reads[2], [
+    [0, 5],
+    [2, 3],
+    [4, 1],
+  ]);
+  assert.equal(closes[2], true);
+
+  failRead = true;
+  await assert.rejects(readSkillFileBytes(dir, "ref.md", false, false, 4), (err) => err === readError);
+  assert.equal(closes[3], true);
+  failRead = false;
+  grow = true;
+  await assert.rejects(readSkillFileBytes(dir, "ref.md", false, false, 4), {
+    message: "skill file exceeds the hosted size limit",
+  });
+  assert.deepEqual(reads[4], [
+    [0, 5],
+    [2, 3],
+    [4, 1],
+  ]);
+  assert.equal(closes[4], true);
 });
