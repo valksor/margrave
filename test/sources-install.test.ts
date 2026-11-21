@@ -536,7 +536,7 @@ test("sources install direct preserves the second staged scan filesystem error",
         p.startsWith(path.join(home, "staging") + path.sep) &&
         p.endsWith(`${path.sep}repo`) &&
         (options as { withFileTypes?: boolean })?.withFileTypes === true &&
-        ++seen === 2
+        ++seen === 4
       )
         return Promise.reject(failure);
       return (readdir as (...a: unknown[]) => unknown)(p, options);
@@ -548,7 +548,7 @@ test("sources install direct preserves the second staged scan filesystem error",
       spy.mock.restore();
       syncBuiltinESMExports();
     }
-    assert.equal(seen, 2);
+    assert.equal(seen, 4);
     assert.deepEqual(catalogRecords(home), records);
     assert.deepEqual(indexRows(home), rows);
     assert.equal(await readlink(alias), link);

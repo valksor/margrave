@@ -1015,7 +1015,7 @@ test("lock restore direct propagates both strict snapshot scan errors", async (t
   const { marker, contents } = await directPending(home, fixture);
   const real = fsp.readdir;
   const ctx = { log: (): void => {}, allowUnsafe: false };
-  for (const target of [1, 2]) {
+  for (const target of [1, 4]) {
     let count = 0;
     const error = new Error(`snapshot listing ${target}`);
     mock.method(fsp, "readdir", ((p: string, ...args: unknown[]) => {

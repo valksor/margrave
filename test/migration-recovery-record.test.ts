@@ -441,6 +441,7 @@ test("migration recovery record direct normalizes extraction failure and closes 
     const removed: Parameters<typeof fs.rm>[] = [];
     let calls = 0;
     let child: EventEmitter | undefined;
+    let emitted: typeof failure | undefined;
     const stderr = new PassThrough();
     mock.method(fs, "mkdtemp", (async (...args: Parameters<typeof fs.mkdtemp>) => {
       const directory = await originalMkdtemp(...args);
@@ -468,12 +469,14 @@ test("migration recovery record direct normalizes extraction failure and closes 
     mock.method(childProcess, "spawn", ((...args: Parameters<typeof childProcess.spawn>) => {
       if (args[0] !== "/usr/bin/tar") return originalSpawn(...args);
       calls++;
-      assert.deepEqual(args[1], ["-xOf", path.join(f.backup, "store.tar"), "./index.db"]);
+      assert.ok(scratch);
+      assert.deepEqual(args[1], ["-xOf", path.join(scratch, "store.tar"), "./index.db"]);
       assert.deepEqual(args[2]?.stdio, ["ignore", opened[0]!.fd, "pipe"]);
       child = Object.assign(new EventEmitter(), { stderr });
       const spawned = child;
       process.nextTick(() => {
         stderr.end("ordinary tar diagnostic");
+        emitted = failure;
         if (failure === "error") spawned.emit("error", new Error("injected"));
         else if (failure === "exit") spawned.emit("close", 1);
         else spawned.emit("close", null, "SIGTERM");
@@ -496,6 +499,7 @@ test("migration recovery record direct normalizes extraction failure and closes 
     assert.deepEqual(removed, [[scratch, { recursive: true, force: true }]]);
     assert.equal(existsSync(scratch), false);
     assert.equal(calls, 1);
+    assert.equal(emitted, failure);
     assert.deepEqual(
       opened.map(({ closes }) => closes),
       [1],

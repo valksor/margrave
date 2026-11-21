@@ -299,12 +299,25 @@ test("migration backup verifier reads the opened member after its path is replac
 
 test("migration backup verifier rejects FIFO members without reading them", async (t) => {
   const f = await fixture(t);
+  const dir = await lstat(f.backup, { bigint: true });
+  const verifier = path.resolve(import.meta.dirname, "../src/migration-backup.ts");
   for (const member of [f.manifestFile, f.archive]) {
     const saved = `${member}.saved`;
     await fs.rename(member, saved);
     await mkfifo(member);
     try {
-      await assert.rejects(withCatDeadline(verifyBackupFiles(f.backup)), { message: `invalid backup: ${f.backup}` });
+      assert.throws(
+        () =>
+          execFileSync(process.execPath, [verifier, "--internal-verify-backup", String(dir.dev), String(dir.ino), f.catalog, ""], {
+            cwd: f.backup,
+            env: { MARGRAVE_HOME: f.home },
+            timeout: 5000,
+            killSignal: "SIGKILL",
+            encoding: "utf8",
+            stdio: "pipe",
+          }),
+        { status: 1, signal: null, stderr: member === f.manifestFile ? /invalid manifest/u : /invalid archive/u },
+      );
     } finally {
       await rm(member);
       await fs.rename(saved, member);
