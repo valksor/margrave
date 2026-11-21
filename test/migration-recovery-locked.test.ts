@@ -11,7 +11,7 @@ import { WRITE_TIMEOUT_MS } from "../src/catalog.ts";
 import { backupMigrationStore, writeMigrationRecord } from "../src/migration-backup.ts";
 import { recoverMigrationRecord } from "../src/migration-recovery.ts";
 import { MargraveError, readLegacySources } from "../src/store-files.ts";
-import { copyLegacyStoreFixture, hostedUseHome, leaveHotJournal, realClose, realExec } from "./helpers.ts";
+import { assertDatabaseWriterAvailable, copyLegacyStoreFixture, hostedUseHome, leaveHotJournal, realClose, realExec } from "./helpers.ts";
 
 const nativeLstat = fs.lstat;
 const nativeOpen = fs.open;
@@ -45,15 +45,6 @@ function restoreMocks() {
   syncBuiltinESMExports();
 }
 
-function assertReleased(index: string) {
-  const contender = new DatabaseSync(index, { timeout: 0 });
-  try {
-    realExec.call(contender, "BEGIN IMMEDIATE");
-  } finally {
-    realClose.call(contender);
-  }
-}
-
 test("migration recovery locked direct returns a configured holder and releases it on close", async (t) => {
   const f = await fixture(t);
   await leaveHotJournal(f.index);
@@ -74,7 +65,7 @@ test("migration recovery locked direct returns a configured holder and releases 
     }
     realClose.call(holder);
     assert.equal(holder.isOpen, false);
-    assertReleased(f.index);
+    assertDatabaseWriterAvailable(f.index);
   } finally {
     if (holder?.isOpen) realClose.call(holder);
   }
@@ -145,7 +136,7 @@ test("migration recovery locked direct rejects each locked verification failure 
         const holder = holders.get(f.index);
         assert.ok(holder);
         assert.equal(holder.isOpen, false);
-        assertReleased(f.index);
+        assertDatabaseWriterAvailable(f.index);
       } finally {
         restoreMocks();
         const holder = holders.get(f.index);
@@ -208,7 +199,7 @@ test("migration recovery locked direct verifies a journal introduced after the l
         assert.ok(holder);
         assert.equal(holder.isOpen, false);
         await rm(f.journal, { force: true });
-        assertReleased(f.index);
+        assertDatabaseWriterAvailable(f.index);
       } finally {
         restoreMocks();
         const holder = holders.get(f.index);
@@ -256,7 +247,7 @@ test("migration recovery locked direct rejects a new journal when its earlier ha
     assert.ok(holder);
     assert.equal(holder.isOpen, false);
     await rm(f.journal, { force: true });
-    assertReleased(f.index);
+    assertDatabaseWriterAvailable(f.index);
   } finally {
     restoreMocks();
     const holder = holders.get(f.index);

@@ -682,6 +682,15 @@ export function assertWriterAvailable(home: string): void {
   realExec.call(db, "BEGIN IMMEDIATE");
 }
 
+export function assertDatabaseWriterAvailable(file: string): void {
+  const db = new DatabaseSync(file, { timeout: 0 });
+  try {
+    realExec.call(db, "BEGIN IMMEDIATE");
+  } finally {
+    realClose.call(db);
+  }
+}
+
 export function gitSourceRecord(id: string, spec = id, snapshot = `${"a".repeat(40)}-${"b".repeat(16)}`): SourceRecord {
   const [commit] = snapshot.split("-", 1);
   return { id, kind: "git", spec, url: "u", subpath: "", ref: null, commit: commit!, installedAt: "now", snapshot };

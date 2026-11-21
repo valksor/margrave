@@ -23,7 +23,7 @@ import {
   openLegacyCatalog,
   probeMigrationCatalog,
 } from "./catalog-legacy.ts";
-import { home, indexDbFile, lstatIfExists, MargraveError, readLegacySources, sourcesFile } from "./store-files.ts";
+import { home, indexDbFile, isRecord, lstatIfExists, MargraveError, readLegacySources, sourcesFile } from "./store-files.ts";
 import { recoverMigrationRecord } from "./migration-recovery.ts";
 
 async function openMigrationLegacy(state: "legacy" | "journal", journalHash?: string): Promise<{ db: DatabaseSync; version: number }> {
@@ -67,7 +67,7 @@ async function verifyMigrationContents(
       const records = legacy.db.prepare("SELECT id, record FROM sources").all() as { id: string; record: string }[];
       for (const row of records) {
         const record: unknown = JSON.parse(row.record);
-        if (typeof record === "object" && record !== null && Object.hasOwn(record, "selection"))
+        if (isRecord(record) && Object.hasOwn(record, "selection"))
           throw new MargraveError(
             `cannot upgrade source "${row.id}" because its source record, index, or files disagree. Restore a known-good backup or restore a verified lock into a new MARGRAVE_HOME. See Upgrading in the README.`,
           );
@@ -107,46 +107,47 @@ async function verifyMigrationContents(
       if (ids.has(rec.id)) throw conflict();
       ids.add(rec.id);
       if (rec.kind === "git") {
-        const parsed = parseSpec(rec.spec);
-        if (parsed.kind !== "git" || parsed.id !== rec.id || parsed.url !== rec.url || parsed.subpath !== rec.subpath) throw conflict();
+        const parsed: { kind: "git" | "local"; id?: string; url?: string; subpath?: string } = parseSpec(rec.spec);
+        if (parsed.id !== rec.id || parsed.url !== rec.url || parsed.subpath !== rec.subpath) throw conflict();
         const snapshot = gitDir(rec);
         const st = await lstat(snapshot);
         const expected = path.join(await realpath(home()), "snapshots", rec.id, rec.snapshot as string);
-        if (!st.isDirectory() || st.isSymbolicLink() || (await realpath(snapshot)) !== expected) throw conflict();
+        if (!st.isDirectory() || (await realpath(snapshot)) !== expected) throw conflict();
       }
       const scanned = await scanInstalledSource(rec, { log: () => {} });
       const indexed = rows.filter((row) => row.source === rec.id);
       if (indexed.length !== scanned.length) throw conflict();
       for (const entry of scanned) {
-        const row = indexed.find((item) => item.id === entry.id);
-        if (
-          row === undefined ||
-          row.revision !== entry.revision ||
-          row.manifest !== entry.manifest ||
-          row.name !== entry.name ||
-          row.description !== entry.description ||
-          row.frontmatter !== entry.frontmatter
-        )
-          throw conflict();
-        let indexedDir = row.dir;
-        if (rec.kind === "git" && version === 2) {
-          const marker = `${path.sep}snapshots${path.sep}${rec.id}${path.sep}${rec.snapshot}`;
-          const at = row.dir.lastIndexOf(marker);
-          if (!path.isAbsolute(row.dir) || at < 0) throw conflict();
-          const suffix = row.dir.slice(at + marker.length);
-          if (suffix !== "" && !suffix.startsWith(path.sep)) throw conflict();
-          indexedDir = suffix.slice(1);
-          if (path.normalize(indexedDir) !== (indexedDir || ".")) throw conflict();
-        }
-        if (indexedDir !== entry.dir) throw conflict();
-        paths.set(row.id, indexedDir);
+        const matches = indexed.some((row) => {
+          if (
+            row.id !== entry.id ||
+            row.revision !== entry.revision ||
+            row.manifest !== entry.manifest ||
+            row.name !== entry.name ||
+            row.description !== entry.description ||
+            row.frontmatter !== entry.frontmatter
+          )
+            return false;
+          let indexedDir = row.dir;
+          if (rec.kind === "git" && version === 2) {
+            const marker = `${path.sep}snapshots${path.sep}${rec.id}${path.sep}${rec.snapshot}`;
+            const at = row.dir.lastIndexOf(marker);
+            if (!path.isAbsolute(row.dir) || at < 0) return false;
+            const suffix = row.dir.slice(at + marker.length);
+            if (suffix !== "" && !suffix.startsWith(path.sep)) return false;
+            indexedDir = suffix.slice(1);
+          }
+          return indexedDir === entry.dir;
+        });
+        if (!matches) throw conflict();
+        paths.set(entry.id, entry.dir);
         entries.push(entry);
       }
     } catch {
       throw conflict();
     }
   }
-  if (rows.some((row) => !ids.has(row.source)) || paths.size !== rows.length)
+  if (rows.some((row) => !ids.has(row.source)))
     throw new MargraveError("cannot upgrade the v0.2.1 catalog: index contains an unknown source");
   return { version, sources, paths, entries };
 }
