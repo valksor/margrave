@@ -31,7 +31,8 @@ test("test preload isolates the default store and replacement child environments
       \`;
       const child = execFileSync(process.execPath, ["--input-type=module", "-e", childProbe], { env: replacement, encoding: "utf8" });
       const explicit = stdioTestEnv({ HOME: "wrong", USERPROFILE: "wrong", MARGRAVE_HOME: "fixture" });
-      const explicitChild = execFileSync(process.execPath, ["--input-type=module", "-e", childProbe], { env: explicit, encoding: "utf8" });
+      // Node can add coverage settings to the environment passed to execFileSync.
+      const explicitChild = execFileSync(process.execPath, ["--input-type=module", "-e", childProbe], { env: { ...explicit }, encoding: "utf8" });
       console.log(JSON.stringify({ privateHome, initial, fallback, replacement, child: JSON.parse(child), explicit, explicitChild: JSON.parse(explicitChild) }));
     `;
     const output = execFileSync(process.execPath, ["--import", "./test/isolate-store.ts", "--input-type=module", "-e", probe], {
