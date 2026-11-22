@@ -15,6 +15,7 @@ async function startServer(
   env: Record<string, string>,
   mockHandler = false,
   onStderr: (text: string) => void = () => {},
+  extraArgs: string[] = [],
 ): Promise<{ base: string; stop: (signal?: NodeJS.Signals) => Promise<void> }> {
   const child = spawn(
     process.execPath,
@@ -27,6 +28,7 @@ async function startServer(
       "--http",
       "--port",
       "0",
+      ...extraArgs,
     ],
     {
       cwd: ROOT,
@@ -163,7 +165,13 @@ test("HTTP CLI serves the catalog and enforces its boundary", async (t) => {
 });
 
 test("configured hosts replace loopback defaults", async (t) => {
-  const { base } = await startServer(t, { MARGRAVE_ALLOWED_HOSTS: " , EXAMPLE.test:443, ", MARGRAVE_ALLOWED_ORIGINS: "" });
+  const { base } = await startServer(
+    t,
+    { MARGRAVE_ALLOWED_HOSTS: " , EXAMPLE.test:443, ", MARGRAVE_ALLOWED_ORIGINS: "" },
+    false,
+    undefined,
+    ["--host", "0.0.0.0"],
+  );
   const port = Number(new URL(base).port);
   async function status(host: string): Promise<number> {
     return new Promise((resolve, reject) => {
@@ -177,6 +185,38 @@ test("configured hosts replace loopback defaults", async (t) => {
   }
   assert.equal(await status(`127.0.0.1:${port}`), 421);
   assert.equal(await status("example.TEST:443"), 405);
+});
+
+test("IPv6 loopback admits its default authority", async (t) => {
+  const { base } = await startServer(t, { MARGRAVE_ALLOWED_HOSTS: "", MARGRAVE_ALLOWED_ORIGINS: "" }, false, undefined, ["--host", "::1"]);
+  assert.match(base, /^http:\/\/\[::1\]:\d+$/u);
+  assert.equal((await fetch(`${base}/mcp`)).status, 405);
+  assert.equal((await fetch(`${base}/api/health`)).status, 200);
+});
+
+test("incomplete headers and bodies time out", async (t) => {
+  const { base } = await startServer(t, { MARGRAVE_ALLOWED_HOSTS: "", MARGRAVE_ALLOWED_ORIGINS: "" });
+  const port = Number(new URL(base).port);
+  const sockets = [connect(port, "127.0.0.1"), connect(port, "127.0.0.1")];
+  t.after(() => {
+    for (const socket of sockets) socket.destroy();
+  });
+  const responses = sockets.map(
+    (socket) =>
+      new Promise<string>((resolve, reject) => {
+        let response = "";
+        socket.setTimeout(20000, () => socket.destroy(new Error("request deadline timed out")));
+        socket.on("data", (chunk: Buffer) => {
+          response += chunk.toString();
+        });
+        socket.on("error", reject);
+        socket.on("close", () => resolve(response));
+      }),
+  );
+  sockets[0]!.write(`GET /mcp HTTP/1.1\r\nHost: localhost:${port}\r\n`);
+  sockets[1]!.write(`POST /mcp HTTP/1.1\r\nHost: localhost:${port}\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{`);
+  for (const response of await Promise.all(responses)) assert.match(response, /^HTTP\/1.1 408/u);
+  assert.equal((await fetch(`${base}/api/health`)).status, 200);
 });
 
 test("handler failures and bodyless responses stay contained", async (t) => {
