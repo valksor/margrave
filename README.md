@@ -80,6 +80,27 @@ The bundle, and so the Homebrew install, no longer has `dist/cli.js`. In this or
 1. Bundle only: point the old symlink at the new binary, from the directory you extracted the new bundle in: `ln -sf "$PWD/margrave/bin/margrave" ~/.local/bin/margrave`. Homebrew updates its own `margrave` command.
 2. Run `margrave wrap <agent>` again and apply its output. Old agent configs run `node .../dist/cli.js mcp`, which no longer exists. Bundle users: run it as `~/.local/bin/margrave wrap <agent>`, so the config keeps the symlink path and survives the next bundle upgrade; run by name, it prints the bundle's real location.
 
+### With Docker
+
+GitHub Container Registry publishes `ghcr.io/valksor/margrave:latest` and a `v<version>` tag for `linux/amd64` and `linux/arm64`. Use the versioned tag to pin a release. Sign in to GHCR with an account that has package read access if the package is private.
+
+```sh
+docker run --rm -v margrave:/home/margrave/.margrave ghcr.io/valksor/margrave:latest install vercel-labs/agent-skills
+```
+
+Use the same volume on later runs to keep the skill store. GitHub creates new GHCR packages as private. If an existing package denies workflow pushes, grant `valksor/margrave` Write under **Manage Actions access** in the package settings.
+
+The image points to the matching Debian source archives by digest. To retrieve the sources for a local image, use its tag or digest in place of `latest`.
+
+```sh
+image=ghcr.io/valksor/margrave:latest
+docker pull "$image"
+sources=$(docker image inspect "$image" --format '{{index .Config.Labels "io.github.valksor.margrave.debian-sources"}}')
+container=$(docker create "$sources" true)
+docker cp "$container:/debian-sources" ./debian-sources
+docker rm "$container"
+```
+
 ## 2. Install a skill source
 
 ```sh
