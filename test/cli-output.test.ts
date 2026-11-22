@@ -1,3 +1,4 @@
+import { FIND_GUIDANCE } from "../src/search.ts";
 import assert from "node:assert/strict";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -125,7 +126,7 @@ test("CLI output direct local sources and presentation contracts", async (t) => 
   assert.equal(Object.hasOwn(parsed, "suggestions"), false);
   const unexplained = await cli(["find", "React", "rendering", "--limit", "1", "--json"]);
   const { exact: _exact, recommended: _recommended, matchedTerms: _matchedTerms, ...unexplainedHit } = hit;
-  assert.deepEqual(unexplained, ok(json({ task: "React rendering", results: [unexplainedHit] })));
+  assert.deepEqual(unexplained, ok(json({ task: "React rendering", results: [unexplainedHit], guidance: FIND_GUIDANCE })));
   const preload = path.join(root, "load-reader.mjs");
   await writeFile(
     preload,
@@ -285,7 +286,7 @@ test("CLI output direct empty store", async (t) => {
   assert.deepEqual(await runCli(["check"], { home }), { code: 0, stdout: `${message}\n`, stderr: "" });
   assert.deepEqual(await runCli(["find", "React", "rendering", "--json"], { home, extra: { MARGRAVE_SKILLS_SH: "0" } }), {
     code: 0,
-    stdout: `${JSON.stringify({ task: "React rendering", results: [], message }, null, 2)}\n`,
+    stdout: `${JSON.stringify({ task: "React rendering", results: [], guidance: FIND_GUIDANCE, message }, null, 2)}\n`,
     stderr: "",
   });
 });

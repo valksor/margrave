@@ -17,7 +17,7 @@ import type { Context, FindText } from "./skills.ts";
 import { RequestError } from "./store.ts";
 import type { IndexEntry } from "./store.ts";
 import { checkId, migrateStore } from "./sources.ts";
-import { HOSTED_SUGGESTION_GUIDANCE, formatClarification, formatSuggestions, searchSkills } from "./search.ts";
+import { FIND_GUIDANCE, HOSTED_SUGGESTION_GUIDANCE, formatClarification, formatSuggestions, searchSkills } from "./search.ts";
 import { attachMargraveSkills } from "./mcp-skills.ts";
 
 export const SERVER_INSTRUCTIONS =
@@ -175,12 +175,8 @@ const FIND_OUTPUT_SCHEMA = z.object({
     }),
   ),
   suggestions: z.array(z.object({ id: z.string(), source: z.string() })),
-  clarification: z
-    .discriminatedUnion("kind", [
-      z.object({ kind: z.literal("framework"), question: z.string(), options: z.array(z.string()) }),
-      z.object({ kind: z.literal("refine"), question: z.string(), matchCount: z.number() }),
-    ])
-    .optional(),
+  guidance: z.string(),
+  clarification: z.object({ kind: z.literal("refine"), question: z.string(), matchCount: z.number() }).optional(),
 });
 
 function registerFind(server: McpServer, variant: Variant, allowedSources: ReadonlySet<string> | undefined, skillsSh: boolean): void {
@@ -221,10 +217,13 @@ function registerFind(server: McpServer, variant: Variant, allowedSources: Reado
               ? formatClarification(clarification, "mcp")
               : noSources
                 ? variant.noSources
-                : formatFind(hits, variant.findText)) + formatSuggestions(suggestions, !variant.showHostPaths),
+                : formatFind(hits, variant.findText)) +
+              formatSuggestions(suggestions, !variant.showHostPaths) +
+              `\n\n${FIND_GUIDANCE}`,
           ),
           structuredContent: {
             results: hits,
+            guidance: FIND_GUIDANCE,
             suggestions: suggestions.map(({ id, source }) => ({ id, source })),
             ...(clarification ? { clarification } : {}),
           },

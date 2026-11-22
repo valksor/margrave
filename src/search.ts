@@ -1,18 +1,16 @@
-import { MAX_LIMIT, clampLimit, queryTerms } from "./bm25.ts";
-import { classifyCandidates, findCandidates, loadContext, selectCandidates } from "./skills.ts";
+import { MAX_LIMIT, clampLimit } from "./bm25.ts";
+import { findSkillsWithCount, loadContext } from "./skills.ts";
 import type { Context, FindHit } from "./skills.ts";
 import type { SourceRecord } from "./store.ts";
 import { parseFrontmatter } from "./scan.ts";
 import type { ScanOutcome } from "./safety.ts";
-import { candidateFamilies, frameworkFamilies, frameworkOptions, frontendTask } from "./frontend.ts";
+export const FIND_GUIDANCE =
+  "If no returned skill or suggestion fits the task, check the project for more details. Ask the user a specific question if you need more information. Repeat the search with the new details.";
 
-export type Clarification =
-  { kind: "framework"; question: string; options: string[] } | { kind: "refine"; question: string; matchCount: number };
+export type Clarification = { kind: "refine"; question: string; matchCount: number };
 
 export function formatClarification(clarification: Clarification, frontend: "cli" | "mcp"): string {
-  if (clarification.kind === "framework")
-    return `${clarification.question}\nOptions: ${clarification.options.join(", ")}\nCheck the project for the framework. If the framework is unclear, ask the user. Repeat the skill search with the original task and the answer.`;
-  return `${clarification.question}\n${clarification.matchCount} installed skills match.\nUse details from the task or project. Ask the user if you need more details. Repeat the skill search with a specific goal, technology, or deliverable.\n${frontend === "cli" ? "Use --browse" : "Set browse to true"} to see ranked results for this task.`;
+  return `${clarification.question}\n${clarification.matchCount} installed skills match.\n${frontend === "cli" ? "Use --browse" : "Set browse to true"} to see ranked results for this task.`;
 }
 
 export interface Recommendation extends FindHit {
@@ -123,41 +121,13 @@ function searchInstalled(
   ctx: Context,
   { task, limit, explain, allowedSources, browse }: InstalledSearch,
 ): { hits: Recommendation[]; clarification?: Clarification } {
-  const named = frameworkFamilies(task);
-  const isFrontend = frontendTask(task);
-  const agnostic = isFrontend && named.length === 0 && /\bframework[\s-]+agnostic\b/iu.test(task);
-  let terms = queryTerms(agnostic ? task.replace(/\bframework[\s-]+agnostic\b/giu, "") : task);
-  let candidates = findCandidates(ctx.db, task, terms, allowedSources);
-  const exact = candidates.some((candidate) => candidate.exact);
-  if (exact && agnostic) {
-    terms = queryTerms(task);
-    candidates = findCandidates(ctx.db, task, terms, allowedSources);
-  }
-  if (!exact && (named.length === 1 || agnostic))
-    candidates = candidates.filter((candidate) => {
-      const match = candidateFamilies(candidate);
-      return match.length === 0 || (!agnostic && match.includes(named[0]!));
-    });
-  const classified = classifyCandidates(candidates, terms);
-  if (!exact && isFrontend && named.length === 0 && !agnostic) {
-    const options = frameworkOptions(classified, terms);
-    if (options.length >= 2)
-      return {
-        hits: [],
-        clarification: {
-          kind: "framework",
-          question: "Which frontend framework does the task use?",
-          options: [...options, "framework-agnostic"],
-        },
-      };
-  }
-  const recommended = classified.filter((candidate) => candidate.recommended);
-  if (!exact && !browse && recommended.length >= MAX_LIMIT)
+  const { hits, matchCount, exact } = findSkillsWithCount(ctx.db, task, limit, explain, allowedSources);
+  if (!exact && !browse && matchCount >= MAX_LIMIT)
     return {
       hits: [],
-      clarification: { kind: "refine", question: "What specific task should the skills cover?", matchCount: recommended.length },
+      clarification: { kind: "refine", question: "What specific task should the skills cover?", matchCount },
     };
-  return { hits: enrichRecommendations(ctx, selectCandidates(classified, limit, explain)) };
+  return { hits: enrichRecommendations(ctx, hits) };
 }
 
 export async function searchSkills(

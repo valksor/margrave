@@ -30,7 +30,7 @@ import {
 import type { Ctx } from "./sources.ts";
 import { MargraveError, RequestError, UsageError } from "./store.ts";
 import { wrap } from "./wrap.ts";
-import { formatClarification, formatSuggestions, searchSkills } from "./search.ts";
+import { FIND_GUIDANCE, formatClarification, formatSuggestions, searchSkills } from "./search.ts";
 
 const USAGE = `usage: margrave <command>
 
@@ -216,6 +216,7 @@ async function findCommand(rest: string[]): Promise<void> {
     json({
       task,
       results: hits,
+      guidance: FIND_GUIDANCE,
       ...(clarification ? { clarification } : {}),
       ...(noSources ? { message: NO_SOURCES_MESSAGE } : {}),
       ...(suggestions.length > 0 ? { suggestions } : {}),
@@ -223,7 +224,8 @@ async function findCommand(rest: string[]): Promise<void> {
   else
     out(
       (clarification ? formatClarification(clarification, "cli") : noSources ? NO_SOURCES_MESSAGE : formatFind(hits)) +
-        formatSuggestions(suggestions),
+        formatSuggestions(suggestions) +
+        `\n\n${FIND_GUIDANCE}`,
     );
   return;
 }

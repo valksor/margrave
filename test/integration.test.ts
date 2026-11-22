@@ -28,6 +28,7 @@ import { cp, mkdir, readFile, readlink, realpath, rename, rm, stat, writeFile } 
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { FIND_GUIDANCE } from "../src/search.ts";
 import type { Env, Run } from "./helpers.ts";
 
 test("a copied Git store loads its own snapshot while the original remains", async () => {
@@ -215,7 +216,7 @@ test("git source via file://: install, duplicate, find, load, update, remove", a
   const find = await mg(env, ["find", "optimize react rendering performance"]);
   assert.equal(find.code, 0, find.stderr);
   assert.match(find.stdout, new RegExp(`^1\\. ${id}/react-perf `, "u"));
-  assert.match(find.stdout, new RegExp(`load: margrave load ${id}/react-perf\\n$`, "u"));
+  assert.ok(find.stdout.endsWith(`load: margrave load ${id}/react-perf\n\n${FIND_GUIDANCE}\n`));
   const pg = JSON.parse((await mg(env, ["find", "tune postgresql indexes", "--json", "--limit", "1"])).stdout) as {
     results: { id: string }[];
   };
@@ -290,7 +291,7 @@ test("git source via file://: install, duplicate, find, load, update, remove", a
   assert.deepEqual(await names(path.join(env.home, "sources")), []);
   assert.equal((await snapshot(env.home)).sources?.trim(), "[]");
   const empty = await mg(env, ["find", "react"]);
-  assert.equal(empty.stdout.trim(), "no skill sources installed; run: margrave install <owner/repo|path>");
+  assert.equal(empty.stdout.trim(), `no skill sources installed; run: margrave install <owner/repo|path>\n\n${FIND_GUIDANCE}`);
 });
 
 test("a failed install leaves no staging, no store dir, and no sources.json change", async () => {
@@ -852,7 +853,7 @@ test("usage errors exit 2, unknown commands exit 2, and find/list say when no so
   assert.match(help.stdout, /usage: margrave/u);
 
   const msg = "no skill sources installed; run: margrave install <owner/repo|path>";
-  assert.equal((await mg(env, ["find", "x"])).stdout.trim(), msg);
+  assert.equal((await mg(env, ["find", "x"])).stdout.trim(), `${msg}\n\n${FIND_GUIDANCE}`);
   assert.equal((await mg(env, ["list"])).stdout.trim(), msg);
   assert.deepEqual(JSON.parse((await mg(env, ["list", "--json"])).stdout), { sources: [] });
   assert.equal((await mg(env, ["load", "x"])).code, 1);
@@ -879,7 +880,7 @@ test("with no sources: update, find --json, and list --skills say so", async () 
   assert.equal(upd.stdout.trim(), NO_SOURCES);
   const find = await mg(env, ["find", "anything", "--json"]);
   assert.equal(find.code, 0, find.stderr);
-  assert.deepEqual(JSON.parse(find.stdout), { task: "anything", results: [], message: NO_SOURCES });
+  assert.deepEqual(JSON.parse(find.stdout), { task: "anything", results: [], guidance: FIND_GUIDANCE, message: NO_SOURCES });
   assert.equal((await mg(env, ["list", "--skills"])).stdout.trim(), NO_SOURCES);
   assert.deepEqual(JSON.parse((await mg(env, ["list", "--json", "--skills"])).stdout), { sources: [], skills: [] });
   const revision = `sha256:${"a".repeat(64)}`;

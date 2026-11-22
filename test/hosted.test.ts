@@ -1,3 +1,4 @@
+import { FIND_GUIDANCE } from "../src/search.ts";
 import {
   call,
   connectHosted,
@@ -310,7 +311,10 @@ test("hosted: with no sources, find_skills answers and the other two tools fail,
   await assert.rejects(skills.get(missing));
   await assert.rejects(client.readResource({ uri: missing }));
   assert.equal(HOSTED_NO_SOURCES_MESSAGE, "no skills are installed on this server");
-  assert.deepEqual(await call(client, "find_skills", { task: "x" }), { isError: false, text: HOSTED_NO_SOURCES_MESSAGE });
+  assert.deepEqual(await call(client, "find_skills", { task: "x" }), {
+    isError: false,
+    text: `${HOSTED_NO_SOURCES_MESSAGE}\n\n${FIND_GUIDANCE}`,
+  });
   assert.deepEqual(await call(client, "load_skill", { id: "x" }), { isError: true, text: HOSTED_NO_SOURCES_MESSAGE });
   assert.deepEqual(await call(client, "read_skill_file", { id: "x", path: "SKILL.md" }), {
     isError: true,
@@ -389,13 +393,16 @@ test("hosted: find, load, read, and request errors, with no server path in any t
   await writeFile(path.join(skillDir, "references", "x.md"), "reference text\n");
   const lines = found.text.split("\n");
   assert.match(lines[0] ?? "", new RegExp(`^1\\. ${id} `, "u"));
-  assert.equal(lines.at(-1), `load: call load_skill with id ${id}`);
+  assert.equal(lines.at(-3), `load: call load_skill with id ${id}`);
   assert.deepEqual(await call(client, "find_skills", { task: "quantum chromodynamics" }), {
     isError: false,
-    text: "no match\ntry other words",
+    text: `no match\ntry other words\n\n${FIND_GUIDANCE}`,
   });
   const weakQuery = "repair a toaster with Terraform";
-  assert.deepEqual(await call(client, "find_skills", { task: weakQuery }), { isError: false, text: "no match\ntry other words" });
+  assert.deepEqual(await call(client, "find_skills", { task: weakQuery }), {
+    isError: false,
+    text: `no match\ntry other words\n\n${FIND_GUIDANCE}`,
+  });
   const weak = await call(client, "find_skills", { task: weakQuery, explain: true });
   assert.equal(weak.isError, false);
   assert.match(weak.text, /weak match/u);

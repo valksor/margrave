@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { formatSuggestions, searchSkills } from "../src/search.ts";
+import { FIND_GUIDANCE, formatSuggestions, searchSkills } from "../src/search.ts";
 import { handleHostedMcp } from "../src/hosted.ts";
 import { CLI, newEntry, runCli, seedIndex, stdioTestEnv, tmp, writeCatalogRecords } from "./helpers.ts";
 
@@ -403,6 +403,7 @@ test("CLI, stdio and hosted support catalog opt-in", async (t) => {
     nodeArgs,
   });
   assert.equal(enabled.code, 0, enabled.stderr);
+  assert.equal((JSON.parse(enabled.stdout) as { guidance: string }).guidance, FIND_GUIDANCE);
   assert.equal((JSON.parse(enabled.stdout) as { task: string }).task, "private-prompt-marker");
   assert.equal((JSON.parse(enabled.stdout) as { suggestions: { id: string }[] }).suggestions[0]?.id, "owner/repo/skill");
   const disabled = await runCli(["find", "private-prompt-marker", "--json", "--catalog-query", "terraform modules"], {
@@ -420,6 +421,7 @@ test("CLI, stdio and hosted support catalog opt-in", async (t) => {
   }
   assert.equal(await readFile(fetchLog, "utf8"), "fetch\n");
   const text = await runCli(["find", "private-prompt-marker", "--catalog-query", "terraform modules"], { home, extra, nodeArgs });
+  assert.equal(text.stdout.split(FIND_GUIDANCE).length - 1, 1);
   assert.match(
     text.stdout,
     /skills\.sh suggestions\n  https:\/\/skills\.sh\/owner\/repo\/skill\n  Manual install: margrave install owner\/repo/u,
@@ -444,6 +446,8 @@ test("CLI, stdio and hosted support catalog opt-in", async (t) => {
       name: "find_skills",
       arguments: { task: "private-prompt-marker", catalogQuery: "terraform modules" },
     });
+    assert.equal((result.structuredContent as { guidance: string }).guidance, FIND_GUIDANCE);
+    assert.equal((result.content as { text: string }[])[0]!.text.split(FIND_GUIDANCE).length - 1, 1);
     assert.match(JSON.stringify(result.content), /skills\.sh suggestions/u);
   } finally {
     await client.close();
@@ -473,6 +477,8 @@ test("CLI, stdio and hosted support catalog opt-in", async (t) => {
       arguments: { task: "private-prompt-marker", catalogQuery: "terraform modules" },
     });
     assert.equal(calls, 1);
+    assert.equal((result.structuredContent as { guidance: string }).guidance, FIND_GUIDANCE);
+    assert.equal((result.content as { text: string }[])[0]!.text.split(FIND_GUIDANCE).length - 1, 1);
     assert.match(JSON.stringify(result.content), /skills\.sh suggestions/u);
   } finally {
     await defaultHosted.close();

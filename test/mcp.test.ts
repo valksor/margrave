@@ -1,3 +1,4 @@
+import { FIND_GUIDANCE } from "../src/search.ts";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -67,14 +68,14 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   // no sources: find returns the hint text, not a tool error
   const noSources = await call(client, "find_skills", { task: "anything" });
   assert.equal(noSources.isError, false);
-  assert.equal(noSources.text, "no skill sources installed; run: margrave install <owner/repo|path>");
+  assert.equal(noSources.text, `no skill sources installed; run: margrave install <owner/repo|path>\n\n${FIND_GUIDANCE}`);
   // load_skill and read_skill_file with no sources are tool errors with the same hint
   for (const [tool, args] of [
     ["load_skill", { id: "anything" }],
     ["read_skill_file", { id: "anything", path: "SKILL.md" }],
   ] as const) {
     const r = await call(client, tool, args);
-    assert.deepEqual(r, { isError: true, text: noSources.text }, tool);
+    assert.deepEqual(r, { isError: true, text: "no skill sources installed; run: margrave install <owner/repo|path>" }, tool);
   }
 
   // install while the server runs: the server sees it without a restart
@@ -92,7 +93,7 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   assert.equal(found.isError, false);
   assert.match(found.text, new RegExp(`^1\\. ${id}/terraform-modules `, "u"));
   assert.match(found.text, /\n   revision: sha256:[0-9a-f]{64}\n/u);
-  assert.match(found.text, new RegExp(`load: margrave load ${id}/terraform-modules$`, "u"));
+  assert.match(found.text, new RegExp(`load: margrave load ${id}/terraform-modules\\n`, "u"));
 
   // no match: empty result plus a hint, not a tool error
   const none = await call(client, "find_skills", { task: "quantum chromodynamics" });
@@ -390,7 +391,7 @@ test("MCP in-process: load_skill and read_skill_file work, and every tool turns 
   const hint = "no skill sources installed; run: margrave install <owner/repo|path>";
 
   // No sources: load_skill and read_skill_file fail with the hint, find_skills answers with it.
-  assert.deepEqual(await call(client, "find_skills", { task: "x" }), { isError: false, text: hint });
+  assert.deepEqual(await call(client, "find_skills", { task: "x" }), { isError: false, text: `${hint}\n\n${FIND_GUIDANCE}` });
   assert.deepEqual(await call(client, "load_skill", { id: "x" }), { isError: true, text: hint });
   assert.deepEqual(await call(client, "read_skill_file", { id: "x", path: "SKILL.md" }), { isError: true, text: hint });
 

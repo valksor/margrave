@@ -195,8 +195,21 @@ export function findCandidates(db: DatabaseSync, task: string, terms: string[], 
 }
 
 export function findSkills(db: DatabaseSync, task: string, limit: unknown, explain = false, scope?: ReadonlySet<string>): FindHit[] {
+  return findSkillsWithCount(db, task, limit, explain, scope).hits;
+}
+
+export function findSkillsWithCount(
+  db: DatabaseSync,
+  task: string,
+  limit: unknown,
+  explain = false,
+  scope?: ReadonlySet<string>,
+): { hits: FindHit[]; matchCount: number; exact: boolean } {
   const terms = queryTerms(task);
-  return selectCandidates(classifyCandidates(findCandidates(db, task, terms, scope), terms), limit, explain);
+  const ranked = classifyCandidates(findCandidates(db, task, terms, scope), terms);
+  const matchCount = ranked.filter((hit) => hit.recommended).length;
+  const exact = ranked.some((hit) => hit.exact);
+  return { hits: selectCandidates(ranked, limit, explain), matchCount, exact };
 }
 
 export interface FindText {
