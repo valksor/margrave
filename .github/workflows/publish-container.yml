@@ -22,37 +22,47 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      actions: read
+      attestations: read
       contents: read
       packages: write
     steps:
-      - name: Checkout code
+      - name: Checkout publisher code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          # Use the Dockerfile revision that defines this publishing workflow.
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
+          fetch-depth: 0
 
-      - name: Download Linux bundles
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: bundle-linux-*
-          path: ${{ runner.temp }}/margrave-bundles
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ github.token }}
-
-      - name: Download bumped package
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: bumped-package
-          path: ${{ runner.temp }}/margrave-version
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ github.token }}
-
-      - name: Read release version
+      - name: Download and verify release bundles
         id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          version=$(jq -er '.version | select(type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' "$RUNNER_TEMP/margrave-version/package.json")
+          tags=()
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$(git rev-parse "$tag^{commit}^1")" == "$HEAD_SHA" ]]; then
+              tags+=("$tag")
+            fi
+          done < <(git tag --list 'v*')
+          if [[ ${#tags[@]} -ne 1 ]]; then
+            echo "Expected exactly one release tag for $HEAD_SHA; found ${#tags[@]}." >&2
+            exit 1
+          fi
+          tag=${tags[0]}
+          version=$(git show "$tag:package.json" | jq -er '.version | select(type == "string" and test("\\A[0-9]+\\.[0-9]+\\.[0-9]+\\z"))')
+          test "v$version" = "$tag"
+          mkdir -p "$RUNNER_TEMP/margrave-bundles"
+          for arch in x64 arm64; do
+            archive="margrave-v${version}-linux-${arch}.tar.gz"
+            gh release download "$tag" --repo "$REPOSITORY" --pattern "$archive" --dir "$RUNNER_TEMP/margrave-bundles"
+            gh attestation verify "$RUNNER_TEMP/margrave-bundles/$archive" --repo "$REPOSITORY" \
+              --signer-workflow "$REPOSITORY/.github/workflows/build.yml" \
+              --source-digest "$HEAD_SHA" --source-ref refs/heads/master
+          done
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Prepare build context
@@ -65,8 +75,8 @@ jobs:
           context="$RUNNER_TEMP/margrave-container-context"
           mkdir -p "$context"
           cp Dockerfile "$context/Dockerfile"
-          cp "$RUNNER_TEMP/margrave-bundles/bundle-linux-x64/margrave-v${VERSION}-linux-x64.tar.gz" "$context/margrave-amd64.tar.gz"
-          cp "$RUNNER_TEMP/margrave-bundles/bundle-linux-arm64/margrave-v${VERSION}-linux-arm64.tar.gz" "$context/margrave-arm64.tar.gz"
+          cp "$RUNNER_TEMP/margrave-bundles/margrave-v${VERSION}-linux-x64.tar.gz" "$context/margrave-amd64.tar.gz"
+          cp "$RUNNER_TEMP/margrave-bundles/margrave-v${VERSION}-linux-arm64.tar.gz" "$context/margrave-arm64.tar.gz"
           echo "path=$context" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
@@ -74,6 +84,7 @@ jobs:
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
         with:
           platforms: arm64
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -84,6 +95,55 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide latest promotion
+        id: latest
+        env:
+          IMAGE: ${{ steps.context.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if latest=$(docker buildx imagetools inspect "$IMAGE:latest" --raw 2>&1); then
+            latest_version=$(printf '%s' "$latest" | jq -er 'if ((.annotations // {}) | has("org.opencontainers.image.version")) then .annotations["org.opencontainers.image.version"] | select(type == "string" and test("\\A[0-9]+\\.[0-9]+\\.[0-9]+\\z")) else "__missing__" end')
+          elif [[ "$latest" == "ERROR: $IMAGE:latest: not found" ]]; then
+            echo 'promote=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            printf '%s\n' "$latest" >&2
+            exit 1
+          fi
+          if [[ "$latest_version" == '__missing__' ]]; then
+            latest_digest=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Manifest.Digest}}')
+            latest_version=''
+            while IFS= read -r tag; do
+              if digest=$(docker buildx imagetools inspect "$IMAGE:$tag" --format '{{.Manifest.Digest}}' 2>&1); then
+                if [[ "$digest" == "$latest_digest" ]]; then
+                  latest_version=${tag#v}
+                  break
+                fi
+              elif [[ "$digest" != "ERROR: $IMAGE:$tag: not found" ]]; then
+                printf '%s\n' "$digest" >&2
+                exit 1
+              fi
+            done < <(git tag --list 'v*' | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/' | sort -Vr)
+            if [[ -z "$latest_version" ]]; then
+              echo "Cannot identify the version of $IMAGE:latest. Its digest does not match a versioned release tag." >&2
+              exit 1
+            fi
+            if [[ "$latest_version" == "$VERSION" ]]; then
+              # Keep the version on latest before the runtime push replaces its matching tag.
+              docker buildx imagetools create --annotation "index:org.opencontainers.image.version=$latest_version" \
+                --tag "$IMAGE:latest" "$IMAGE@$latest_digest"
+              docker buildx imagetools inspect "$IMAGE:latest" --raw | jq -e --arg version "$latest_version" '.annotations["org.opencontainers.image.version"] == $version' > /dev/null
+            fi
+          fi
+          newest=$(printf '%s\n%s\n' "$VERSION" "$latest_version" | sort -V | tail -n 1)
+          if [[ "$newest" == "$VERSION" ]]; then
+            echo 'promote=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "Latest version $latest_version is newer than $VERSION. Leaving latest unchanged."
+            echo 'promote=false' >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Publish Debian sources
         id: sources
@@ -102,6 +162,8 @@ jobs:
         with:
           context: ${{ steps.context.outputs.path }}
           target: runtime
+          build-args: DEBIAN_SOURCES_IMAGE=${{ steps.context.outputs.image }}@${{ steps.sources.outputs.digest }}
+          annotations: index:org.opencontainers.image.version=${{ steps.version.outputs.version }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.context.outputs.image }}:v${{ steps.version.outputs.version }}
@@ -111,13 +173,11 @@ jobs:
 
       - name: Verify published images and update latest
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE: ${{ steps.context.outputs.image }}
           VERSION: ${{ steps.version.outputs.version }}
           SOURCE_DIGEST: ${{ steps.sources.outputs.digest }}
           RUNTIME_DIGEST: ${{ steps.runtime.outputs.digest }}
-          REPOSITORY: ${{ github.repository }}
-          REF_NAME: ${{ github.event.workflow_run.head_branch }}
+          PROMOTE: ${{ steps.latest.outputs.promote }}
         run: |
           set -euo pipefail
           for entry in "v${VERSION}-debian-sources=$SOURCE_DIGEST" "v${VERSION}=$RUNTIME_DIGEST"; do
@@ -126,11 +186,8 @@ jobs:
             test "$(docker buildx imagetools inspect "$IMAGE:$tag" --format '{{.Manifest.Digest}}')" = "$digest"
             docker buildx imagetools inspect "$IMAGE:$tag" --raw | jq -e '[.manifests[] | select(.platform.os == "linux") | .platform.architecture] | sort == ["amd64", "arm64"]' > /dev/null
           done
-          branch_version=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$REPOSITORY/contents/package.json?ref=$REF_NAME" | jq -er .version)
-          if [[ "$branch_version" == "$VERSION" ]]; then
+          if [[ "$PROMOTE" == 'true' ]]; then
             docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$RUNTIME_DIGEST"
             test "$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Manifest.Digest}}')" = "$RUNTIME_DIGEST"
             docker buildx imagetools inspect "$IMAGE:latest" --raw | jq -e '[.manifests[] | select(.platform.os == "linux") | .platform.architecture] | sort == ["amd64", "arm64"]' > /dev/null
-          else
-            echo "Branch version $branch_version differs from $VERSION; leaving latest unchanged."
           fi

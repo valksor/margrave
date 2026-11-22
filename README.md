@@ -82,7 +82,7 @@ The bundle, and so the Homebrew install, no longer has `dist/cli.js`. In this or
 
 ### With Docker
 
-GitHub Container Registry publishes `ghcr.io/valksor/margrave:latest` and a `v<version>` tag for `linux/amd64` and `linux/arm64`. Use the versioned tag to pin a release. Sign in to GHCR with an account that has package read access if the package is private.
+GitHub Container Registry publishes `ghcr.io/valksor/margrave:latest` and a `v<version>` tag for `linux/amd64` and `linux/arm64`. Use a version tag to select a release. Use an image digest to pin the exact image. Sign in to GHCR with an account that has package read access if the package is private.
 
 ```sh
 docker run --rm -v margrave:/home/margrave/.margrave ghcr.io/valksor/margrave:latest install vercel-labs/agent-skills
@@ -90,13 +90,13 @@ docker run --rm -v margrave:/home/margrave/.margrave ghcr.io/valksor/margrave:la
 
 Use the same volume on later runs to keep the skill store. GitHub creates new GHCR packages as private. If an existing package denies workflow pushes, grant `valksor/margrave` Write under **Manage Actions access** in the package settings.
 
-The image points to the matching Debian source archives by digest. To retrieve the sources for a local image, use its tag or digest in place of `latest`.
+The image points to the matching Debian source archives by digest. Set `image` to the local runtime image you want to inspect.
 
 ```sh
 image=ghcr.io/valksor/margrave:latest
-docker pull "$image"
+platform=$(docker image inspect "$image" --format '{{.Os}}/{{.Architecture}}')
 sources=$(docker image inspect "$image" --format '{{index .Config.Labels "io.github.valksor.margrave.debian-sources"}}')
-container=$(docker create "$sources" true)
+container=$(docker create --platform "$platform" "$sources" true)
 docker cp "$container:/debian-sources" ./debian-sources
 docker rm "$container"
 ```
