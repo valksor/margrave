@@ -590,6 +590,21 @@ test("hosted source options isolate requests on the same store", async (t) => {
     ids.push(/^installed (\S+)/u.exec(result.stdout)?.[1] ?? "");
   }
   const [first, second] = ids as [string, string];
+  class ScopedOptions {
+    get allowedSources() {
+      return [first];
+    }
+  }
+  const options = new ScopedOptions();
+  const inheritedClient = new Client({ name: "margrave-test", version: "0.0.0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  t.after(() => inheritedClient.close());
+  await inheritedClient.connect(
+    new StreamableHTTPClientTransport(new URL("http://test/mcp"), {
+      fetch: (url, init) => handleHostedMcp(new Request(url, init), options),
+    }),
+  );
+  assert.equal((await call(inheritedClient, "load_skill", { id: `${first}/shared` })).isError, false);
+  assert.equal((await call(inheritedClient, "load_skill", { id: `${second}/shared` })).isError, true);
   for (const scope of [undefined, [first, first, "missing"], [second], []]) {
     const client = await connectHosted(t, scope);
     const found = await call(client, "find_skills", {
