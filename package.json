@@ -1,6 +1,6 @@
 {
   "name": "margrave",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "On-demand skill router: one skill store, ranked search, load on demand.",
   "license": "BSD-3-Clause",
   "repository": {
