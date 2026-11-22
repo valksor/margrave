@@ -17,14 +17,14 @@ import type { Context, FindText } from "./skills.ts";
 import { RequestError } from "./store.ts";
 import type { IndexEntry } from "./store.ts";
 import { checkId, migrateStore } from "./sources.ts";
-import { HOSTED_SUGGESTION_GUIDANCE, formatSuggestions, searchSkills } from "./search.ts";
+import { HOSTED_SUGGESTION_GUIDANCE, formatClarification, formatSuggestions, searchSkills } from "./search.ts";
 import { attachMargraveSkills } from "./mcp-skills.ts";
 
 export const SERVER_INSTRUCTIONS =
   "This server gives access to installed skills that the agent does not load by default. Before a task in an unfamiliar domain, tool, or framework, call find_skills with the task in plain words. Call load_skill only for a recommended result. Call read_skill_file for a file that the skill names.";
 
 export const FIND_DESCRIPTION =
-  "Find recommended installed skills for a task in plain words. Use explain to see matching terms and weak matches. Use load_skill only for a recommended result.";
+  "Find recommended installed skills for a task in plain words. Use explain to see matching terms and weak matches. Use load_skill only for a recommended result. If the result contains a clarification question, repeat the search with more details. Set browse to true to skip the match count check.";
 export const LOAD_DESCRIPTION =
   "Load the instructions of one skill. Use an id from find_skills. Returns the skill text, its source, and its base directory.";
 export const READ_DESCRIPTION =
@@ -175,6 +175,12 @@ const FIND_OUTPUT_SCHEMA = z.object({
     }),
   ),
   suggestions: z.array(z.object({ id: z.string(), source: z.string() })),
+  clarification: z
+    .discriminatedUnion("kind", [
+      z.object({ kind: z.literal("framework"), question: z.string(), options: z.array(z.string()) }),
+      z.object({ kind: z.literal("refine"), question: z.string(), matchCount: z.number() }),
+    ])
+    .optional(),
 });
 
 function registerFind(server: McpServer, variant: Variant, allowedSources: ReadonlySet<string> | undefined, skillsSh: boolean): void {
@@ -193,18 +199,35 @@ function registerFind(server: McpServer, variant: Variant, allowedSources: Reado
         task: z.string(),
         limit: z.number().int().optional(),
         explain: z.boolean().optional(),
+        browse: z.boolean().optional(),
         catalogQuery: z.string().optional(),
       }),
       outputSchema: FIND_OUTPUT_SCHEMA,
     },
-    async ({ task, limit, explain, catalogQuery }) => {
+    async ({ task, limit, explain, catalogQuery, browse }) => {
       try {
-        const { hits, noSources, suggestions } = await searchSkills(task, limit, explain === true, skillsSh, allowedSources, catalogQuery);
+        const { hits, noSources, suggestions, clarification } = await searchSkills(
+          task,
+          limit,
+          explain === true,
+          skillsSh,
+          allowedSources,
+          catalogQuery,
+          browse,
+        );
         return {
           ...ok(
-            (noSources ? variant.noSources : formatFind(hits, variant.findText)) + formatSuggestions(suggestions, !variant.showHostPaths),
+            (clarification
+              ? formatClarification(clarification, "mcp")
+              : noSources
+                ? variant.noSources
+                : formatFind(hits, variant.findText)) + formatSuggestions(suggestions, !variant.showHostPaths),
           ),
-          structuredContent: { results: hits, suggestions: suggestions.map(({ id, source }) => ({ id, source })) },
+          structuredContent: {
+            results: hits,
+            suggestions: suggestions.map(({ id, source }) => ({ id, source })),
+            ...(clarification ? { clarification } : {}),
+          },
         };
       } catch (err) {
         return variant.fail(err);

@@ -119,12 +119,9 @@ const FIND_TAIL = `SELECT k.rowid, k.id, k.name, k.description, k.hash AS revisi
 FROM cand c JOIN skills k ON k.rowid = c.rowid
 WHERE (? IS NULL OR k.source IN (SELECT value FROM json_each(?)))`;
 
-function rankEvidence(
-  ranked: (FindHit & { exact: boolean; matchedTerms: MatchedTerms })[],
-  terms: string[],
-  limit: unknown,
-  explain: boolean,
-): FindHit[] {
+export type FindCandidate = FindHit & { exact: boolean; matchedTerms: MatchedTerms };
+
+export function classifyCandidates(ranked: FindCandidate[], terms: string[]): FindCandidate[] {
   const uniqueDescription =
     terms.length === 1 &&
     !ranked.some((hit) => hit.matchedTerms.name.length > 0) &&
@@ -132,6 +129,10 @@ function rankEvidence(
   for (const hit of ranked)
     hit.recommended =
       hit.exact || hasRecommendationEvidence(terms, hit.matchedTerms) || (uniqueDescription && hit.matchedTerms.description.length > 0);
+  return ranked;
+}
+
+export function selectCandidates(ranked: FindCandidate[], limit: unknown, explain: boolean): FindHit[] {
   const selected = [...ranked.filter((hit) => hit.recommended), ...(explain ? ranked.filter((hit) => !hit.recommended) : [])].slice(
     0,
     clampLimit(limit),
@@ -140,9 +141,8 @@ function rankEvidence(
 }
 
 /** BM25 over the FTS columns. An exact name or id match ranks first. Ties break by id in byte order. */
-export function findSkills(db: DatabaseSync, task: string, limit: unknown, explain = false, scope?: ReadonlySet<string>): FindHit[] {
+export function findCandidates(db: DatabaseSync, task: string, terms: string[], scope?: ReadonlySet<string>): FindCandidate[] {
   // The MATCH text comes only from tokenize() output, never from the raw task.
-  const terms = queryTerms(task);
   const q = task.trim().toLowerCase();
   const exact = [q, q, q, q, q, q];
   const scopeJson = scope === undefined ? null : JSON.stringify([...scope]);
@@ -191,7 +191,12 @@ export function findSkills(db: DatabaseSync, task: string, limit: unknown, expla
       hits.get(row.rowid)?.matchedTerms[row.col].push(row.term);
     }
   }
-  return rankEvidence([...hits.values()], terms, limit, explain);
+  return [...hits.values()];
+}
+
+export function findSkills(db: DatabaseSync, task: string, limit: unknown, explain = false, scope?: ReadonlySet<string>): FindHit[] {
+  const terms = queryTerms(task);
+  return selectCandidates(classifyCandidates(findCandidates(db, task, terms, scope), terms), limit, explain);
 }
 
 export interface FindText {

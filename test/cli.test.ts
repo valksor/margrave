@@ -15,7 +15,7 @@ const usage = `usage: margrave <command>
   lock restore <file>                         restore locked Git sources
   remove <source>                             remove a source (never deletes a local directory)
   list [--skills] [--json]                    list sources, and with --skills every skill
-  find "<task>" [--limit N] [--json] [--explain] [--catalog-query QUERY]  rank installed skills for a task
+  find "<task>" [--limit N] [--json] [--explain] [--browse] [--catalog-query QUERY]  rank installed skills for a task
   load <id> [--json] [--revision <hash>]      print one skill
   load <id> --file <path> [--revision <hash>] print one file inside a skill directory
   reindex                                     rescan all sources

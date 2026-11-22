@@ -50,7 +50,7 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   const desc = Object.fromEntries(tools.map((x) => [x.name, x.description]));
   assert.equal(
     desc["find_skills"],
-    "Find recommended installed skills for a task in plain words. Use explain to see matching terms and weak matches. Use load_skill only for a recommended result.",
+    "Find recommended installed skills for a task in plain words. Use explain to see matching terms and weak matches. Use load_skill only for a recommended result. If the result contains a clarification question, repeat the search with more details. Set browse to true to skip the match count check.",
   );
   assert.equal(
     desc["load_skill"],

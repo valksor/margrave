@@ -266,13 +266,23 @@ Limit: the baseline compares the flagged line, not the lines around it. A known 
 
 The `margrave mcp` tools are read-only. `install`, `update`, and `remove` are not exposed. It opens `index.db` on every call, so a new install shows up without a restart. After upgrading Margrave, restart running `margrave mcp` sessions.
 
-| Tool              | Input                                         | Result                                                                                                                                  |
-| ----------------- | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `find_skills`     | `task`, `limit?`, `explain?`, `catalogQuery?` | Recommended skill ids with descriptions. Set `explain` to show weak matches and matched terms. No match is an empty result with a hint. |
-| `load_skill`      | `id`, `revision?`                             | The same text as `margrave load`.                                                                                                       |
-| `read_skill_file` | `id`, `path`, `revision?`                     | One file, with the same guard as `--file`.                                                                                              |
+| Tool              | Input                                                    | Result                                                                                                                              |
+| ----------------- | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `find_skills`     | `task`, `limit?`, `explain?`, `browse?`, `catalogQuery?` | Recommended skill IDs with descriptions, or a question that asks for details. Set `explain` to show weak matches and matched terms. |
+| `load_skill`      | `id`, `revision?`                                        | The same text as `margrave load`.                                                                                                   |
+| `read_skill_file` | `id`, `path`, `revision?`                                | One file, with the same guard as `--file`.                                                                                          |
 
 Both MCP load tools verify file contents against the selected revision. The active indexed revision applies when the caller omits `revision`.
+
+### Clarify a broad search
+
+If relevant installed skills target multiple frontend frameworks, Margrave asks which framework the task uses. Check the project first. If the framework is unclear, ask the user. Repeat the search with the original task and the framework, such as `frontend work with Vue`. Use `frontend work framework-agnostic` for skills with no detected framework. Margrave recognizes Angular, React and Next.js, Svelte and SvelteKit, and Vue and Nuxt.
+
+If there are at least 25 recommended installed matches after source and framework filtering, Margrave asks for a more specific task. The count includes every recommendation before the result limit. The framework question takes priority. Exact skill names and IDs bypass both questions.
+
+MCP structured content and CLI JSON include a `clarification` field when Margrave asks a question. A framework question has `kind: "framework"`, `question`, and `options`. A count question has `kind: "refine"`, `question`, and `matchCount`. Both questions return an empty result list.
+
+To browse a broad list, set `browse: true` in MCP or pass `--browse` to `margrave find`. Browse mode skips the count question. The result limit and framework question still apply.
 
 Set `MARGRAVE_ALLOWED_SOURCES` for a stdio server to a comma-separated list of source IDs from `margrave list`. Leave the variable unset to serve all sources. Set it to an empty string to serve none.
 

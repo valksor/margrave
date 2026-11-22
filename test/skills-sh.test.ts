@@ -504,7 +504,8 @@ test("CLI, stdio and hosted support catalog opt-in", async (t) => {
       const output = JSON.stringify(result.content);
       assert.equal(output.includes("skills.sh suggestions"), enabledHosted);
       if (enabledHosted) {
-        assert.ok(output.includes("https://skills.sh/owner/repo/skill"));
+        const content = result.content as { text: string }[];
+        assert.ok(content.some(({ text: blockText }) => blockText.split("\n").includes("  https://skills.sh/owner/repo/skill")));
         assert.ok(output.includes(hostedGuidance));
         assert.doesNotMatch(output, /margrave (?:install|update)/u);
       }
