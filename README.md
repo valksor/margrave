@@ -354,7 +354,7 @@ A non-loopback bind requires `MARGRAVE_ALLOWED_HOSTS`. Set it to a comma-separat
 
 Use `GET /skills.json` for the catalog and `HEAD /skills.json` for its response headers. Both methods use the same Host and Origin checks as `/mcp`. Catalog IDs for `file://` Git sources include sanitized path components.
 
-For remote use, keep the listener private behind a reverse proxy. Configure TLS, client access, and rate limits at the proxy. Require authentication for `/mcp` and both methods on `/skills.json`. Grant catalog access only to callers authorized to see the entire store. A source-scoped MCP grant does not authorize catalog access.
+For remote use, keep the listener private behind a reverse proxy. Configure TLS, client access, and rate limits at the proxy. Require authentication for `/mcp` and apply its proxy access rules to both methods on `/skills.json`. Grant catalog access only to callers authorized to see the entire store. A source-scoped MCP grant does not authorize catalog access. Set a low concurrency limit for the catalog at the proxy. Browser clients must use a same-origin deployment or have CORS and preflight handling configured at the proxy for `/skills.json`.
 
 #### Custom Node host
 
@@ -389,6 +389,8 @@ The compatibility link at `sources/<id>` points to the active Git snapshot. A wr
 To reclaim space, stop all Margrave readers and writers. Use `margrave list --json` to identify the active snapshot for each Git source. Remove only retired snapshot directories that no active source record references. Keep the active catalog and its referenced snapshots together. Take a complete store backup before removing retired snapshots.
 
 ## Upgrading
+
+`margrave list --skills --json` now returns source summaries in place of full source records. If you need the old fields, read the full records with `margrave list --json` and join them to skills by `sources[].id` and `skills[].source`.
 
 Install the new CLI. The first local command that uses the store or the first stdio MCP startup backs up a supported older store and upgrades it automatically. To upgrade at a scheduled time, run `margrave migrate` with the store's original `MARGRAVE_HOME`. Margrave prints the backup directory to stderr after a successful upgrade.
 

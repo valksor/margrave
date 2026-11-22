@@ -11,6 +11,7 @@ import {
   call,
   catalogSetup,
   cliSnapshot,
+  copyLegacyStoreFixture,
   head,
   makeRepo,
   NO_VENDORED_PRELOAD,
@@ -22,6 +23,15 @@ import {
 } from "./helpers.ts";
 
 const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+
+async function raw(port: number, text: string): Promise<string> {
+  const socket = connect(port, "127.0.0.1");
+  socket.setTimeout(5000, () => socket.destroy());
+  socket.write(text);
+  let result = "";
+  for await (const chunk of socket) result += chunk.toString();
+  return result;
+}
 
 async function startServer(
   t: { after: (fn: () => Promise<void>) => void },
@@ -125,6 +135,8 @@ test("HTTP skill catalog matches CLI output and checks access", async (t) => {
   const cli = await mg(["list", "--skills", "--json"]);
   assert.equal(cli.code, 0, cli.stderr);
   const before = await cliSnapshot(home);
+  const inventory = await readdir(home);
+  const bytes = await readFile(path.join(home, "index.db"));
   const { base } = await startServer(t, {
     MARGRAVE_HOME: home,
     PATH: `${fakeBin}:${process.env["PATH"]}`,
@@ -145,39 +157,50 @@ test("HTTP skill catalog matches CLI output and checks access", async (t) => {
   assert.equal(headResponse.status, 200);
   for (const name of ["content-type", "content-length", "cache-control"])
     assert.equal(headResponse.headers.get(name), response.headers.get(name));
-  assert.equal(await headResponse.text(), "");
+  const port = Number(new URL(base).port);
+  const rawHead = await raw(port, `HEAD /skills.json HTTP/1.1\r\nHost: localhost:${port}\r\nConnection: close\r\n\r\n`);
+  assert.match(rawHead, /^HTTP\/1.1 200 /u);
+  assert.ok(rawHead.includes("\r\n\r\n"));
+  assert.equal(rawHead.slice(rawHead.indexOf("\r\n\r\n") + 4), "");
   assert.deepEqual(await cliSnapshot(home), before);
-  const badHost = await new Promise<number>((resolve, reject) => {
-    const req = request(`${base}/skills.json`, { headers: { host: "bad" } }, (res) => {
-      res.resume();
-      resolve(res.statusCode!);
-    });
-    req.on("error", reject);
-    req.end();
-  });
-  assert.equal(badHost, 421);
-  assert.equal((await fetch(`${base}/skills.json`, { headers: { origin: "https://bad.test" } })).status, 403);
+  assert.deepEqual(await readdir(home), inventory);
+  assert.deepEqual(await readFile(path.join(home, "index.db")), bytes);
   const method = await fetch(`${base}/skills.json`, { method: "POST" });
   assert.equal(method.status, 405);
   assert.equal(method.headers.get("allow"), "GET, HEAD");
 });
 
-test("HTTP skill catalog distinguishes empty and invalid stores", async (t) => {
+test("HTTP skill catalog distinguishes empty, invalid, and legacy stores", async (t) => {
   const root = await tmp("mg-http-stores-");
   t.after(() => rm(root, { recursive: true, force: true }));
-  for (const invalid of [false, true]) {
-    const home = path.join(root, invalid ? "invalid" : "empty");
+  for (const store of ["empty", "invalid", "legacy"] as const) {
+    const home = path.join(root, store);
     await mkdir(home);
-    if (invalid) await writeFile(path.join(home, "index.db"), "not a database");
+    if (store === "invalid") await writeFile(path.join(home, "index.db"), "not a database");
+    if (store === "legacy") await copyLegacyStoreFixture(home);
     const inventory = await readdir(home);
-    const bytes = invalid ? await readFile(path.join(home, "index.db")) : null;
+    const bytes = store === "empty" ? null : await readFile(path.join(home, "index.db"));
+    const sources = store === "legacy" ? await readFile(path.join(home, "sources.json")) : null;
     const { base } = await startServer(t, { MARGRAVE_HOME: home, MARGRAVE_ALLOWED_HOSTS: "", MARGRAVE_ALLOWED_ORIGINS: "" });
+    if (store === "invalid") {
+      const port = Number(new URL(base).port);
+      for (const method of ["GET", "HEAD"]) {
+        for (const [requestHeaders, status] of [
+          ["Host: bad", 421],
+          [`Host: localhost:${port}\r\nOrigin: https://bad.test`, 403],
+        ] as const) {
+          const result = await raw(port, `${method} /skills.json HTTP/1.1\r\n${requestHeaders}\r\nConnection: close\r\n\r\n`);
+          assert.match(result, new RegExp(`^HTTP/1\\.1 ${status} `));
+        }
+      }
+    }
     const response = await fetch(`${base}/skills.json`);
-    assert.equal(response.status, invalid ? 500 : 200);
-    if (invalid) assert.equal(await response.text(), "");
+    assert.equal(response.status, store === "empty" ? 200 : 500);
+    if (store !== "empty") assert.equal(await response.text(), "");
     else assert.deepEqual(await response.json(), { sources: [], skills: [] });
     assert.deepEqual(await readdir(home), inventory);
-    if (invalid) assert.deepEqual(await readFile(path.join(home, "index.db")), bytes);
+    if (store !== "empty") assert.deepEqual(await readFile(path.join(home, "index.db")), bytes);
+    if (store === "legacy") assert.deepEqual(await readFile(path.join(home, "sources.json")), sources);
   }
 });
 
@@ -246,23 +269,18 @@ test("HTTP CLI serves the catalog and enforces its boundary", async (t) => {
   assert.equal((await fetch(`${base}/mcp`)).headers.get("allow"), "POST");
   assert.equal((await fetch(`${base}/mcp`, { headers: { origin: "https://bad.test" } })).status, 403);
   assert.equal((await fetch(`${base}/mcp`, { headers: { origin: "https://example.test" } })).status, 405);
-  const raw = async (text: string): Promise<string> => {
-    const socket = connect(port, "127.0.0.1");
-    socket.setTimeout(5000, () => socket.destroy());
-    socket.write(text);
-    let result = "";
-    for await (const chunk of socket) result += chunk.toString();
-    return result;
-  };
   for (const [extra, status] of [
     ["Host: bad", 421],
     [`Host: localhost:${port}\r\nHost: localhost:${port}`, 421],
     [`Host: localhost:${port}\r\nOrigin: https://example.test\r\nOrigin: https://example.test`, 403],
     ["", 421],
   ]) {
-    assert.match(await raw(`GET /mcp HTTP/1.1\r\n${extra}\r\nConnection: close\r\n\r\n`), new RegExp(`^HTTP/1.1 ${status}`));
+    assert.match(await raw(port, `GET /mcp HTTP/1.1\r\n${extra}\r\nConnection: close\r\n\r\n`), new RegExp(`^HTTP/1.1 ${status}`));
   }
-  assert.match(await raw("POST /mcp HTTP/1.1\r\nHost: bad\r\nContent-Length: 100\r\n\r\n{"), /^HTTP\/1.1 421[\s\S]*connection: close/iu);
+  assert.match(
+    await raw(port, "POST /mcp HTTP/1.1\r\nHost: bad\r\nContent-Length: 100\r\n\r\n{"),
+    /^HTTP\/1.1 421[\s\S]*connection: close/iu,
+  );
   const client = new Client({ name: "test", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`)));
   t.after(() => client.close());
