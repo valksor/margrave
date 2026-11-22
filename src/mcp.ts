@@ -17,7 +17,7 @@ import type { Context, FindText } from "./skills.ts";
 import { RequestError } from "./store.ts";
 import type { IndexEntry } from "./store.ts";
 import { checkId, migrateStore } from "./sources.ts";
-import { formatSuggestions, searchSkills } from "./search.ts";
+import { HOSTED_SUGGESTION_GUIDANCE, formatSuggestions, searchSkills } from "./search.ts";
 import { attachMargraveSkills } from "./mcp-skills.ts";
 
 export const SERVER_INSTRUCTIONS =
@@ -184,7 +184,10 @@ function registerFind(server: McpServer, variant: Variant, allowedSources: Reado
       description:
         FIND_DESCRIPTION +
         (skillsSh
-          ? " Supply catalogQuery with a short capability description to request public suggestions after a local miss. Do not include task details. Offer catalog suggestions to the user. Wait for an explicit request before installation."
+          ? " Supply catalogQuery with a short capability description to request public suggestions after a local miss. Do not include task details. " +
+            (variant.showHostPaths
+              ? "Offer catalog suggestions to the user. Wait for an explicit request before installation."
+              : HOSTED_SUGGESTION_GUIDANCE)
           : ""),
       inputSchema: z.object({
         task: z.string(),
