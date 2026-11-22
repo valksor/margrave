@@ -275,7 +275,28 @@ jobs:
 
           MARGRAVE_HOME="$RUNNER_TEMP/home-vendored" "$BUNDLE/bin/margrave" serve --http --port 0 > "$RUNNER_TEMP/http-listen.txt" 2> "$RUNNER_TEMP/http-error.txt" &
           HTTP_PID=$!
-          trap 'kill "$HTTP_PID" 2>/dev/null || true; wait "$HTTP_PID" 2>/dev/null || true' EXIT
+          stop_http() {
+            if ! kill -TERM "$HTTP_PID" 2>/dev/null; then
+              wait "$HTTP_PID" 2>/dev/null || true
+              echo "::error::HTTP server exited before shutdown"
+              return 1
+            fi
+            for _ in {1..100}; do
+              if ! kill -0 "$HTTP_PID" 2>/dev/null; then
+                if ! wait "$HTTP_PID"; then
+                  echo "::error::HTTP server exited unsuccessfully"
+                  return 1
+                fi
+                return 0
+              fi
+              sleep 0.1
+            done
+            kill -KILL "$HTTP_PID" 2>/dev/null || true
+            wait "$HTTP_PID" 2>/dev/null || true
+            echo "::error::HTTP server did not stop after SIGTERM"
+            return 1
+          }
+          trap 'stop_http || true' EXIT
           for _ in {1..100}; do
             if [[ -s "$RUNNER_TEMP/http-listen.txt" ]]; then break; fi
             if ! kill -0 "$HTTP_PID" 2>/dev/null; then cat "$RUNNER_TEMP/http-error.txt"; exit 1; fi
@@ -288,9 +309,8 @@ jobs:
             curl --noproxy '*' --max-time 5 --fail --silent --http1.1 -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: server/discover' --data-binary @- "$HTTP_URL/mcp" > "$RUNNER_TEMP/http-mcp.json"
           # shellcheck disable=SC2016
           "$JQ" -e --arg v "$VERSION" '.result._meta["io.modelcontextprotocol/serverInfo"].version == $v' "$RUNNER_TEMP/http-mcp.json" > /dev/null
-          kill "$HTTP_PID"
-          wait "$HTTP_PID" || true
           trap - EXIT
+          stop_http
 
           # execArgvExtension is none, so the binary ignores NODE_OPTIONS and
           # cannot be used as a general JS launcher. A node would refuse this
