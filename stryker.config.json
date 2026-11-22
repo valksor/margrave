@@ -20,7 +20,7 @@
     "!/test/fixtures/store-v0.2.1",
     "/test/fixtures/store-v0.2.1/store/sources"
   ],
-  "concurrency": 2,
+  "concurrency": 4,
   "thresholds": { "high": 100, "low": 100, "break": 100 },
   "reporters": ["clear-text", "progress", "html"],
   "htmlReporter": {
