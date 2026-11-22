@@ -273,6 +273,25 @@ jobs:
             exit 1
           fi
 
+          MARGRAVE_HOME="$RUNNER_TEMP/home-vendored" "$BUNDLE/bin/margrave" serve --http --port 0 > "$RUNNER_TEMP/http-listen.txt" 2> "$RUNNER_TEMP/http-error.txt" &
+          HTTP_PID=$!
+          trap 'kill "$HTTP_PID" 2>/dev/null || true; wait "$HTTP_PID" 2>/dev/null || true' EXIT
+          for _ in {1..100}; do
+            if [[ -s "$RUNNER_TEMP/http-listen.txt" ]]; then break; fi
+            if ! kill -0 "$HTTP_PID" 2>/dev/null; then cat "$RUNNER_TEMP/http-error.txt"; exit 1; fi
+            sleep 0.1
+          done
+          HTTP_URL=$(sed -n 's/^margrave HTTP listening on //p' "$RUNNER_TEMP/http-listen.txt")
+          if [[ -z "$HTTP_URL" ]]; then echo "::error::HTTP server did not become ready"; exit 1; fi
+          curl --noproxy '*' --max-time 5 --fail --silent "$HTTP_URL/api/health" | "$JQ" -e '.status == "ok"' > /dev/null
+          printf '%s' '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"smoke","version":"0"},"io.modelcontextprotocol/clientCapabilities":{}}}}' |
+            curl --noproxy '*' --max-time 5 --fail --silent --http1.1 -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: server/discover' --data-binary @- "$HTTP_URL/mcp" > "$RUNNER_TEMP/http-mcp.json"
+          # shellcheck disable=SC2016
+          "$JQ" -e --arg v "$VERSION" '.result._meta["io.modelcontextprotocol/serverInfo"].version == $v' "$RUNNER_TEMP/http-mcp.json" > /dev/null
+          kill "$HTTP_PID"
+          wait "$HTTP_PID" || true
+          trap - EXIT
+
           # execArgvExtension is none, so the binary ignores NODE_OPTIONS and
           # cannot be used as a general JS launcher. A node would refuse this
           # unknown flag. (No file path here: knip would read a --require path

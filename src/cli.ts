@@ -2,6 +2,8 @@
 // margrave CLI. Exit codes: 0 ok, 1 error, 2 usage.
 import { parseArgs } from "node:util";
 import { isSea } from "node:sea";
+import { isIP } from "node:net";
+import { serveHttp } from "./serve.ts";
 import { verifyBackupChild } from "./migration-backup.ts";
 import { exportLock, readLock, restoreLock } from "./lock.ts";
 import { runMcp, version } from "./mcp.ts";
@@ -47,6 +49,7 @@ const USAGE = `usage: margrave <command>
   reindex                                     rescan all sources
   migrate                                    upgrade the skill catalog
   mcp                                         run the stdio MCP server
+  serve --http [--host IP] [--port N]         run the HTTP MCP server
   wrap <claude|codex|bb|generic>              print setup text for an agent
   version                                     print the version
 `;
@@ -259,6 +262,17 @@ async function loadCommand(rest: string[]): Promise<void> {
   return;
 }
 
+async function serveCommand(rest: string[]): Promise<void> {
+  const p = parse(rest, { http: { type: "boolean" }, host: { type: "string" }, port: { type: "string" } });
+  positionals(p, 0, 0, "serve --http [--host IP] [--port N]");
+  if (p.values["http"] !== true) throw new UsageError("expected serve --http [--host IP] [--port N]");
+  const host = (p.values["host"] as string | undefined) ?? "127.0.0.1";
+  const port = (p.values["port"] as string | undefined) ?? "8080";
+  if (host.includes("%") || isIP(host) === 0) throw new UsageError("--host must be an IP address");
+  if (!/^\d+$/u.test(port) || Number(port) > 65535) throw new UsageError("--port must be an integer from 0 to 65535");
+  await serveHttp(host, Number(port));
+}
+
 async function run(argv: string[]): Promise<void> {
   const [command, ...rest] = argv;
   if (command === undefined) throw new UsageError("missing command");
@@ -321,6 +335,8 @@ async function run(argv: string[]): Promise<void> {
       await runMcp();
       return;
     }
+    case "serve":
+      return serveCommand(rest);
     case "wrap": {
       const p = parse(rest, {});
       const [agent] = positionals(p, 1, 1, "wrap <claude|codex|bb|generic>");

@@ -21,6 +21,7 @@ const usage = `usage: margrave <command>
   reindex                                     rescan all sources
   migrate                                    upgrade the skill catalog
   mcp                                         run the stdio MCP server
+  serve --http [--host IP] [--port N]         run the HTTP MCP server
   wrap <claude|codex|bb|generic>              print setup text for an agent
   version                                     print the version
 `;
@@ -219,4 +220,22 @@ syncBuiltinESMExports();
     stdout: expected,
     stderr: "",
   });
+});
+
+test("serve argument errors", async (t) => {
+  const home = await tmp("mg-serve-cli-");
+  t.after(() => rm(home, { recursive: true, force: true }));
+  for (const [args, message] of [
+    [["serve"], "expected serve --http [--host IP] [--port N]"],
+    [["serve", "--http", "extra"], "expected serve --http [--host IP] [--port N]"],
+    [["serve", "--http", "--host", "localhost"], "--host must be an IP address"],
+    [["serve", "--http", "--host", "fe80::1%lo0"], "--host must be an IP address"],
+    [["serve", "--http", "--host", "::ffff:0.127.0.1"], "MARGRAVE_ALLOWED_HOSTS is required for a non-loopback bind"],
+    ...["-1", "65536", "1.5", ""].map((port): [string[], string] => [
+      ["serve", "--http", `--port=${port}`],
+      "--port must be an integer from 0 to 65535",
+    ]),
+    [["serve", "--http", "--host", "0.0.0.0"], "MARGRAVE_ALLOWED_HOSTS is required for a non-loopback bind"],
+  ] as [string[], string][])
+    assert.deepEqual(await runCli(args, { home, extra: { MARGRAVE_ALLOWED_HOSTS: "" } }), usageError(message));
 });

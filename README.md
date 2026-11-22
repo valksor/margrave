@@ -294,7 +294,7 @@ The hosted extension lists skills whose manifest files fit the hosted read limit
 
 Structured search results include the source ID, skill revision, commit, declared license, scan verdict, and override status. Older revisions can have unknown scan provenance. Hosted recommendation metadata omits installation URLs and server paths.
 
-`import { handleHostedMcp } from "margrave/hosted"` gives a `(Request, options?) => Promise<Response>` handler for MCP Streamable HTTP. margrave starts no server. The host app mounts the handler on one route.
+`import { handleHostedMcp } from "margrave/hosted"` gives a `(Request, options?) => Promise<Response>` handler for MCP Streamable HTTP. A host app mounts the handler on one route.
 
 Pass `{ allowedSources: ["owner__repo"] }` as the second argument to `handleHostedMcp` to scope a hosted request. An empty array serves no sources. The hosted application chooses this option in trusted server code.
 
@@ -315,42 +315,27 @@ A remote client sees these differences:
 
 By default, the handler serves every skill in the store, including any installed with `--allow-unsafe`. Skill ids carry the source id (see [Ids](#ids)), so a remote client sees the basename of a local source's directory, and the host and repository path of a git source (GitHub `owner/repo` with any subpath, `https://`, `git@`, and `file://` specs alike).
 
-margrave does no auth, TLS, CORS, Host/Origin checks, or rate limiting. The host app must do them. Do not expose the handler without auth.
+The package handler leaves authentication, TLS, CORS, Host and Origin checks, and rate limiting to its host app. Deploy the handler behind an authenticated endpoint.
 
-Example (Node, `node:http`):
+#### Standalone HTTP server
 
-The quick-start listener accepts connections on loopback. The [production integration example](examples/hosted-mcp.mjs) is designed for a private listener behind TLS termination. It authenticates each caller, selects the caller's allowed sources, and limits request sizes, rates, and concurrency before it calls MCP. Configure the proxy and the example with the exact public Host and allowed browser origins. Hosted skill reads accept files up to 1 MiB. The handler allows 10 seconds for an admitted request body. Configure header and response timeouts at the proxy.
+```sh
+margrave serve --http
+```
+
+The standalone release binary serves MCP at `http://127.0.0.1:8080/mcp` without a separate Node installation. Use `GET /api/health` to check that the listener is running. The server reads `MARGRAVE_HOME` and accepts a read-only store. Run `margrave migrate` separately when upgrading the catalog.
+
+Use `--host IP` and `--port N` to change the bind address and port. Port `0` selects an unused port. The server prints its address and port when it starts.
+
+A non-loopback bind requires `MARGRAVE_ALLOWED_HOSTS`. Set it to a comma-separated list of exact Host values, including any port sent by the proxy. The default accepts loopback Host values at the bound port. Set `MARGRAVE_ALLOWED_ORIGINS` to a comma-separated list of exact browser origins. Requests without an Origin header are allowed. With the default settings, requests with an Origin header are rejected.
+
+For remote use, keep the listener private behind a reverse proxy. Configure TLS, client access, and rate limits at the proxy.
+
+#### Custom Node host
+
+The [production integration example](examples/hosted-mcp.mjs) authenticates each caller, selects the caller's allowed sources, and limits request sizes, rates, and concurrency before it calls MCP. Configure the proxy and example with the exact public Host and allowed browser origins. Hosted skill reads accept files up to 1 MiB. The example allows 10 seconds for an admitted request body. Configure header and response timeouts at the proxy.
 
 Pass `handleHostedMcp` as the example's `handle` option. Supply bearer tokens from the host secret store and map each token to its allowed source IDs.
-
-```ts
-import { createServer } from "node:http";
-import { handleHostedMcp } from "margrave/hosted";
-
-createServer(async (incoming, outgoing) => {
-  try {
-    if (new URL(incoming.url ?? "/", "http://localhost").pathname !== "/mcp") {
-      outgoing.writeHead(404).end("not found");
-      return;
-    }
-    const headers = new Headers();
-    for (const [name, value] of Object.entries(incoming.headers)) {
-      if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(", ") : value);
-    }
-    const chunks: Buffer[] = [];
-    for await (const chunk of incoming) chunks.push(chunk as Buffer);
-    const method = incoming.method ?? "GET";
-    const body = method === "GET" || method === "HEAD" ? undefined : Buffer.concat(chunks);
-    const res = await handleHostedMcp(new Request("http://localhost/mcp", { method, headers, body }));
-    outgoing.writeHead(res.status, Object.fromEntries(res.headers));
-    outgoing.end(Buffer.from(await res.arrayBuffer()));
-  } catch (err) {
-    console.error(err);
-    if (!outgoing.headersSent) outgoing.writeHead(500);
-    outgoing.end();
-  }
-}).listen(8080, "127.0.0.1");
-```
 
 ## Ranking
 
