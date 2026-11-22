@@ -4,6 +4,7 @@ import { parseArgs } from "node:util";
 import { isSea } from "node:sea";
 import { isIP } from "node:net";
 import { serveHttp } from "./serve.ts";
+import { listSkillCatalog } from "./source-maintenance.ts";
 import { verifyBackupChild } from "./migration-backup.ts";
 import { exportLock, readLock, restoreLock } from "./lock.ts";
 import { runMcp, version } from "./mcp.ts";
@@ -174,14 +175,11 @@ async function listCommand(rest: string[]): Promise<void> {
   positionals(p, 0, 0, "list [--skills] [--json]");
   await migrateStore();
   const withSkills = p.values["skills"] === true;
-  const { sources, skills } = await listSources(withSkills);
   if (p.values["json"] === true) {
-    json({
-      sources,
-      ...(withSkills ? { skills: skills.map((s) => ({ id: s.id, name: s.name, description: s.description, source: s.source })) } : {}),
-    });
+    json(withSkills ? await listSkillCatalog() : { sources: (await listSources(false)).sources });
     return;
   }
+  const { sources, skills } = await listSources(withSkills);
   if (sources.length === 0) {
     out(NO_SOURCES_MESSAGE);
     return;

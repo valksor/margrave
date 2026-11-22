@@ -3,10 +3,23 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { request } from "node:http";
 import { connect } from "node:net";
-import { rm } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
 import test from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { call, catalogSetup, cliSnapshot, ROOT, runCli } from "./helpers.ts";
+import {
+  call,
+  catalogSetup,
+  cliSnapshot,
+  head,
+  makeRepo,
+  NO_VENDORED_PRELOAD,
+  ROOT,
+  runCli,
+  sourceId,
+  tmp,
+  writeSkill,
+} from "./helpers.ts";
 
 const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
 
@@ -15,11 +28,12 @@ async function startServer(
   env: Record<string, string>,
   mockHandler = false,
   onStderr: (text: string) => void = () => {},
-  extraArgs: string[] = [],
+  options: { extraArgs?: string[]; preload?: string } = {},
 ): Promise<{ base: string; stop: (signal?: NodeJS.Signals) => Promise<void> }> {
   const child = spawn(
     process.execPath,
     [
+      ...(options.preload ? ["--import", options.preload] : []),
       ...(mockHandler ? ["--import", "./test/serve-mock-preload.ts"] : []),
       "--import",
       "./test/no-vendored-ripwire.ts",
@@ -28,7 +42,7 @@ async function startServer(
       "--http",
       "--port",
       "0",
-      ...extraArgs,
+      ...(options.extraArgs ?? []),
     ],
     {
       cwd: ROOT,
@@ -73,6 +87,142 @@ async function startServer(
   assert.match(line, /^margrave HTTP listening on http:\/\//u);
   return { base: line.replace("margrave HTTP listening on ", ""), stop };
 }
+
+test("HTTP skill catalog matches CLI output and checks access", async (t) => {
+  const { home, fakeBin, dir, id, mg } = await catalogSetup();
+  const repo = await makeRepo();
+  t.after(async () => {
+    await Promise.all([home, fakeBin, dir, repo.dir].map((item) => rm(item, { recursive: true, force: true })));
+  });
+  await writeSkill(dir, "alpha", "Café catalog skill");
+  assert.equal((await mg(["update", id])).code, 0);
+  const installed = await mg(["install", repo.url, "--ref", "main"]);
+  assert.equal(installed.code, 0, installed.stderr);
+  const gitId = sourceId(installed);
+  const commit = await head(repo.dir);
+  const expected = {
+    sources: [
+      { id, kind: "local", ref: null, commit: null, skillCount: 1 },
+      { id: gitId, kind: "git", ref: "refs/heads/main", commit, skillCount: 3 },
+    ],
+    skills: [
+      { id: `${id}/alpha`, name: "alpha", description: "Café catalog skill", source: id },
+      {
+        id: `${gitId}/docker-compose`,
+        name: "docker-compose",
+        description: "Write Docker Compose files for local services",
+        source: gitId,
+      },
+      {
+        id: `${gitId}/postgres-tuning`,
+        name: "postgres-tuning",
+        description: "Tune PostgreSQL queries, indexes, and vacuum settings",
+        source: gitId,
+      },
+      { id: `${gitId}/react-perf`, name: "react-perf", description: "Optimize React rendering performance and bundle size", source: gitId },
+    ].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+  };
+  const cli = await mg(["list", "--skills", "--json"]);
+  assert.equal(cli.code, 0, cli.stderr);
+  const before = await cliSnapshot(home);
+  const { base } = await startServer(t, {
+    MARGRAVE_HOME: home,
+    PATH: `${fakeBin}:${process.env["PATH"]}`,
+    MARGRAVE_ALLOWED_HOSTS: "",
+    MARGRAVE_ALLOWED_ORIGINS: "https://example.test",
+  });
+  const response = await fetch(`${base}/skills.json`, { headers: { origin: "https://example.test" } });
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.deepEqual(JSON.parse(body), expected);
+  assert.deepEqual(JSON.parse(body), JSON.parse(cli.stdout));
+  assert.equal(body.includes(dir), false);
+  assert.equal(body.includes(repo.url), false);
+  assert.equal(response.headers.get("content-type"), "application/json");
+  assert.equal(response.headers.get("content-length"), String(Buffer.byteLength(body)));
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const headResponse = await fetch(`${base}/skills.json`, { method: "HEAD" });
+  assert.equal(headResponse.status, 200);
+  for (const name of ["content-type", "content-length", "cache-control"])
+    assert.equal(headResponse.headers.get(name), response.headers.get(name));
+  assert.equal(await headResponse.text(), "");
+  assert.deepEqual(await cliSnapshot(home), before);
+  const badHost = await new Promise<number>((resolve, reject) => {
+    const req = request(`${base}/skills.json`, { headers: { host: "bad" } }, (res) => {
+      res.resume();
+      resolve(res.statusCode!);
+    });
+    req.on("error", reject);
+    req.end();
+  });
+  assert.equal(badHost, 421);
+  assert.equal((await fetch(`${base}/skills.json`, { headers: { origin: "https://bad.test" } })).status, 403);
+  const method = await fetch(`${base}/skills.json`, { method: "POST" });
+  assert.equal(method.status, 405);
+  assert.equal(method.headers.get("allow"), "GET, HEAD");
+});
+
+test("HTTP skill catalog distinguishes empty and invalid stores", async (t) => {
+  const root = await tmp("mg-http-stores-");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const invalid of [false, true]) {
+    const home = path.join(root, invalid ? "invalid" : "empty");
+    await mkdir(home);
+    if (invalid) await writeFile(path.join(home, "index.db"), "not a database");
+    const inventory = await readdir(home);
+    const bytes = invalid ? await readFile(path.join(home, "index.db")) : null;
+    const { base } = await startServer(t, { MARGRAVE_HOME: home, MARGRAVE_ALLOWED_HOSTS: "", MARGRAVE_ALLOWED_ORIGINS: "" });
+    const response = await fetch(`${base}/skills.json`);
+    assert.equal(response.status, invalid ? 500 : 200);
+    if (invalid) assert.equal(await response.text(), "");
+    else assert.deepEqual(await response.json(), { sources: [], skills: [] });
+    assert.deepEqual(await readdir(home), inventory);
+    if (invalid) assert.deepEqual(await readFile(path.join(home, "index.db")), bytes);
+  }
+});
+
+test("HTTP skill catalog keeps one generation during publication", async (t) => {
+  const { home, fakeBin, dir, id } = await catalogSetup();
+  t.after(async () => {
+    await Promise.all([home, fakeBin, dir].map((item) => rm(item, { recursive: true, force: true })));
+  });
+  await writeSkill(dir, "beta", "beta skill");
+  const preload = path.join(dir, "publication-preload.mjs");
+  await writeFile(
+    preload,
+    `import { DatabaseSync } from "node:sqlite";
+import { spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+const prepare = DatabaseSync.prototype.prepare;
+let called = false;
+DatabaseSync.prototype.prepare = function (sql) {
+  if (!called && sql === "SELECT source, count(*) AS n FROM skills GROUP BY source") {
+    called = true;
+    DatabaseSync.prototype.prepare = prepare;
+    const result = spawnSync(process.execPath, ["--import", ${JSON.stringify(NO_VENDORED_PRELOAD)}, ${JSON.stringify(path.join(ROOT, "src/cli.ts"))}, "update", ${JSON.stringify(id)}], { cwd: ${JSON.stringify(ROOT)}, env: process.env, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+  }
+  return prepare.call(this, sql);
+};
+`,
+  );
+  const { base } = await startServer(
+    t,
+    { MARGRAVE_HOME: home, PATH: `${fakeBin}:${process.env["PATH"]}`, MARGRAVE_ALLOWED_HOSTS: "", MARGRAVE_ALLOWED_ORIGINS: "" },
+    false,
+    undefined,
+    { preload },
+  );
+  const source = { id, kind: "local", ref: null, commit: null, skillCount: 1 };
+  const alpha = { id: `${id}/alpha`, name: "alpha", description: "alpha skill for the guard tests", source: id };
+  const beta = { id: `${id}/beta`, name: "beta", description: "beta skill", source: id };
+  const first = await fetch(`${base}/skills.json`);
+  assert.equal(first.status, 200);
+  assert.deepEqual(await first.json(), { sources: [source], skills: [alpha] });
+  const second = await fetch(`${base}/skills.json`);
+  assert.equal(second.status, 200);
+  assert.deepEqual(await second.json(), { sources: [{ ...source, skillCount: 2 }], skills: [alpha, beta] });
+});
 
 test("HTTP CLI serves the catalog and enforces its boundary", async (t) => {
   const { home, fakeBin, dir, id } = await catalogSetup();
@@ -170,7 +320,7 @@ test("configured hosts replace loopback defaults", async (t) => {
     { MARGRAVE_ALLOWED_HOSTS: " , EXAMPLE.test:443, ", MARGRAVE_ALLOWED_ORIGINS: "" },
     false,
     undefined,
-    ["--host", "0.0.0.0"],
+    { extraArgs: ["--host", "0.0.0.0"] },
   );
   const port = Number(new URL(base).port);
   async function status(host: string): Promise<number> {
@@ -188,7 +338,9 @@ test("configured hosts replace loopback defaults", async (t) => {
 });
 
 test("IPv6 loopback admits its default authority", async (t) => {
-  const { base } = await startServer(t, { MARGRAVE_ALLOWED_HOSTS: "", MARGRAVE_ALLOWED_ORIGINS: "" }, false, undefined, ["--host", "::1"]);
+  const { base } = await startServer(t, { MARGRAVE_ALLOWED_HOSTS: "", MARGRAVE_ALLOWED_ORIGINS: "" }, false, undefined, {
+    extraArgs: ["--host", "::1"],
+  });
   assert.match(base, /^http:\/\/\[::1\]:\d+$/u);
   assert.equal((await fetch(`${base}/mcp`)).status, 405);
   assert.equal((await fetch(`${base}/api/health`)).status, 200);

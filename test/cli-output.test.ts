@@ -68,7 +68,18 @@ test("CLI output direct local sources and presentation contracts", async (t) => 
     ),
   );
   assert.deepEqual(await cli(["list", "--json"]), ok(json({ sources })));
-  assert.deepEqual(await cli(["list", "--skills", "--json"]), ok(json({ sources, skills: descriptors })));
+  assert.deepEqual(
+    await cli(["list", "--skills", "--json"]),
+    ok(
+      json({
+        sources: [
+          { id: a.id, kind: "local", ref: null, commit: null, skillCount: 2 },
+          { id: b.id, kind: "local", ref: null, commit: null, skillCount: 1 },
+        ],
+        skills: descriptors,
+      }),
+    ),
+  );
   assert.deepEqual(await cli(["check", a.id]), ok(`${a.id}: current\n`));
 
   const found = await cli(["find", "React", "rendering", "--limit", "1", "--explain", "--json"]);

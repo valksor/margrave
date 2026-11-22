@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { handleHostedMcp } from "./hosted.ts";
+import { listSkillCatalog } from "./source-maintenance.ts";
 import { UsageError } from "./store.ts";
 
 function list(value: string | undefined): string[] {
@@ -28,6 +29,33 @@ function early(req: IncomingMessage, res: ServerResponse, status: number, header
   res.writeHead(status, headers).end(body);
 }
 
+async function respondMcp(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "POST") return early(req, res, 405, { Allow: "POST" });
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(req.headers)) {
+    const header = value as string | string[];
+    headers.set(name, Array.isArray(header) ? header.join(", ") : header);
+  }
+  const body = Readable.toWeb(req, { strategy: { highWaterMark: 65536, size: (chunk: Buffer) => chunk.byteLength } });
+  const init: RequestInit & { duplex: "half" } = {
+    method: "POST",
+    headers,
+    body: body as unknown as ReadableStream,
+    signal: req.signal,
+    duplex: "half",
+  };
+  const request = new Request("http://localhost/mcp", init);
+  const response = await handleHostedMcp(request);
+  if (res.destroyed) {
+    await response.body?.cancel();
+    return;
+  }
+  if (!req.complete) res.shouldKeepAlive = false;
+  res.writeHead(response.status, Object.fromEntries(response.headers));
+  if (response.body === null) res.end();
+  else await pipeline(Readable.fromWeb(response.body as unknown as import("node:stream/web").ReadableStream), res);
+}
+
 async function respond(req: IncomingMessage, res: ServerResponse, hosts: Set<string>, origins: Set<string>): Promise<void> {
   try {
     // Node supplies the URL for server requests.
@@ -42,35 +70,23 @@ async function respond(req: IncomingMessage, res: ServerResponse, hosts: Set<str
         req.method === "HEAD" ? "" : '{"status":"ok"}',
       );
     }
-    if (route !== "/mcp") return early(req, res, 404);
+    if (route !== "/mcp" && route !== "/skills.json") return early(req, res, 404);
     const host = req.headersDistinct.host ?? [];
     if (host.length !== 1 || !host[0] || !hosts.has(host[0].toLowerCase())) return early(req, res, 421);
     const origin = req.headersDistinct.origin ?? [];
     if (origin.length > 1 || (origin.length === 1 && !origins.has(origin[0]!))) return early(req, res, 403);
-    if (req.method !== "POST") return early(req, res, 405, { Allow: "POST" });
-    const headers = new Headers();
-    for (const [name, value] of Object.entries(req.headers)) {
-      const header = value as string | string[];
-      headers.set(name, Array.isArray(header) ? header.join(", ") : header);
+    if (route === "/skills.json") {
+      if (req.method !== "GET" && req.method !== "HEAD") return early(req, res, 405, { Allow: "GET, HEAD" });
+      const body = JSON.stringify(await listSkillCatalog());
+      return early(
+        req,
+        res,
+        200,
+        { "Content-Type": "application/json", "Content-Length": String(Buffer.byteLength(body)), "Cache-Control": "no-store" },
+        req.method === "HEAD" ? "" : body,
+      );
     }
-    const body = Readable.toWeb(req, { strategy: { highWaterMark: 65536, size: (chunk: Buffer) => chunk.byteLength } });
-    const init: RequestInit & { duplex: "half" } = {
-      method: "POST",
-      headers,
-      body: body as unknown as ReadableStream,
-      signal: req.signal,
-      duplex: "half",
-    };
-    const request = new Request("http://localhost/mcp", init);
-    const response = await handleHostedMcp(request);
-    if (res.destroyed) {
-      await response.body?.cancel();
-      return;
-    }
-    if (!req.complete) res.shouldKeepAlive = false;
-    res.writeHead(response.status, Object.fromEntries(response.headers));
-    if (response.body === null) res.end();
-    else await pipeline(Readable.fromWeb(response.body as unknown as import("node:stream/web").ReadableStream), res);
+    await respondMcp(req, res);
   } catch {
     if (res.destroyed) return;
     console.error("margrave: HTTP server error");

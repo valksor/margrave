@@ -173,6 +173,8 @@ Each suggestion links to its catalog page and shows a manual command. Use `margr
 | `margrave wrap <claude\|codex\|bb\|generic>`                                                 | Print setup text.                                                                                                                                                                                                                                                                            |
 | `margrave version`                                                                           | Print the version (`--version` and `-v` do the same).                                                                                                                                                                                                                                        |
 
+`margrave list --skills --json` returns the same catalog as `GET /skills.json` for the same current store. The source records contain `id`, `kind`, `ref`, `commit`, and `skillCount`. The skill records contain `id`, `name`, `description`, and `source`, which matches the owning source ID. Use `margrave list --json` for full local source records.
+
 `<source>` is a source id or the original spec you installed it with.
 
 `margrave check [source] [--json]` reports updates and installed-file drift for the current catalog. It exits 1 when a source needs attention.
@@ -350,7 +352,9 @@ Use `--host IP` and `--port N` to change the bind address and port. Port `0` sel
 
 A non-loopback bind requires `MARGRAVE_ALLOWED_HOSTS`. Set it to a comma-separated list of exact Host values, including any port sent by the proxy. The default accepts loopback Host values at the bound port. Set `MARGRAVE_ALLOWED_ORIGINS` to a comma-separated list of exact browser origins. Requests without an Origin header are allowed. With the default settings, requests with an Origin header are rejected.
 
-For remote use, keep the listener private behind a reverse proxy. Configure TLS, client access, and rate limits at the proxy.
+Use `GET /skills.json` for the catalog and `HEAD /skills.json` for its response headers. Both methods use the same Host and Origin checks as `/mcp`. Catalog IDs for `file://` Git sources include sanitized path components.
+
+For remote use, keep the listener private behind a reverse proxy. Configure TLS, client access, and rate limits at the proxy. Require authentication for `/mcp` and both methods on `/skills.json`. Grant catalog access only to callers authorized to see the entire store. A source-scoped MCP grant does not authorize catalog access.
 
 #### Custom Node host
 

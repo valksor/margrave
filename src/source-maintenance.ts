@@ -181,3 +181,11 @@ export async function listSources(
     db.close();
   }
 }
+
+export async function listSkillCatalog(): Promise<{
+  sources: (Pick<SourceRecord, "id" | "kind" | "ref" | "commit"> & { skillCount: number })[];
+  skills: ListedSkill[];
+}> {
+  const { sources, skills } = await listSources(true);
+  return { sources: sources.map(({ id, kind, ref, commit: sha, skillCount }) => ({ id, kind, ref, commit: sha, skillCount })), skills };
+}
