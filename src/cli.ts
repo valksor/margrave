@@ -178,7 +178,7 @@ async function listCommand(rest: string[]): Promise<void> {
   if (p.values["json"] === true) {
     json({
       sources,
-      ...(withSkills ? { skills: skills.map((s) => ({ id: s.id, name: s.name, description: s.description })) } : {}),
+      ...(withSkills ? { skills: skills.map((s) => ({ id: s.id, name: s.name, description: s.description, source: s.source })) } : {}),
     });
     return;
   }

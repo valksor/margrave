@@ -56,9 +56,9 @@ test("CLI output direct local sources and presentation contracts", async (t) => 
   ];
   const headings = `${a.id}  local  ref=-  commit=-  skills=2\n${b.id}  local  ref=-  commit=-  skills=1\n`;
   const descriptors = [
-    { id: `${a.id}/alpha`, name: "alpha", description: "Profile React rendering performance" },
-    { id: `${a.id}/beta`, name: "beta", description: "Plan database migrations" },
-    { id: `${b.id}/gamma`, name: "gamma", description: "Profile Vue rendering performance" },
+    { id: `${a.id}/alpha`, name: "alpha", description: "Profile React rendering performance", source: a.id },
+    { id: `${a.id}/beta`, name: "beta", description: "Plan database migrations", source: a.id },
+    { id: `${b.id}/gamma`, name: "gamma", description: "Profile Vue rendering performance", source: b.id },
   ].sort((x, y) => x.id.localeCompare(y.id));
   assert.deepEqual(await cli(["list"]), ok(headings));
   assert.deepEqual(
