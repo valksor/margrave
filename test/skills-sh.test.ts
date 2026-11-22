@@ -371,7 +371,7 @@ test("catalog fallback formats install and update suggestions exactly", () => {
   );
 });
 
-test("CLI, stdio and hosted opt in through trusted configuration", async (t) => {
+test("CLI, stdio and hosted support catalog opt-in", async (t) => {
   const home = await tmp("mg-catalog-entry-");
   const previous = process.env["MARGRAVE_HOME"];
   const originalFetch = globalThis.fetch;
@@ -450,7 +450,29 @@ test("CLI, stdio and hosted opt in through trusted configuration", async (t) => 
     assert.ok(!input.includes("private-prompt-marker"));
     return Promise.resolve(Response.json({ skills: [{ source: "owner/repo", skillId: "skill" }] }));
   };
+  const defaultHosted = new Client({ name: "test", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  await defaultHosted.connect(
+    new StreamableHTTPClientTransport(new URL("http://test/mcp"), {
+      fetch: (url, init) => handleHostedMcp(new Request(url, init)),
+    }),
+  );
+  try {
+    for (const catalogQuery of [undefined, "  "]) {
+      const local = await defaultHosted.callTool({ name: "find_skills", arguments: { task: "private-prompt-marker", catalogQuery } });
+      assert.deepEqual((local.structuredContent as { suggestions: unknown[] }).suggestions, []);
+      assert.equal(calls, 0);
+    }
+    const result = await defaultHosted.callTool({
+      name: "find_skills",
+      arguments: { task: "private-prompt-marker", catalogQuery: "terraform modules" },
+    });
+    assert.equal(calls, 1);
+    assert.match(JSON.stringify(result.content), /skills\.sh suggestions/u);
+  } finally {
+    await defaultHosted.close();
+  }
   for (const enabledHosted of [false, true]) {
+    calls = 0;
     const hosted = new Client({ name: "test", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
     await hosted.connect(
       new StreamableHTTPClientTransport(new URL("http://test/mcp?skillsSh=true"), {

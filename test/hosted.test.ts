@@ -265,7 +265,7 @@ test("a moved Git store loads from its new path through CLI and MCP", async (t) 
   }
 });
 
-test("hosted tools have the same names, input schemas, and instructions as the stdio server; only the two descriptions differ", async (t) => {
+test("hosted tools share stdio schemas and advertise hosted behavior", async (t) => {
   await useHome(t);
   const local = await connectLocal(t);
   const hosted = await connectHosted(t);
@@ -284,7 +284,13 @@ test("hosted tools have the same names, input schemas, and instructions as the s
   );
 
   const desc = Object.fromEntries(hostedTools.map((x) => [x.name, x.description]));
-  assert.equal(desc["find_skills"], FIND_DESCRIPTION);
+  const localDesc = Object.fromEntries(localTools.map((x) => [x.name, x.description]));
+  assert.equal(localDesc["find_skills"], FIND_DESCRIPTION);
+  assert.ok(desc["find_skills"]?.startsWith(FIND_DESCRIPTION));
+  assert.match(
+    desc["find_skills"] ?? "",
+    /Supply catalogQuery with a short capability description to request public suggestions after a local miss\./u,
+  );
   assert.equal(desc["load_skill"], HOSTED_LOAD_DESCRIPTION);
   assert.equal(desc["read_skill_file"], HOSTED_READ_DESCRIPTION);
   assert.equal(

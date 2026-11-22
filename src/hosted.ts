@@ -5,7 +5,7 @@ import { HOSTED, createServer } from "./mcp.ts";
 import type { ServerOptions } from "./mcp.ts";
 
 export function createHostedServer(options: ServerOptions = {}): McpServer {
-  return createServer(HOSTED, options);
+  return createServer(HOSTED, { ...options, skillsSh: options.skillsSh ?? true });
 }
 
 /** One POST in, one JSON response out. */

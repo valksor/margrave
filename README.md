@@ -290,7 +290,7 @@ Structured search results include the source ID, skill revision, commit, declare
 
 Pass `{ allowedSources: ["owner__repo"] }` as the second argument to `handleHostedMcp` to scope a hosted request. An empty array serves no sources. The hosted application chooses this option in trusted server code.
 
-For a hosted integration, set `skillsSh: true` in trusted server code to permit the same behavior. A normal search without `catalogQuery` uses the private catalog alone.
+For HTTP MCP, pass a short capability description as `catalogQuery` to `find_skills` to request skills.sh suggestions after a local miss. Omit `catalogQuery` to search only the local catalog. A host can disable public lookups with `{ skillsSh: false }`.
 
 It has the same three tools and the same inputs as `margrave mcp`. It reads the store in `MARGRAVE_HOME` of the host process on every call. It needs read access to `MARGRAVE_HOME`; it does not need write access, so a read-only mount or a separate user works. The handler serves MCP requests over stateless Streamable HTTP. It is POST-only. Other methods get 405.
 
