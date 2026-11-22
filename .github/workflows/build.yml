@@ -379,6 +379,10 @@ jobs:
       DEVELOPER_ID_G2_SHA256: f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a
 
     steps:
+      - name: Mask the runner home directory
+        run: |
+          printf '::add-mask::%s\n' "${HOME//%/%25}"
+
       # Only the file that pins ripwire and the entitlements file. Neither is
       # executed: the pin is read as text, and codesign reads the plist as data.
       - name: Checkout the ripwire pin
@@ -570,17 +574,19 @@ jobs:
       # entitlements file from the checkout (allow-jit for V8, and unsigned
       # executable memory); nothing from the bundle runs here.
       - name: Sign ripwire and margrave
+        working-directory: ${{ runner.temp }}/sign/margrave
         run: |
           set -euo pipefail
           KC="$RUNNER_TEMP/signing.keychain-db"
-          BIN="$RUNNER_TEMP/sign/margrave/vendor/ripwire/ripwire"
-          MARGRAVE_BIN="$RUNNER_TEMP/sign/margrave/bin/margrave"
+          BUNDLE=$(pwd -P)
+          BIN=./vendor/ripwire/ripwire
+          MARGRAVE_BIN=./bin/margrave
           codesign --force --options runtime --timestamp --keychain "$KC" --sign "$IDENTITY" "$BIN"
-          codesign --force --options runtime --timestamp --keychain "$KC" --sign "$IDENTITY" --entitlements .github/entitlements.plist "$MARGRAVE_BIN"
+          codesign --force --options runtime --timestamp --keychain "$KC" --sign "$IDENTITY" --entitlements "$GITHUB_WORKSPACE/.github/entitlements.plist" "$MARGRAVE_BIN"
           codesign --verify --strict --verbose=2 "$MARGRAVE_BIN"
           # codesign -dv writes to stderr.
           MARGRAVE_DETAILS=$(codesign -dv "$MARGRAVE_BIN" 2>&1)
-          echo "$MARGRAVE_DETAILS"
+          printf '%s\n' "${MARGRAVE_DETAILS//"$BUNDLE"\//./}"
           if ! grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime[^)]*\)' <<< "$MARGRAVE_DETAILS"; then
             echo "::error::The signed margrave does not have the hardened runtime flag"
             exit 1
@@ -594,7 +600,7 @@ jobs:
           # entitlement (for example dylib injection or get-task-allow) slips in.
           codesign -d --entitlements - --xml "$MARGRAVE_BIN" > "$RUNNER_TEMP/signed-entitlements.plist" 2>/dev/null
           SIGNED=$(plutil -convert json -o - "$RUNNER_TEMP/signed-entitlements.plist" | jq -S -c .)
-          WANTED=$(plutil -convert json -o - .github/entitlements.plist | jq -S -c .)
+          WANTED=$(plutil -convert json -o - "$GITHUB_WORKSPACE/.github/entitlements.plist" | jq -S -c .)
           if [[ "$SIGNED" != "$WANTED" ]]; then
             echo "::error::The signed margrave entitlements $SIGNED differ from .github/entitlements.plist $WANTED"
             exit 1
@@ -602,7 +608,7 @@ jobs:
           codesign --verify --strict --verbose=2 "$BIN"
           # codesign -dv writes to stderr.
           DETAILS=$(codesign -dv "$BIN" 2>&1)
-          echo "$DETAILS"
+          printf '%s\n' "${DETAILS//"$BUNDLE"\//./}"
           if ! grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime[^)]*\)' <<< "$DETAILS"; then
             echo "::error::The signed ripwire does not have the hardened runtime flag"
             exit 1
