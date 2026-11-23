@@ -15,7 +15,7 @@ const withHome = { ...input, home: "/data/margrave home" };
 test("the snippet is the exact plan text", () => {
   assert.equal(
     SNIPPET,
-    'Installed skills are available on demand through margrave. Before a task in an unfamiliar domain, tool, or framework, run `margrave find "<task in plain words>"` (or the find_skills MCP tool). Run `margrave load <id>` (or load_skill) only for a recommended result.',
+    'Installed skills are available on demand through margrave. Before an unfamiliar task, search for a skill. Run `margrave find "<task in plain words>" --category general` or call the find_skills MCP tool. Use a technology such as react as the category for a focused search. Use general for a broad search. Run `margrave load <id>` or call load_skill only for a recommended result.',
   );
 });
 

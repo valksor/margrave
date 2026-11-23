@@ -173,7 +173,7 @@ async function withBadDb(bad: BadDb): Promise<Awaited<ReturnType<typeof catalogS
 }
 
 const readArgs = (s: { id: string; other: string }): string[][] => [
-  ["find", "alpha"],
+  ["find", "--category", "general", "alpha"],
   ["list"],
   ["load", "alpha"],
   ["install", s.other],
@@ -1274,7 +1274,7 @@ test("a loose index.json is ignored and remains untouched", async () => {
   const s = await catalogSetup();
   const json = path.join(s.home, "index.json");
   await writeFile(json, "legacy bytes");
-  assert.equal((await s.mg(["find", "alpha"])).code, 0);
+  assert.equal((await s.mg(["find", "--category", "general", "alpha"])).code, 0);
   assert.equal((await s.mg(["reindex"])).code, 0);
   assert.equal(await readFile(json, "utf8"), "legacy bytes");
 });
@@ -1397,7 +1397,7 @@ test("an install into a store with no sources: a schema-less index.db is initial
       assert.equal(r.code, 0, `${bad.why}: ${r.stderr}`);
       assert.equal(indexIds(home).length, 1, bad.why);
       assert.equal((await catalogSnapshot(file)).ino, before.ino, `${bad.why}: opened in place`);
-      assert.equal((await runCli(["find", "alpha"], { home })).code, 0, bad.why);
+      assert.equal((await runCli(["find", "--category", "general", "alpha"], { home })).code, 0, bad.why);
     } else {
       assert.equal(r.code, 1, bad.why);
       assert.match(r.stderr, message, bad.why);
@@ -1418,7 +1418,7 @@ test("a damaged index.db (SQLITE_CORRUPT) keeps the open error and adds how to r
     await fh.close();
   }
   const before = await catalogSnapshot(file);
-  for (const args of [["find", "alpha"], ["list"], ["reindex"]]) {
+  for (const args of [["find", "--category", "general", "alpha"], ["list"], ["reindex"]]) {
     const r = await s.mg(args);
     assert.equal(r.code, 1, args.join(" "));
     assert.match(r.stderr, CORRUPT, args.join(" "));
@@ -1473,7 +1473,7 @@ test(
     assert.equal((await readdir(s.home)).includes("index.db-journal"), true, "the killed writer left a hot journal");
 
     const message = /index\.db has an unfinished v0.2.1 write. Restore a complete backup before migrating/u;
-    for (const args of [["find", "alpha"], ["list"], ["load", `${s.id}/alpha`]]) {
+    for (const args of [["find", "--category", "general", "alpha"], ["list"], ["load", `${s.id}/alpha`]]) {
       const r = await s.mg(args);
       assert.equal(r.code, 1, args.join(" "));
       assert.match(r.stderr, message, args.join(" "));
@@ -1509,7 +1509,7 @@ test("a locked database is not called invalid, and reindex does not delete it", 
   const lock = holdWriteLock(s.home, "EXCLUSIVE");
   let runs: Run[];
   try {
-    runs = await Promise.all([s.mg(["find", "alpha"]), s.mg(["reindex"]), s.mg(["list"])]);
+    runs = await Promise.all([s.mg(["find", "--category", "general", "alpha"]), s.mg(["reindex"]), s.mg(["list"])]);
   } finally {
     lock.release();
   }
@@ -1519,7 +1519,7 @@ test("a locked database is not called invalid, and reindex does not delete it", 
     assert.doesNotMatch(r.stderr, /not a valid margrave index/u);
   }
   assert.deepEqual(indexRows(s.home), before, "the index is intact");
-  assert.equal((await s.mg(["find", "alpha"])).code, 0);
+  assert.equal((await s.mg(["find", "--category", "general", "alpha"])).code, 0);
 });
 
 test("a symlinked or non-regular index.db is refused, and reindex does not follow it", async () => {
@@ -1529,7 +1529,7 @@ test("a symlinked or non-regular index.db is refused, and reindex does not follo
   await rename(file, real);
   await symlink(real, file);
   const other = await localSource("beta");
-  for (const args of [["find", "alpha"], ["reindex"], ["install", other.dir]]) {
+  for (const args of [["find", "--category", "general", "alpha"], ["reindex"], ["install", other.dir]]) {
     const r = await s.mg(args);
     assert.equal(r.code, 1, args.join(" "));
     assert.match(r.stderr, /index\.db is not a regular catalog file/u, args.join(" "));
@@ -1537,7 +1537,7 @@ test("a symlinked or non-regular index.db is refused, and reindex does not follo
   assert.equal((await stat(real)).isFile(), true, "the target is untouched");
   await rm(file);
   await mkdir(file);
-  assert.match((await s.mg(["find", "alpha"])).stderr, /index\.db is not a regular catalog file/u);
+  assert.match((await s.mg(["find", "--category", "general", "alpha"])).stderr, /index\.db is not a regular catalog file/u);
 });
 
 test("an index.db that cannot be opened for a reason other than NOTADB is an error that names index.db, and nothing is deleted", async (t) => {
@@ -1546,7 +1546,7 @@ test("an index.db that cannot be opened for a reason other than NOTADB is an err
   const file = path.join(s.home, "index.db");
   await chmod(file, 0o000);
   try {
-    for (const args of [["find", "alpha"], ["reindex"]]) {
+    for (const args of [["find", "--category", "general", "alpha"], ["reindex"]]) {
       const r = await s.mg(args);
       assert.equal(r.code, 1, args.join(" "));
       assert.match(r.stderr, /cannot open .*index\.db: /u, args.join(" "));
@@ -1568,7 +1568,7 @@ test("a store directory that cannot be inspected is an error that names index.db
 test("a missing index.db with sources says to run reindex", async () => {
   const s = await catalogSetup();
   await rm(path.join(s.home, "index.db"));
-  const r = await s.mg(["find", "alpha"]);
+  const r = await s.mg(["find", "--category", "general", "alpha"]);
   assert.equal(r.code, 1);
   assert.match(r.stderr, /index\.db is missing\. Restore the complete store backup/u);
 });
@@ -1621,7 +1621,7 @@ test("a read-only MARGRAVE_HOME (mode 555) still serves find and load, and creat
   t.after(() => chmod(s.home, 0o755));
   await chmod(s.home, 0o555);
   const before = (await readdir(s.home)).sort();
-  const find = await s.mg(["find", "alpha"]);
+  const find = await s.mg(["find", "--category", "general", "alpha"]);
   assert.equal(find.code, 0, find.stderr);
   assert.match(find.stdout, /alpha/u);
   const load = await s.mg(["load", `${s.id}/alpha`]);
@@ -1670,7 +1670,7 @@ test("a reader during an open write transaction gets the old results with no err
   const lock = holdWriteLock(s.home);
   try {
     insertSkills(lock.db, [newEntry(s.id, "uncommitted")]);
-    const find = await s.mg(["find", "alpha", "--json"]);
+    const find = await s.mg(["find", "--category", "general", "alpha", "--json"]);
     assert.equal(find.code, 0, find.stderr);
     assert.deepEqual(
       (JSON.parse(find.stdout) as { results: { id: string }[] }).results.map((r) => r.id),
@@ -2055,17 +2055,17 @@ test("a malformed or missing catalog requires restoration from a backup", async 
   assert.equal((await mg(env, ["install", dir])).code, 0);
   const backup = await readFile(path.join(env.home, "index.db"));
   await writeFile(path.join(env.home, "index.db"), "{ broken");
-  const r = await mg(env, ["find", "alpha"]);
+  const r = await mg(env, ["find", "--category", "general", "alpha"]);
   assert.equal(r.code, 1);
   assert.match(r.stderr, /index\.db is not a supported margrave catalog/u);
   assert.equal((await mg(env, ["reindex"])).code, 1, "reindex does not replace a file that is not ours");
   await rename(path.join(env.home, "index.db"), path.join(env.home, "index.db.aside"));
   assert.equal((await mg(env, ["reindex"])).code, 1);
-  const missing = await mg(env, ["find", "alpha"]);
+  const missing = await mg(env, ["find", "--category", "general", "alpha"]);
   assert.equal(missing.code, 1);
   assert.match(missing.stderr, /index\.db is missing\. Restore the complete store backup/u);
   await writeFile(path.join(env.home, "index.db"), backup);
-  assert.equal((await mg(env, ["find", "alpha"])).code, 0);
+  assert.equal((await mg(env, ["find", "--category", "general", "alpha"])).code, 0);
 });
 
 test("store readers refuse legacy, empty, and missing catalogs", async (t) => {

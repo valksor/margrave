@@ -44,7 +44,7 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   assert.equal(client.getInstructions(), SERVER_INSTRUCTIONS);
   assert.equal(
     SERVER_INSTRUCTIONS,
-    "This server gives access to installed skills that the agent does not load by default. Before a task in an unfamiliar domain, tool, or framework, call find_skills with the task in plain words. Call load_skill only for a recommended result. Call read_skill_file for a file that the skill names.",
+    "This server gives access to installed skills that the agent does not load by default. Before an unfamiliar task, call find_skills with the task in plain words and a category. Use a technology such as react or use general for a broad search. Call load_skill only for a recommended result. Call read_skill_file for a file that the skill names.",
   );
   const tools = (await client.listTools()).tools;
   assert.deepEqual(tools.map((x) => x.name).sort(), ["find_skills", "load_skill", "read_skill_file"]);
@@ -66,7 +66,7 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   assert.equal(READ_DESCRIPTION, desc["read_skill_file"]);
 
   // no sources: find returns the hint text, not a tool error
-  const noSources = await call(client, "find_skills", { task: "anything" });
+  const noSources = await call(client, "find_skills", { category: "general", task: "anything" });
   assert.equal(noSources.isError, false);
   assert.equal(noSources.text, `no skill sources installed; run: margrave install <owner/repo|path>\n\n${FIND_GUIDANCE}`);
   // load_skill and read_skill_file with no sources are tool errors with the same hint
@@ -89,14 +89,14 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
   assert.equal(inst.code, 0, inst.stderr);
   const id = /^installed (\S+)/mu.exec(inst.stdout)?.[1] ?? "";
 
-  const found = await call(client, "find_skills", { task: "terraform modules", limit: 3 });
+  const found = await call(client, "find_skills", { category: "general", task: "terraform modules", limit: 3 });
   assert.equal(found.isError, false);
   assert.match(found.text, new RegExp(`^1\\. ${id}/terraform-modules `, "u"));
   assert.match(found.text, /\n   revision: sha256:[0-9a-f]{64}\n/u);
   assert.match(found.text, new RegExp(`load: margrave load ${id}/terraform-modules\\n`, "u"));
 
   // no match: empty result plus a hint, not a tool error
-  const none = await call(client, "find_skills", { task: "quantum chromodynamics" });
+  const none = await call(client, "find_skills", { category: "general", task: "quantum chromodynamics" });
   assert.equal(none.isError, false);
   assert.match(none.text, /^no match\n.*margrave list --skills/u);
 
@@ -124,7 +124,7 @@ test("MCP smoke: three tools, exact texts, no-sources, no-match, load, read, gua
 
   // a corrupt index.db is a tool error that says how to repair it
   await writeFile(path.join(home, "index.db"), "garbage that is not a database");
-  const corrupt = await call(client, "find_skills", { task: "terraform" });
+  const corrupt = await call(client, "find_skills", { category: "general", task: "terraform" });
   assert.equal(corrupt.isError, true);
   assert.match(corrupt.text, /is not a supported margrave catalog/u);
   const { SkillsClient } = await import("@modelcontextprotocol/client/ext/skills");
@@ -152,6 +152,12 @@ test("MCP server direct advertises metadata and validates revisions without a ca
   const client = await connectInMemory(t);
   assert.equal(client.getServerVersion()?.name, "margrave");
   const find = (await client.listTools()).tools.find((tool) => tool.name === "find_skills");
+  assert.deepEqual(find?.inputSchema.required, ["task", "category"]);
+  for (const args of [{ task: "forms" }, ...[" ", "the", "C++"].map((category) => ({ task: "forms", category }))]) {
+    const invalid = await call(client, "find_skills", args);
+    assert.equal(invalid.isError, true);
+    assert.match(invalid.text, /category|searchable words/u);
+  }
   const schema = find?.outputSchema as {
     properties: {
       results: { items: { properties: { scanVerdict: { enum: string[] }; matchedTerms: { properties: Record<string, unknown> } } } };
@@ -356,7 +362,7 @@ test("a tool whose work rejects with a non-Error value returns that value as tex
     if (sql === "SELECT id, record FROM sources ORDER BY position") throw "boom, not an Error";
     return prepare.call(this, sql);
   });
-  const r = await call(client, "find_skills", { task: "anything" });
+  const r = await call(client, "find_skills", { category: "general", task: "anything" });
   assert.deepEqual(r, { isError: true, text: "boom, not an Error" });
 });
 
@@ -391,7 +397,10 @@ test("MCP in-process: load_skill and read_skill_file work, and every tool turns 
   const hint = "no skill sources installed; run: margrave install <owner/repo|path>";
 
   // No sources: load_skill and read_skill_file fail with the hint, find_skills answers with it.
-  assert.deepEqual(await call(client, "find_skills", { task: "x" }), { isError: false, text: `${hint}\n\n${FIND_GUIDANCE}` });
+  assert.deepEqual(await call(client, "find_skills", { category: "general", task: "x" }), {
+    isError: false,
+    text: `${hint}\n\n${FIND_GUIDANCE}`,
+  });
   assert.deepEqual(await call(client, "load_skill", { id: "x" }), { isError: true, text: hint });
   assert.deepEqual(await call(client, "read_skill_file", { id: "x", path: "SKILL.md" }), { isError: true, text: hint });
 
@@ -415,7 +424,7 @@ test("MCP in-process: load_skill and read_skill_file work, and every tool turns 
   // A corrupt index.db is a tool error for all three tools.
   await writeFile(path.join(home, "index.db"), "garbage that is not a database");
   for (const [tool, args] of [
-    ["find_skills", { task: "terraform" }],
+    ["find_skills", { category: "general", task: "terraform" }],
     ["load_skill", { id }],
     ["read_skill_file", { id, path: "SKILL.md" }],
   ] as const) {
@@ -450,9 +459,9 @@ test("many failing tool calls leave no open index handle: reindex rebuilds the d
     assert.equal((await call(client, "load_skill", { id: `nope-${i}` })).isError, true);
     assert.equal((await call(client, "read_skill_file", { id: `nope-${i}`, path: "SKILL.md" })).isError, true);
   }
-  assert.equal((await call(client, "find_skills", { task: "alpha" })).isError, false);
+  assert.equal((await call(client, "find_skills", { category: "general", task: "alpha" })).isError, false);
   assert.equal((await runCli(["reindex"], { home, fakeBin })).code, 0);
-  assert.equal((await call(client, "find_skills", { task: "alpha" })).isError, false);
+  assert.equal((await call(client, "find_skills", { category: "general", task: "alpha" })).isError, false);
   // 600 failing calls would leave 600 open descriptors if a call did not close its handle; the usual limit is 256.
   const open = (await fsp.readdir("/dev/fd")).length;
   assert.ok(open < 200, `${open} open file descriptors`);
@@ -473,7 +482,11 @@ test("stdio source allowlists scope search and both reads", async (t) => {
     ids.push(/^installed (\S+)/u.exec(result.stdout)?.[1] ?? "");
   }
   const [visible, hidden] = ids as [string, string];
-  const cli = await runCli(["find", "terraform modules", "--limit", "10"], { home, fakeBin, extra: { MARGRAVE_ALLOWED_SOURCES: "" } });
+  const cli = await runCli(["find", "--category", "general", "terraform modules", "--limit", "10"], {
+    home,
+    fakeBin,
+    extra: { MARGRAVE_ALLOWED_SOURCES: "" },
+  });
   assert.equal(cli.code, 0, cli.stderr);
   assert.ok(cli.stdout.includes(visible) && cli.stdout.includes(hidden));
   for (const scope of [undefined, `${visible}, ${visible},missing`, "", "   "]) {
@@ -483,7 +496,7 @@ test("stdio source allowlists scope search and both reads", async (t) => {
     const client = new Client({ name: "scope-test", version: "1" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
     await client.connect(new StdioClientTransport({ command: process.execPath, args: [CLI, "mcp"], env: stdioTestEnv(env) }));
     t.after(() => client.close());
-    const found = await call(client, "find_skills", { task: "terraform modules", limit: 1, explain: true });
+    const found = await call(client, "find_skills", { category: "general", task: "terraform modules", limit: 1, explain: true });
     if (emptyScope) assert.match(found.text, /no match/u);
     else if (scope !== undefined) {
       assert.ok(found.text.includes(visible));
@@ -494,7 +507,7 @@ test("stdio source allowlists scope search and both reads", async (t) => {
     if (scope === undefined) assert.match(bare.text, /ambiguous/u);
     else assert.equal(bare.isError, emptyScope);
     const revision = /revision: (sha256:[0-9a-f]{64})/u.exec(
-      (await call(client, "find_skills", { task: "shared", explain: true })).text,
+      (await call(client, "find_skills", { category: "general", task: "shared", explain: true })).text,
     )?.[1];
     for (const tool of ["load_skill", "read_skill_file"]) {
       for (const token of [undefined, revision ?? `sha256:${"a".repeat(64)}`]) {
@@ -576,7 +589,7 @@ test("stdio serves a client that opens with an older protocol revision", { timeo
       const tools = await request("tools/list", {});
       assert.deepEqual(tools?.tools?.map((tool) => tool.name).sort(), ["find_skills", "load_skill", "read_skill_file"]);
       for (const [name, args, expected] of [
-        ["find_skills", { task: "legacy fixture capability" }, id],
+        ["find_skills", { category: "general", task: "legacy fixture capability" }, id],
         ["load_skill", { id }, "Body of legacy-fixture"],
         ["read_skill_file", { id, path: "reference.txt" }, "legacy reference\n"],
       ] as const) {
@@ -668,7 +681,7 @@ test("Skills extension serves verified scoped pages over stdio", async (t) => {
   await assert.rejects(client.readResource({ uri: toolkit.uri.replace(/sha256%3A[0-9a-f]{64}/u, "invalid") }));
   await assert.rejects(skills.get(toolkit.uri.replace("toolkit/SKILL.md", "missing/SKILL.md")));
   await assert.rejects(skills.get(toolkit.uri.replace("SKILL.md", "references/checklist.md")));
-  const result = await client.callTool({ name: "find_skills", arguments: { task: "toolkit" } });
+  const result = await client.callTool({ name: "find_skills", arguments: { category: "general", task: "toolkit" } });
   const structured = result.structuredContent as {
     results: { source: string; scanVerdict: string; scanOverridden: boolean | null; license: string | null }[];
   };

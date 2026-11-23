@@ -64,7 +64,10 @@ DatabaseSync.prototype.exec = function(sql) {
     assert.notEqual(stopped.code, 0, checkpoint);
     if (checkpoint === "nonhot")
       assert.equal((await readFile(path.join(home, "index.db-journal"))).subarray(0, 8).toString("hex"), "0000000000000000");
-    const retried = await runCli(["find", "release upgrade", "--json"], { home, extra: { TAR_OPTIONS: "--not-a-real-tar-option" } });
+    const retried = await runCli(["find", "--category", "general", "release upgrade", "--json"], {
+      home,
+      extra: { TAR_OPTIONS: "--not-a-real-tar-option" },
+    });
     assert.equal(retried.code, 0, `${checkpoint}: ${retried.stderr}`);
     assert.ok(JSON.parse(retried.stdout).results.length > 0, checkpoint);
     assert.equal((await readdir(parent)).filter((name) => name.startsWith(".margrave-upgrade-v2-")).length, 1, checkpoint);
@@ -438,7 +441,7 @@ DatabaseSync.prototype.exec = function(sql) { if (point === "exclusive" && sql =
     else retry.send("continue");
     assert.equal((await retryExit)[0], 0, stderr);
     assert.equal((await readdir(parent)).filter((name) => name.startsWith(".margrave-upgrade-v2-")).length, 1);
-    assert.match((await runCli(["find", "release upgrade"], { home })).stdout, /release-upgrade/u);
+    assert.match((await runCli(["find", "--category", "general", "release upgrade"], { home })).stdout, /release-upgrade/u);
   }
 });
 

@@ -238,7 +238,7 @@ test("a moved Git store loads from its new path through CLI and MCP", async (t) 
     skillMd("react-perf", "old copy", "old copy bytes"),
   );
   process.env["MARGRAVE_HOME"] = moved;
-  const found = await runCli(["find", "react-perf"], { home: moved });
+  const found = await runCli(["find", "--category", "general", "react-perf"], { home: moved });
   assert.equal(found.code, 0, found.stderr);
   assert.match(found.stdout, /react-perf/u);
   const loaded = await runCli(["load", "react-perf"], { home: moved });
@@ -256,7 +256,7 @@ test("a moved Git store loads from its new path through CLI and MCP", async (t) 
   );
   const hosted = await connectHosted(t);
   for (const mcp of [client, hosted]) {
-    const foundSkill = await call(mcp, "find_skills", { task: "react-perf" });
+    const foundSkill = await call(mcp, "find_skills", { category: "general", task: "react-perf" });
     assert.equal(foundSkill.isError, false, foundSkill.text);
     assert.match(foundSkill.text, /react-perf/u);
     const result = await call(mcp, "load_skill", { id: `${id}/react-perf` });
@@ -311,7 +311,7 @@ test("hosted: with no sources, find_skills answers and the other two tools fail,
   await assert.rejects(skills.get(missing));
   await assert.rejects(client.readResource({ uri: missing }));
   assert.equal(HOSTED_NO_SOURCES_MESSAGE, "no skills are installed on this server");
-  assert.deepEqual(await call(client, "find_skills", { task: "x" }), {
+  assert.deepEqual(await call(client, "find_skills", { category: "general", task: "x" }), {
     isError: false,
     text: `${HOSTED_NO_SOURCES_MESSAGE}\n\n${FIND_GUIDANCE}`,
   });
@@ -349,7 +349,7 @@ test("hosted: find, load, read, and request errors, with no server path in any t
     assert.ok(!text.includes(dir), text);
   };
 
-  const found = await call(client, "find_skills", { task: "terraform modules", limit: 3 });
+  const found = await call(client, "find_skills", { category: "general", task: "terraform modules", limit: 3 });
   assert.equal(found.isError, false);
   const revision = /revision: (sha256:[0-9a-f]{64})/u.exec(found.text)?.[1];
   assert.ok(revision);
@@ -394,22 +394,22 @@ test("hosted: find, load, read, and request errors, with no server path in any t
   const lines = found.text.split("\n");
   assert.match(lines[0] ?? "", new RegExp(`^1\\. ${id} `, "u"));
   assert.equal(lines.at(-3), `load: call load_skill with id ${id}`);
-  assert.deepEqual(await call(client, "find_skills", { task: "quantum chromodynamics" }), {
+  assert.deepEqual(await call(client, "find_skills", { category: "general", task: "quantum chromodynamics" }), {
     isError: false,
     text: `no match\ntry other words\n\n${FIND_GUIDANCE}`,
   });
   const weakQuery = "repair a toaster with Terraform";
-  assert.deepEqual(await call(client, "find_skills", { task: weakQuery }), {
+  assert.deepEqual(await call(client, "find_skills", { category: "general", task: weakQuery }), {
     isError: false,
     text: `no match\ntry other words\n\n${FIND_GUIDANCE}`,
   });
-  const weak = await call(client, "find_skills", { task: weakQuery, explain: true });
+  const weak = await call(client, "find_skills", { category: "general", task: weakQuery, explain: true });
   assert.equal(weak.isError, false);
   assert.match(weak.text, /weak match/u);
   assert.match(weak.text, /matches in name \(terraform\)/u);
   assert.doesNotMatch(weak.text, /load:/u);
   noPaths(weak.text);
-  const explained = await call(client, "find_skills", { task: "terraform modules", explain: true });
+  const explained = await call(client, "find_skills", { category: "general", task: "terraform modules", explain: true });
   assert.match(explained.text, /matches in name \(modul, terraform\)/u);
   assert.match(explained.text, /load: call load_skill/u);
   noPaths(explained.text);
@@ -511,7 +511,7 @@ test("hosted: a store failure returns a generic error and logs the cause", async
 
   assert.equal(HOSTED_SERVER_ERROR, "the skill store on this server is not available; the server log has details");
   for (const [tool, args] of [
-    ["find_skills", { task: "terraform" }],
+    ["find_skills", { category: "general", task: "terraform" }],
     ["load_skill", { id }],
     ["read_skill_file", { id, path: "SKILL.md" }],
   ] as const) {
@@ -536,7 +536,7 @@ test("hosted: a hot journal returns the generic error and logs the unfinished-wr
   await leaveHotJournal(path.join(home, "index.db"));
   const log = mock.method(console, "error", () => {});
 
-  const r = await call(client, "find_skills", { task: "terraform" });
+  const r = await call(client, "find_skills", { category: "general", task: "terraform" });
   assert.deepEqual(r, { isError: true, text: HOSTED_SERVER_ERROR });
   assert.equal(log.mock.callCount(), 1);
   const logged: unknown = log.mock.calls[0]?.arguments[0];
@@ -573,7 +573,7 @@ test("hosted: a read-only MARGRAVE_HOME (mode 555) still serves find_skills, loa
   t.after(() => chmod(home, 0o755));
   await chmod(home, 0o555);
 
-  const found = await call(client, "find_skills", { task: "terraform" });
+  const found = await call(client, "find_skills", { category: "general", task: "terraform" });
   assert.equal(found.isError, false, found.text);
   assert.match(found.text, /terraform-modules/u);
   const loaded = await call(client, "load_skill", { id });
@@ -615,6 +615,7 @@ test("hosted source options isolate requests on the same store", async (t) => {
   for (const scope of [undefined, [first, first, "missing"], [second], []]) {
     const client = await connectHosted(t, scope);
     const found = await call(client, "find_skills", {
+      category: "general",
       task: "terraform modules",
       limit: 1,
       explain: true,
@@ -629,7 +630,7 @@ test("hosted source options isolate requests on the same store", async (t) => {
     if (scope === undefined) assert.match(bare.text, /ambiguous/u);
     else assert.equal(bare.isError, scope.length === 0);
     const revision = /revision: (sha256:[0-9a-f]{64})/u.exec(
-      (await call(client, "find_skills", { task: "shared", explain: true })).text,
+      (await call(client, "find_skills", { category: "general", task: "shared", explain: true })).text,
     )?.[1];
     for (const tool of ["load_skill", "read_skill_file"]) {
       for (const token of [undefined, revision ?? `sha256:${"a".repeat(64)}`]) {
@@ -703,7 +704,7 @@ test("hosted serves a client that opens with an older protocol revision", async 
     const tools = await request("tools/list", {});
     assert.deepEqual(tools?.tools?.map((tool) => tool.name).sort(), ["find_skills", "load_skill", "read_skill_file"]);
     for (const [name, args, expected] of [
-      ["find_skills", { task: "legacy fixture capability" }, id],
+      ["find_skills", { category: "general", task: "legacy fixture capability" }, id],
       ["load_skill", { id }, "Body of legacy-fixture"],
       ["read_skill_file", { id, path: "reference.txt" }, "legacy reference\n"],
     ] as const) {
@@ -1108,7 +1109,7 @@ test("recommendation provenance reflects verified and overridden Git scans", asy
   const skills = new SkillsClient(client);
   const gitEntry = (await skills.list()).skills.find((entry) => entry.uri.includes(cleanId))!;
   assert.equal((await skills.read(gitEntry)).verified, true);
-  const response = await client.callTool({ name: "find_skills", arguments: { task: "react-perf" } });
+  const response = await client.callTool({ name: "find_skills", arguments: { category: "general", task: "react-perf" } });
   const results = (
     response.structuredContent as { results: { source: string; commit: string; scanVerdict: string; scanOverridden: boolean }[] }
   ).results;
@@ -1123,6 +1124,6 @@ test("recommendation provenance reflects verified and overridden Git scans", asy
   );
   assert.ok(results.every((hit) => /^[0-9a-f]{40}$/u.test(hit.commit)));
   assert.equal(JSON.stringify(response.structuredContent).includes(cleanRepo.dir), false);
-  const cli = await runCli(["find", "react-perf", "--json"], { home, fakeBin });
+  const cli = await runCli(["find", "--category", "general", "react-perf", "--json"], { home, fakeBin });
   assert.deepEqual((JSON.parse(cli.stdout) as { results: unknown }).results, results);
 });

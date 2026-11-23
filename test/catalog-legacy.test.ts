@@ -645,11 +645,11 @@ test("schema 3 catalog setup failure keeps the original for retry", async () => 
 const exec = DatabaseSync.prototype.exec;
 DatabaseSync.prototype.exec = function(sql) { if (sql === "PRAGMA journal_mode = DELETE") throw new Error("catalog setup failed"); return exec.call(this, sql); };\n`,
   );
-  const failed = await runCli(["find", "react-perf"], { home, fakeBin, nodeArgs: ["--import", preload] });
+  const failed = await runCli(["find", "--category", "general", "react-perf"], { home, fakeBin, nodeArgs: ["--import", preload] });
   assert.equal(failed.code, 1);
   assert.match(failed.stderr, /catalog setup failed/u);
   assert.deepEqual(await readFile(path.join(home, "index.db")), before);
-  const retry = await runCli(["find", "react-perf"], { home, fakeBin });
+  const retry = await runCli(["find", "--category", "general", "react-perf"], { home, fakeBin });
   assert.equal(retry.code, 0, retry.stderr);
   assert.match(retry.stdout, /react-perf/u);
   assert.equal((await readdir(parent)).filter((name) => name.startsWith(".margrave-upgrade-v3-")).length, 1);
@@ -674,12 +674,12 @@ const lstat = fs.lstat;
 fs.lstat = async function(file, ...args) { if (String(file).includes("/.catalog-") && String(file).endsWith(".tmp")) await fs.chmod(file, 0); return lstat.call(this, file, ...args); };
 syncBuiltinESMExports();\n`,
   );
-  const failed = await runCli(["find", "react-perf"], { home, fakeBin, nodeArgs: ["--import", preload] });
+  const failed = await runCli(["find", "--category", "general", "react-perf"], { home, fakeBin, nodeArgs: ["--import", preload] });
   assert.equal(failed.code, 1);
   assert.match(failed.stderr, /catalog copy did not preserve access metadata/u);
   assert.deepEqual(await readFile(path.join(home, "index.db")), before);
   assert.ok(!(await readdir(home)).some((name) => name.startsWith(".catalog-")));
-  const retry = await runCli(["find", "react-perf"], { home, fakeBin });
+  const retry = await runCli(["find", "--category", "general", "react-perf"], { home, fakeBin });
   assert.equal(retry.code, 0, retry.stderr);
 });
 

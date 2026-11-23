@@ -82,7 +82,7 @@ test("CLI output direct local sources and presentation contracts", async (t) => 
   );
   assert.deepEqual(await cli(["check", a.id]), ok(`${a.id}: current\n`));
 
-  const found = await cli(["find", "React", "rendering", "--limit", "1", "--explain", "--json"]);
+  const found = await cli(["find", "--category", "general", "React", "rendering", "--limit", "1", "--explain", "--json"]);
   assert.equal(found.code, 0);
   assert.equal(found.stderr, "");
   const parsed = JSON.parse(found.stdout) as {
@@ -135,7 +135,7 @@ test("CLI output direct local sources and presentation contracts", async (t) => 
   assert.deepEqual(hit.matchedTerms.description, ["react", "render"]);
   assert.equal(Object.hasOwn(parsed, "message"), false);
   assert.equal(Object.hasOwn(parsed, "suggestions"), false);
-  const unexplained = await cli(["find", "React", "rendering", "--limit", "1", "--json"]);
+  const unexplained = await cli(["find", "--category", "general", "React", "rendering", "--limit", "1", "--json"]);
   const { exact: _exact, recommended: _recommended, matchedTerms: _matchedTerms, ...unexplainedHit } = hit;
   assert.deepEqual(unexplained, ok(json({ task: "React rendering", results: [unexplainedHit], guidance: FIND_GUIDANCE })));
   const preload = path.join(root, "load-reader.mjs");
@@ -173,7 +173,7 @@ process.on("exit", () => {
   assert.deepEqual(await loadWithReaderCheck(["load", "missing-skill"]), {
     code: 1,
     stdout: "",
-    stderr: 'margrave: no skill "missing-skill"; run: margrave find "<task>" or margrave list --skills\n',
+    stderr: 'margrave: no skill "missing-skill"; run: margrave find "<task>" --category general or margrave list --skills\n',
   });
   assert.deepEqual(
     await cli(["load", hit.id, "--revision", hit.revision]),
@@ -295,9 +295,12 @@ test("CLI output direct empty store", async (t) => {
   const home = await disposableHome(t);
   const message = "no skill sources installed; run: margrave install <owner/repo|path>";
   assert.deepEqual(await runCli(["check"], { home }), { code: 0, stdout: `${message}\n`, stderr: "" });
-  assert.deepEqual(await runCli(["find", "React", "rendering", "--json"], { home, extra: { MARGRAVE_SKILLS_SH: "0" } }), {
-    code: 0,
-    stdout: `${JSON.stringify({ task: "React rendering", results: [], guidance: FIND_GUIDANCE, message }, null, 2)}\n`,
-    stderr: "",
-  });
+  assert.deepEqual(
+    await runCli(["find", "--category", "general", "React", "rendering", "--json"], { home, extra: { MARGRAVE_SKILLS_SH: "0" } }),
+    {
+      code: 0,
+      stdout: `${JSON.stringify({ task: "React rendering", results: [], guidance: FIND_GUIDANCE, message }, null, 2)}\n`,
+      stderr: "",
+    },
+  );
 });

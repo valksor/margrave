@@ -17,11 +17,18 @@ import type { Context, FindText } from "./skills.ts";
 import { RequestError } from "./store.ts";
 import type { IndexEntry } from "./store.ts";
 import { checkId, migrateStore } from "./sources.ts";
-import { FIND_GUIDANCE, HOSTED_SUGGESTION_GUIDANCE, formatClarification, formatSuggestions, searchSkills } from "./search.ts";
+import {
+  FIND_GUIDANCE,
+  HOSTED_SUGGESTION_GUIDANCE,
+  formatClarification,
+  formatSuggestions,
+  parseFindCategory,
+  searchSkills,
+} from "./search.ts";
 import { attachMargraveSkills } from "./mcp-skills.ts";
 
 export const SERVER_INSTRUCTIONS =
-  "This server gives access to installed skills that the agent does not load by default. Before a task in an unfamiliar domain, tool, or framework, call find_skills with the task in plain words. Call load_skill only for a recommended result. Call read_skill_file for a file that the skill names.";
+  "This server gives access to installed skills that the agent does not load by default. Before an unfamiliar task, call find_skills with the task in plain words and a category. Use a technology such as react or use general for a broad search. Call load_skill only for a recommended result. Call read_skill_file for a file that the skill names.";
 
 export const FIND_DESCRIPTION =
   "Find recommended installed skills for a task in plain words. Use explain to see matching terms and weak matches. Use load_skill only for a recommended result. If the result contains a clarification question, repeat the search with more details. Set browse to true to skip the match count check.";
@@ -193,6 +200,7 @@ function registerFind(server: McpServer, variant: Variant, allowedSources: Reado
           : ""),
       inputSchema: z.object({
         task: z.string(),
+        category: z.string().describe("Technology for installed skills. Use general for a broad search."),
         limit: z.number().int().optional(),
         explain: z.boolean().optional(),
         browse: z.boolean().optional(),
@@ -200,8 +208,10 @@ function registerFind(server: McpServer, variant: Variant, allowedSources: Reado
       }),
       outputSchema: FIND_OUTPUT_SCHEMA,
     },
-    async ({ task, limit, explain, catalogQuery, browse }) => {
+    async ({ task, category, limit, explain, catalogQuery, browse }) => {
       try {
+        const categoryQuery = parseFindCategory(category);
+        if (categoryQuery === undefined) throw new RequestError("Use general or specify a technology with searchable words.");
         const { hits, noSources, suggestions, clarification } = await searchSkills(
           task,
           limit,
@@ -210,6 +220,7 @@ function registerFind(server: McpServer, variant: Variant, allowedSources: Reado
           allowedSources,
           catalogQuery,
           browse,
+          categoryQuery,
         );
         return {
           ...ok(

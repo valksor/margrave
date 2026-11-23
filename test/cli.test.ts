@@ -15,7 +15,9 @@ const usage = `usage: margrave <command>
   lock restore <file>                         restore locked Git sources
   remove <source>                             remove a source (never deletes a local directory)
   list [--skills] [--json]                    list sources, and with --skills every skill
-  find "<task>" [--limit N] [--json] [--explain] [--browse] [--catalog-query QUERY]  rank installed skills for a task
+  find "<task>" --category CATEGORY [--limit N] [--json] [--explain] [--browse] [--catalog-query QUERY]
+                                              search installed skills by technology or use general
+                                              use --catalog-query for public suggestions
   load <id> [--json] [--revision <hash>]      print one skill
   load <id> --file <path> [--revision <hash>] print one file inside a skill directory
   reindex                                     rescan all sources
@@ -83,7 +85,7 @@ const invalidPositionals: [string[], string][] = [
   [["lock", "export", "extra"], "lock export [--source <id> ...]"],
   [["lock", "restore"], "lock restore <file>"],
   [["lock", "invalid"], "lock export or lock restore"],
-  [["find"], 'find "<task>"'],
+  [["find"], 'find "<task>" --category CATEGORY'],
   [["load"], "load <id>"],
   [["reindex", "extra"], "reindex"],
   [["migrate", "extra"], "migrate"],

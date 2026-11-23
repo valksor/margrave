@@ -42,7 +42,7 @@ test("a copied Git store loads its own snapshot while the original remains", asy
   const originalSkill = path.join(env.home, "sources", id, "skills", "react-perf", "SKILL.md");
   await writeFile(originalSkill, skillMd("react-perf", "Changed original", "Original store content."));
   const copied = { ...env, home: moved };
-  const found = await mg(copied, ["find", "react-perf"]);
+  const found = await mg(copied, ["find", "--category", "general", "react-perf"]);
   assert.equal(found.code, 0, found.stderr);
   assert.match(found.stdout, /react-perf/u);
   const loaded = await mg(copied, ["load", `${id}/react-perf`]);
@@ -213,18 +213,18 @@ test("git source via file://: install, duplicate, find, load, update, remove", a
   assert.deepEqual(await snapshot(env.home), before);
 
   // find ranks the expected skill first
-  const find = await mg(env, ["find", "optimize react rendering performance"]);
+  const find = await mg(env, ["find", "--category", "general", "optimize react rendering performance"]);
   assert.equal(find.code, 0, find.stderr);
   assert.match(find.stdout, new RegExp(`^1\\. ${id}/react-perf `, "u"));
   assert.ok(find.stdout.endsWith(`load: margrave load ${id}/react-perf\n\n${FIND_GUIDANCE}\n`));
-  const pg = JSON.parse((await mg(env, ["find", "tune postgresql indexes", "--json", "--limit", "1"])).stdout) as {
+  const pg = JSON.parse((await mg(env, ["find", "--category", "general", "tune postgresql indexes", "--json", "--limit", "1"])).stdout) as {
     results: { id: string }[];
   };
   assert.deepEqual(
     pg.results.map((r) => r.id),
     [`${id}/postgres-tuning`],
   );
-  const none = await mg(env, ["find", "kubernetes operators"]);
+  const none = await mg(env, ["find", "--category", "general", "kubernetes operators"]);
   assert.equal(none.code, 0);
   assert.match(none.stdout, /^no match\n/u);
 
@@ -290,7 +290,7 @@ test("git source via file://: install, duplicate, find, load, update, remove", a
   assert.equal(rm1.code, 0, rm1.stderr);
   assert.deepEqual(await names(path.join(env.home, "sources")), []);
   assert.equal((await snapshot(env.home)).sources?.trim(), "[]");
-  const empty = await mg(env, ["find", "react"]);
+  const empty = await mg(env, ["find", "--category", "general", "react"]);
   assert.equal(empty.stdout.trim(), `no skill sources installed; run: margrave install <owner/repo|path>\n\n${FIND_GUIDANCE}`);
 });
 
@@ -711,7 +711,7 @@ test("local directory source: install, find, load, update, remove leaves the dir
   assert.match(dup.stderr, /already installed/u);
   assert.equal((await mg(env, ["install", dir, "--ref", "main"])).code, 2);
 
-  const find = await mg(env, ["find", "terraform modules"]);
+  const find = await mg(env, ["find", "--category", "general", "terraform modules"]);
   assert.match(find.stdout, new RegExp(`^1\\. ${id}/terraform-modules `, "u"));
   const load = await mg(env, ["load", "terraform-modules"]);
   assert.equal(load.code, 0, load.stderr);
@@ -844,7 +844,7 @@ test("usage errors exit 2, unknown commands exit 2, and find/list say when no so
   assert.equal((await mg(env, [])).code, 2);
   assert.equal((await mg(env, ["bogus"])).code, 2);
   assert.equal((await mg(env, ["install"])).code, 2);
-  assert.equal((await mg(env, ["find", "x", "--bogus"])).code, 2);
+  assert.equal((await mg(env, ["find", "--category", "general", "x", "--bogus"])).code, 2);
   assert.equal((await mg(env, ["install", "-x"])).code, 2);
   assert.equal((await mg(env, ["install", "owner/repo/../x"])).code, 2);
   assert.equal((await mg(env, ["wrap", "nope"])).code, 2);
@@ -853,7 +853,7 @@ test("usage errors exit 2, unknown commands exit 2, and find/list say when no so
   assert.match(help.stdout, /usage: margrave/u);
 
   const msg = "no skill sources installed; run: margrave install <owner/repo|path>";
-  assert.equal((await mg(env, ["find", "x"])).stdout.trim(), `${msg}\n\n${FIND_GUIDANCE}`);
+  assert.equal((await mg(env, ["find", "--category", "general", "x"])).stdout.trim(), `${msg}\n\n${FIND_GUIDANCE}`);
   assert.equal((await mg(env, ["list"])).stdout.trim(), msg);
   assert.deepEqual(JSON.parse((await mg(env, ["list", "--json"])).stdout), { sources: [] });
   assert.equal((await mg(env, ["load", "x"])).code, 1);
@@ -878,7 +878,7 @@ test("with no sources: update, find --json, and list --skills say so", async () 
   const upd = await mg(env, ["update"]);
   assert.equal(upd.code, 0, upd.stderr);
   assert.equal(upd.stdout.trim(), NO_SOURCES);
-  const find = await mg(env, ["find", "anything", "--json"]);
+  const find = await mg(env, ["find", "--category", "general", "anything", "--json"]);
   assert.equal(find.code, 0, find.stderr);
   assert.deepEqual(JSON.parse(find.stdout), { task: "anything", results: [], guidance: FIND_GUIDANCE, message: NO_SOURCES });
   assert.equal((await mg(env, ["list", "--skills"])).stdout.trim(), NO_SOURCES);
@@ -1156,7 +1156,8 @@ test("reference-only updates change revision and pinned reads detect drift", asy
   const installed = await mg(env, ["install", repo.url]);
   assert.equal(installed.code, 0, installed.stderr);
   const id = `${sourceId(installed)}/react-perf`;
-  const find = async () => JSON.parse((await mg(env, ["find", id, "--json"])).stdout) as { results: { revision: string }[] };
+  const find = async () =>
+    JSON.parse((await mg(env, ["find", "--category", "general", id, "--json"])).stdout) as { results: { revision: string }[] };
   const old = (await find()).results[0]!.revision;
   const oldHash = createHash("sha256")
     .update(await readFile(path.join(repo.dir, "skills", "react-perf", "SKILL.md")))

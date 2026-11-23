@@ -124,7 +124,7 @@ test("sources install direct preserves unrelated local records and selection thr
         },
       );
       assert.throws(() => resolveSkill(db, `${id}/extra`), {
-        message: `no skill "${id}/extra"; run: margrave find "<task>" or margrave list --skills`,
+        message: `no skill "${id}/extra"; run: margrave find "<task>" --category general or margrave list --skills`,
       });
     } finally {
       db.close();
@@ -343,7 +343,7 @@ test("sources install direct publishes selected Git snapshots and accepts manage
         },
       );
       assert.throws(() => resolveSkill(db, `${id}/docker-compose`), {
-        message: `no skill "${id}/docker-compose"; run: margrave find "<task>" or margrave list --skills`,
+        message: `no skill "${id}/docker-compose"; run: margrave find "<task>" --category general or margrave list --skills`,
       });
     } finally {
       db.close();

@@ -285,7 +285,7 @@ test("HTTP CLI serves the catalog and enforces its boundary", async (t) => {
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`)));
   t.after(() => client.close());
   assert.ok((await client.listTools()).tools.some((tool) => tool.name === "find_skills"));
-  assert.match((await call(client, "find_skills", { task: "alpha" })).text, /alpha/u);
+  assert.match((await call(client, "find_skills", { category: "general", task: "alpha" })).text, /alpha/u);
   assert.match((await call(client, "load_skill", { id: `${id}/alpha` })).text, /alpha/u);
   const notification = await fetch(`${base}/mcp`, {
     method: "POST",

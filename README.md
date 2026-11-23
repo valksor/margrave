@@ -6,7 +6,7 @@
 
 margrave keeps agent skills (folders with a `SKILL.md`) in one store. It does not install them into any agent. An agent asks for what it needs in plain words, gets ranked suggestions, and loads one skill from the store.
 
-- `margrave find "<task>"` returns ranked skills.
+- `margrave find "<task>" --category general` returns ranked skills.
 - `margrave load <id>` prints one skill.
 - `margrave mcp` runs a stdio MCP server with the same functions, for agents that use MCP.
 - `margrave/hosted` exports the same MCP tools over HTTP, for a server that hosts its own skill store.
@@ -143,35 +143,35 @@ Run the printed command yourself, and add the snippet to the agent's instruction
 ## 4. Check it
 
 ```sh
-margrave find "react performance"
+margrave find "profile rendering performance" --category react
 margrave load <id from the result>
 ```
 
-Set `MARGRAVE_SKILLS_SH=1` to enable public suggestions for the CLI and stdio MCP. Pass a short capability description as `--catalog-query` or the MCP `catalogQuery` argument. Only that description goes to skills.sh, and only after a local miss. Keep task details in the local search query.
+Set `MARGRAVE_SKILLS_SH=1` to enable public suggestions for the CLI and stdio MCP. Pass a short capability description as `--catalog-query` or the MCP `catalogQuery` argument. Only that description goes to skills.sh, and only after a local miss. Include the technology in the public query if it matters for suggestions. Keep task details in the installed search.
 
 ```sh
-MARGRAVE_SKILLS_SH=1 margrave find "precise local task" --catalog-query terraform
+MARGRAVE_SKILLS_SH=1 margrave find "precise local task" --category terraform --catalog-query "terraform modules"
 ```
 
-`{"task":"precise local task","catalogQuery":"terraform"}`
+`{"task":"precise local task","category":"terraform","catalogQuery":"terraform modules"}`
 
 Each suggestion links to its catalog page and shows a manual command. Use `margrave install owner/repo --skill <name>` for a new source or `margrave update <source-id> --skill <name>` to expand a selective install.
 
 ## Commands
 
-| Command                                                                                      | What it does                                                                                                                                                                                                                                                                                 |
-| -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `margrave install <spec> [--ref R] [--allow-unsafe] [--skill NAME ...]`                      | Add a source. Margrave stages and scans Git content before publication. A source must contain at least one valid skill. An installed source ID cannot be installed twice. Use --ref to select a Git branch or tag. Local sources do not accept --ref.                                        |
-| `margrave update [source] [--ref R] [--allow-unsafe] [--skill NAME ...]`                     | For Git sources, fetch and scan the tracked branch or tag before publishing the new revision. Keep retired snapshots for readers. Update prints the old and new commits and the skills that changed. Local updates reindex the registered directory. Omit the source to update every source. |
-| `margrave remove <source>`                                                                   | Unregister the source and remove its compatibility link. Keep retired Git snapshots for readers. The command leaves registered local directories untouched.                                                                                                                                  |
-| `margrave list [--skills] [--json]`                                                          | Sources with kind, ref, commit, and skill count. `--skills` adds every skill id and its description.                                                                                                                                                                                         |
-| `margrave find "<task>" [--limit N] [--json] [--explain] [--browse] [--catalog-query QUERY]` | Top N recommended skills by BM25 (default 5, clamped to 1..25). With no recommendation it exits 0 and prints `no match`. Use `--explain` to include weak matches and see why each skill matched.                                                                                             |
-| `margrave load <id> [--json] [--revision <hash>]`                                            | Prints a header and the `SKILL.md` body. The header has `skill:`, `source:`, `commit:`, `base:` (the absolute skill directory, so relative references such as `references/x.md` resolve), the raw frontmatter, and the file list.                                                            |
-| `margrave load <id> --file <rel> [--revision <hash>]`                                        | Prints one file in the skill directory. See "Path guard".                                                                                                                                                                                                                                    |
-| `margrave reindex`                                                                           | Rescan all sources and rebuild `index.db`.                                                                                                                                                                                                                                                   |
-| `margrave mcp`                                                                               | stdio MCP server (see below).                                                                                                                                                                                                                                                                |
-| `margrave wrap <claude\|codex\|bb\|generic>`                                                 | Print setup text.                                                                                                                                                                                                                                                                            |
-| `margrave version`                                                                           | Print the version (`--version` and `-v` do the same).                                                                                                                                                                                                                                        |
+| Command                                                                                                          | What it does                                                                                                                                                                                                                                                                                 |
+| ---------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `margrave install <spec> [--ref R] [--allow-unsafe] [--skill NAME ...]`                                          | Add a source. Margrave stages and scans Git content before publication. A source must contain at least one valid skill. An installed source ID cannot be installed twice. Use --ref to select a Git branch or tag. Local sources do not accept --ref.                                        |
+| `margrave update [source] [--ref R] [--allow-unsafe] [--skill NAME ...]`                                         | For Git sources, fetch and scan the tracked branch or tag before publishing the new revision. Keep retired snapshots for readers. Update prints the old and new commits and the skills that changed. Local updates reindex the registered directory. Omit the source to update every source. |
+| `margrave remove <source>`                                                                                       | Unregister the source and remove its compatibility link. Keep retired Git snapshots for readers. The command leaves registered local directories untouched.                                                                                                                                  |
+| `margrave list [--skills] [--json]`                                                                              | Sources with kind, ref, commit, and skill count. `--skills` adds every skill id and its description.                                                                                                                                                                                         |
+| `margrave find "<task>" --category CATEGORY [--limit N] [--json] [--explain] [--browse] [--catalog-query QUERY]` | Top N recommended skills by BM25 (default 5, clamped to 1..25). Use `general` to search across technologies. With no recommendation it exits 0 and prints `no match`. Use `--explain` to include weak matches and see why each skill matched.                                                |
+| `margrave load <id> [--json] [--revision <hash>]`                                                                | Prints a header and the `SKILL.md` body. The header has `skill:`, `source:`, `commit:`, `base:` (the absolute skill directory, so relative references such as `references/x.md` resolve), the raw frontmatter, and the file list.                                                            |
+| `margrave load <id> --file <rel> [--revision <hash>]`                                                            | Prints one file in the skill directory. See "Path guard".                                                                                                                                                                                                                                    |
+| `margrave reindex`                                                                                               | Rescan all sources and rebuild `index.db`.                                                                                                                                                                                                                                                   |
+| `margrave mcp`                                                                                                   | stdio MCP server (see below).                                                                                                                                                                                                                                                                |
+| `margrave wrap <claude\|codex\|bb\|generic>`                                                                     | Print setup text.                                                                                                                                                                                                                                                                            |
+| `margrave version`                                                                                               | Print the version (`--version` and `-v` do the same).                                                                                                                                                                                                                                        |
 
 `margrave list --skills --json` returns the same catalog as `GET /skills.json` for the same current store. The source records contain `id`, `kind`, `ref`, `commit`, and `skillCount`. The skill records contain `id`, `name`, `description`, and `source`, which matches the owning source ID. Use `margrave list --json` for full local source records.
 
@@ -289,11 +289,11 @@ Limit: the baseline compares the flagged line, not the lines around it. A known 
 
 The `margrave mcp` tools are read-only. `install`, `update`, and `remove` are not exposed. It opens `index.db` on every call, so a new install shows up without a restart. After upgrading Margrave, restart running `margrave mcp` sessions.
 
-| Tool              | Input                                                    | Result                                                                                                                              |
-| ----------------- | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `find_skills`     | `task`, `limit?`, `explain?`, `browse?`, `catalogQuery?` | Recommended skill IDs with descriptions, or a question that asks for details. Set `explain` to show weak matches and matched terms. |
-| `load_skill`      | `id`, `revision?`                                        | The same text as `margrave load`.                                                                                                   |
-| `read_skill_file` | `id`, `path`, `revision?`                                | One file, with the same guard as `--file`.                                                                                          |
+| Tool              | Input                                                                | Result                                                                                                                              |
+| ----------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `find_skills`     | `task`, `category`, `limit?`, `explain?`, `browse?`, `catalogQuery?` | Recommended skill IDs with descriptions, or a question that asks for details. Set `explain` to show weak matches and matched terms. |
+| `load_skill`      | `id`, `revision?`                                                    | The same text as `margrave load`.                                                                                                   |
+| `read_skill_file` | `id`, `path`, `revision?`                                            | One file, with the same guard as `--file`.                                                                                          |
 
 Both MCP load tools verify file contents against the selected revision. The active indexed revision applies when the caller omits `revision`.
 
@@ -366,13 +366,15 @@ Pass `handleHostedMcp` as the example's `handle` option. Supply bearer tokens fr
 
 Each result includes the indexed skill revision. Pass it with `margrave load <id> --revision <hash>` to verify the selected content.
 
+Use `general` to search across all visible installed skills. A technology category such as `react`, `vue`, or `php` requires every category term to appear in the skill name or headings. The task then determines which of those skills to recommend. Category names are case-insensitive. Values such as `C`, `C++`, and `C#` have no searchable terms. Use a spelling such as `cpp` or `csharp` if it appears in the skill name or headings.
+
 Margrave ranks results with weighted SQLite FTS5 BM25. Field weights are name 3, description 2, headings 1, and body 0.3. The index uses the first 2,000 body tokens. Margrave normalizes Unicode text, preserves accents, and applies English stemming to ASCII words.
 
 An exact match of the query to a name or id (case-insensitive) ranks first. Its shown score has a fixed bonus of 10. Ties break by id in byte order (the UTF-8 bytes of the id). A query uses at most 32 distinct tokens, in the order they appear; later tokens are dropped.
 
 An exact query match to a skill name or ID ranks first. A single term also qualifies when it uniquely matches a visible skill description and matches no visible skill name. For longer queries, a skill qualifies when all terms match or when at least two distinct terms match its name, description, or headings and cover one third of the query.
 
-`margrave find --explain` includes weak matches after recommendations. The explanation shows the indexed fields and stemmed terms that matched. The JSON output adds `recommended`, `exact`, and `matchedTerms` to each result. The load hint points to a recommended result when one exists.
+`margrave find "<task>" --category general --explain` includes weak matches after recommendations. The explanation shows the indexed fields and stemmed terms that matched. The JSON output adds `recommended`, `exact`, and `matchedTerms` to each result. The load hint points to a recommended result when one exists.
 
 FTS5 sets the IDF of a term that is in half or more of the skills to almost zero. On a small store, or for a common word, scores can show as `0.000`. Scores rank the results of one query; do not use them as absolute thresholds.
 
@@ -389,6 +391,8 @@ The compatibility link at `sources/<id>` points to the active Git snapshot. A wr
 To reclaim space, stop all Margrave readers and writers. Use `margrave list --json` to identify the active snapshot for each Git source. Remove only retired snapshot directories that no active source record references. Keep the active catalog and its referenced snapshots together. Take a complete store backup before removing retired snapshots.
 
 ## Upgrading
+
+Skill search requires a category. Add `--category general` to existing CLI calls and `"category": "general"` to existing MCP arguments to keep the broad search. Run `margrave wrap <agent>` again to refresh previously copied agent instructions. Refresh the tool list in MCP clients that cache tool schemas.
 
 `margrave list --skills --json` now returns source summaries in place of full source records. If you need the old fields, read the full records with `margrave list --json` and join them to skills by `sources[].id` and `skills[].source`.
 

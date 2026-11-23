@@ -1,4 +1,4 @@
-import { MAX_LIMIT, clampLimit } from "./bm25.ts";
+import { MAX_LIMIT, clampLimit, queryTerms } from "./bm25.ts";
 import { findSkillsWithCount, loadContext } from "./skills.ts";
 import type { Context, FindHit } from "./skills.ts";
 import type { SourceRecord } from "./store.ts";
@@ -111,17 +111,27 @@ function enrichRecommendations(ctx: Context, hits: FindHit[]): Recommendation[] 
 
 interface InstalledSearch {
   task: string;
+  categoryQuery: string | null;
   limit: unknown;
   explain: boolean;
   allowedSources: ReadonlySet<string> | undefined;
   browse: boolean;
 }
 
+/** Return the FTS filter, null for general, or undefined for invalid input. */
+export function parseFindCategory(category: string | undefined): string | null | undefined {
+  const name = category?.trim().toLowerCase();
+  if (name === undefined) return undefined;
+  if (name === "general") return null;
+  const terms = queryTerms(name);
+  return terms.length === 0 ? undefined : `{name headings} : (${terms.map((term) => `"${term}"`).join(" AND ")})`;
+}
+
 function searchInstalled(
   ctx: Context,
-  { task, limit, explain, allowedSources, browse }: InstalledSearch,
+  { task, categoryQuery, limit, explain, allowedSources, browse }: InstalledSearch,
 ): { hits: Recommendation[]; clarification?: Clarification } {
-  const { hits, matchCount, exact } = findSkillsWithCount(ctx.db, task, limit, explain, allowedSources);
+  const { hits, matchCount, exact } = findSkillsWithCount(ctx.db, task, limit, explain, allowedSources, categoryQuery);
   if (!exact && !browse && matchCount >= MAX_LIMIT)
     return {
       hits: [],
@@ -138,12 +148,13 @@ export async function searchSkills(
   allowedSources?: ReadonlySet<string>,
   catalogQuery?: string,
   browse = false,
+  categoryQuery: string | null = null,
 ): Promise<{ hits: Recommendation[]; noSources: boolean; suggestions: Suggestion[]; clarification?: Clarification }> {
   const ctx = await loadContext();
   let result: { hits: Recommendation[]; clarification?: Clarification } = { hits: [] };
   if (ctx !== null) {
     try {
-      result = searchInstalled(ctx, { task, limit, explain, allowedSources, browse });
+      result = searchInstalled(ctx, { task, categoryQuery, limit, explain, allowedSources, browse });
     } finally {
       ctx.db.close();
     }

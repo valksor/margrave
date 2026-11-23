@@ -263,10 +263,10 @@ test("resolution respects source scope and revision diagnostics", async (t) => {
   try {
     assert.equal(resolveSkill(db, "z/shared").id, "z/shared");
     assert.equal(resolveSkill(db, "shared", undefined, new Set(["a"])).id, "a/shared");
-    const missing = 'no skill "z/shared"; run: margrave find "<task>" or margrave list --skills';
+    const missing = 'no skill "z/shared"; run: margrave find "<task>" --category general or margrave list --skills';
     assert.throws(() => resolveSkill(db, "z/shared", undefined, new Set(["a"])), { message: missing });
     assert.throws(() => resolveSkill(db, "shared", undefined, new Set()), {
-      message: 'no skill "shared"; run: margrave find "<task>" or margrave list --skills',
+      message: 'no skill "shared"; run: margrave find "<task>" --category general or margrave list --skills',
     });
     assert.throws(() => resolveSkill(db, "shared"), { message: '"shared" is ambiguous; use one of these ids:\n  a/shared\n  z/shared' });
     assert.throws(() => resolveSkill(db, "missing", `sha256:${"a".repeat(64)}`), { message: "skill revision changed; search again" });

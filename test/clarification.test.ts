@@ -3,6 +3,7 @@ import { rm } from "node:fs/promises";
 import test from "node:test";
 import { fakeRipwire, runCli, tmp, writeSkill, disposableHome, newEntry, seedIndex, connectHosted, CLI, stdioTestEnv } from "./helpers.ts";
 import { FIND_GUIDANCE, searchSkills } from "../src/search.ts";
+import { buildFieldTokens } from "../src/bm25.ts";
 import type { Clarification } from "../src/search.ts";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
@@ -26,26 +27,77 @@ test("frontend and migration searches use ordinary ranking", async (t) => {
   }
 });
 
+test("on hosted MCP a category requires evidence in the name or headings", async (t) => {
+  await disposableHome(t);
+  const joint = newEntry("joint", "frontend-interop", "Frontend work across frameworks");
+  joint.tokens = buildFieldTokens({ ...joint, headings: ["React Native and Vue"], body: "" });
+  await seedIndex([
+    newEntry("one", "react-guide", "React frontend work"),
+    newEntry("two", "vue-guide", "Vue frontend work. Compare to React."),
+    newEntry("three", "php-guide", "PHP frontend work"),
+    joint,
+  ]);
+  const client = await connectHosted(t);
+  for (const [category, names] of [
+    ["general", ["frontend-interop", "php-guide", "react-guide", "vue-guide"]],
+    ["react", ["frontend-interop", "react-guide"]],
+    [" React Native ", ["frontend-interop"]],
+    ["vue", ["frontend-interop", "vue-guide"]],
+    ["php", ["php-guide"]],
+    ["rust", []],
+  ] as const) {
+    const result = await client.callTool({ name: "find_skills", arguments: { task: "frontend work", category } });
+    assert.notEqual(result.isError, true);
+    assert.deepEqual((result.structuredContent as { results: { name: string }[] }).results.map((hit) => hit.name).sort(), names);
+  }
+  const exactTask = "two/vue-guide";
+  const exact = await client.callTool({ name: "find_skills", arguments: { task: exactTask, category: "general" } });
+  assert.equal((exact.structuredContent as { results: { id: string }[] }).results[0]?.id, exactTask);
+  const explained = await client.callTool({ name: "find_skills", arguments: { task: exactTask, category: "react", explain: true } });
+  const weak = (explained.structuredContent as { results: { id: string; recommended: boolean }[] }).results;
+  assert.deepEqual(
+    weak.toSorted((a, b) => a.id.localeCompare(b.id)).map((hit) => [hit.id, hit.recommended]),
+    [
+      ["joint/frontend-interop", false],
+      ["one/react-guide", false],
+    ],
+  );
+  const limited = await connectHosted(t, ["two", "joint"]);
+  const scoped = await limited.callTool({ name: "find_skills", arguments: { task: "frontend work", category: "react" } });
+  assert.deepEqual(
+    (scoped.structuredContent as { results: { name: string }[] }).results.map((hit) => hit.name),
+    ["frontend-interop"],
+  );
+});
+
 test("counts all recommendations before the requested limit", async (t) => {
   const dir = await tmp("mg-count-source-");
   const home = await tmp("mg-count-home-");
   const fakeBin = await fakeRipwire();
   t.after(async () => Promise.all([dir, home, fakeBin].map((p) => rm(p, { recursive: true, force: true }))));
-  for (let i = 0; i < 26; i++) await writeSkill(dir, `database-task-${i}`, "Database task guidance");
+  for (let i = 0; i < 25; i++) await writeSkill(dir, `database-task-${i}`, "Database task guidance");
+  await writeSkill(dir, "postgres-maintenance", "Database task guidance");
   const install = await runCli(["install", dir], { home, fakeBin });
   assert.equal(install.code, 0, install.stderr);
-  const result = await runCli(["find", "database task", "--limit", "1", "--json"], { home, fakeBin });
+  const result = await runCli(["find", "--category", "general", "database task", "--limit", "1", "--json"], { home, fakeBin });
   assert.equal(result.code, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout).clarification, {
     kind: "refine",
     question: "What specific task should the skills cover?",
     matchCount: 26,
   });
-  const browse = await runCli(["find", "database task", "--limit", "1", "--browse", "--json"], { home, fakeBin });
+  const scoped = await runCli(["find", "database task", "--category", "database", "--limit", "1", "--json"], { home, fakeBin });
+  assert.equal(scoped.code, 0, scoped.stderr);
+  assert.equal(JSON.parse(scoped.stdout).clarification.matchCount, 25);
+  const narrow = await runCli(["find", "database task", "--category", "postgres", "--limit", "1", "--json"], { home, fakeBin });
+  assert.equal(narrow.code, 0, narrow.stderr);
+  assert.equal(JSON.parse(narrow.stdout).clarification, undefined);
+  assert.equal(JSON.parse(narrow.stdout).results[0]?.name, "postgres-maintenance");
+  const browse = await runCli(["find", "--category", "general", "database task", "--limit", "1", "--browse", "--json"], { home, fakeBin });
   assert.equal(browse.code, 0, browse.stderr);
   assert.equal(JSON.parse(browse.stdout).results.length, 1);
   assert.equal(JSON.parse(browse.stdout).clarification, undefined);
-  const exact = await runCli(["find", "database-task-1", "--json"], { home, fakeBin });
+  const exact = await runCli(["find", "--category", "general", "database-task-1", "--json"], { home, fakeBin });
   assert.equal(exact.code, 0, exact.stderr);
   assert.equal(JSON.parse(exact.stdout).clarification, undefined);
   assert.ok(JSON.parse(exact.stdout).results.some((hit: { name: string }) => hit.name === "database-task-1"));
@@ -102,12 +154,12 @@ test("stdio and hosted MCP return clarification text and structured content", as
     newEntry("two", "vue-frontend", "Vue frontend development"),
     ...Array.from({ length: 25 }, (_, i) => newEntry("count", `database-task-${i}`, "Database task guidance")),
   ]);
-  const cli = await runCli(["find", "frontend development"], { home });
+  const cli = await runCli(["find", "--category", "general", "frontend development"], { home });
   assert.equal(cli.code, 0, cli.stderr);
   assert.equal(cli.stdout.split(FIND_GUIDANCE).length - 1, 1);
-  const json = await runCli(["find", "frontend development", "--json"], { home });
+  const json = await runCli(["find", "--category", "general", "frontend development", "--json"], { home });
   assert.equal(JSON.parse(json.stdout).guidance, FIND_GUIDANCE);
-  const countCli = await runCli(["find", "database task guidance"], { home });
+  const countCli = await runCli(["find", "--category", "general", "database task guidance"], { home });
   assert.match(countCli.stdout, /25 installed skills match/u);
   assert.match(countCli.stdout, /Use --browse/u);
   assert.equal(countCli.stdout.split(FIND_GUIDANCE).length - 1, 1);
@@ -122,11 +174,14 @@ test("stdio and hosted MCP return clarification text and structured content", as
   t.after(() => local.close());
   const hosted = await connectHosted(t);
   for (const client of [local, hosted]) {
-    const result = await client.callTool({ name: "find_skills", arguments: { task: "frontend development" } });
+    const result = await client.callTool({ name: "find_skills", arguments: { category: "general", task: "frontend development" } });
     assert.notEqual(result.isError, true);
     assert.equal((result.structuredContent as { guidance: string }).guidance, FIND_GUIDANCE);
     assert.equal((result.content as { text: string }[])[0]!.text.split(FIND_GUIDANCE).length - 1, 1);
-    const count = await client.callTool({ name: "find_skills", arguments: { task: "database task guidance", limit: 1 } });
+    const count = await client.callTool({
+      name: "find_skills",
+      arguments: { category: "general", task: "database task guidance", limit: 1 },
+    });
     assert.notEqual(count.isError, true);
     const countData = count.structuredContent as { results: unknown[]; suggestions: unknown[]; clarification?: Clarification } | undefined;
     assert.ok(countData?.clarification);

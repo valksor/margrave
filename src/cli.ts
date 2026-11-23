@@ -33,7 +33,7 @@ import {
 import type { Ctx } from "./sources.ts";
 import { MargraveError, RequestError, UsageError } from "./store.ts";
 import { wrap } from "./wrap.ts";
-import { FIND_GUIDANCE, formatClarification, formatSuggestions, searchSkills } from "./search.ts";
+import { FIND_GUIDANCE, formatClarification, formatSuggestions, parseFindCategory, searchSkills } from "./search.ts";
 
 const USAGE = `usage: margrave <command>
 
@@ -44,7 +44,9 @@ const USAGE = `usage: margrave <command>
   lock restore <file>                         restore locked Git sources
   remove <source>                             remove a source (never deletes a local directory)
   list [--skills] [--json]                    list sources, and with --skills every skill
-  find "<task>" [--limit N] [--json] [--explain] [--browse] [--catalog-query QUERY]  rank installed skills for a task
+  find "<task>" --category CATEGORY [--limit N] [--json] [--explain] [--browse] [--catalog-query QUERY]
+                                              search installed skills by technology or use general
+                                              use --catalog-query for public suggestions
   load <id> [--json] [--revision <hash>]      print one skill
   load <id> --file <path> [--revision <hash>] print one file inside a skill directory
   reindex                                     rescan all sources
@@ -195,14 +197,17 @@ async function listCommand(rest: string[]): Promise<void> {
 
 async function findCommand(rest: string[]): Promise<void> {
   const p = parse(rest, {
+    category: { type: "string" },
     limit: { type: "string" },
     json: { type: "boolean" },
     explain: { type: "boolean" },
     browse: { type: "boolean" },
     "catalog-query": { type: "string" },
   });
-  const words = positionals(p, 1, Number.POSITIVE_INFINITY, 'find "<task>"');
+  const words = positionals(p, 1, Number.POSITIVE_INFINITY, 'find "<task>" --category CATEGORY');
   const task = words.join(" ");
+  const categoryQuery = parseFindCategory(p.values["category"] as string | undefined);
+  if (categoryQuery === undefined) throw new UsageError("Use --category general or specify a technology with searchable words.");
   await migrateStore();
   const { hits, noSources, suggestions, clarification } = await searchSkills(
     task,
@@ -212,6 +217,7 @@ async function findCommand(rest: string[]): Promise<void> {
     undefined,
     p.values["catalog-query"] as string | undefined,
     p.values["browse"] === true,
+    categoryQuery,
   );
   if (p.values["json"] === true)
     json({

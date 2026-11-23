@@ -211,12 +211,12 @@ test("search relevance and CLI/MCP parity on an installed corpus", async (t) => 
     const weak = hits.find((hit) => hit.id === `${source}/body-evidence`);
     assert.equal(weak?.recommended, false);
     assert.deepEqual(weak?.matchedTerms?.body, ["docker"]);
-    const cli = await runCli(["find", query, "--explain"], { home, fakeBin });
+    const cli = await runCli(["find", "--category", "general", query, "--explain"], { home, fakeBin });
     assert.equal(cli.code, 0, cli.stderr);
     assert.match(cli.stdout, /weak match/u);
     assert.match(cli.stdout, /matches in body \(docker\)/u);
     assert.doesNotMatch(cli.stdout, /load:/u);
-    const json = await runCli(["find", query, "--explain", "--json"], { home, fakeBin });
+    const json = await runCli(["find", "--category", "general", query, "--explain", "--json"], { home, fakeBin });
     assert.equal(json.code, 0, json.stderr);
     assert.deepEqual(
       (JSON.parse(json.stdout) as { results: typeof hits }).results,
@@ -268,7 +268,7 @@ test("search relevance and CLI/MCP parity on an installed corpus", async (t) => 
   });
   await t.test("CLI and stdio MCP agree on limited ordered results and hint", async () => {
     const query = "profile rendering performance";
-    const cli = await runCli(["find", query, "--limit", "2", "--json"], { home, fakeBin });
+    const cli = await runCli(["find", "--category", "general", query, "--limit", "2", "--json"], { home, fakeBin });
     assert.equal(cli.code, 0, cli.stderr);
     for (const hit of (JSON.parse(cli.stdout) as { results: { revision: string }[] }).results) {
       assert.match(hit.revision, /^sha256:[0-9a-f]{64}$/u);
@@ -283,7 +283,7 @@ test("search relevance and CLI/MCP parity on an installed corpus", async (t) => 
     });
     await client.connect(transport);
     try {
-      const result = await client.callTool({ name: "find_skills", arguments: { task: query, limit: 2 } });
+      const result = await client.callTool({ name: "find_skills", arguments: { category: "general", task: query, limit: 2 } });
       assert.notEqual(result.isError, true);
       const text = (result.content as { text: string }[]).map((item) => item.text).join("\n");
       assert.deepEqual(
@@ -291,13 +291,30 @@ test("search relevance and CLI/MCP parity on an installed corpus", async (t) => 
         ids,
       );
       assert.ok(text.includes(`load: margrave load ${ids[0]}`));
-      const plain = await runCli(["find", query, "--limit", "2"], { home, fakeBin });
+      const focused = await runCli(["find", query, "--category", "react", "--json"], { home, fakeBin });
+      assert.equal(focused.code, 0, focused.stderr);
+      const reactId = `${source}/react-perf`;
+      assert.deepEqual(
+        (JSON.parse(focused.stdout) as { results: { id: string }[] }).results.map((hit) => hit.id),
+        [reactId],
+      );
+      const focusedMcp = await client.callTool({ name: "find_skills", arguments: { task: query, category: "react" } });
+      assert.notEqual(focusedMcp.isError, true);
+      assert.deepEqual(
+        (focusedMcp.structuredContent as { results: { id: string }[] }).results.map((hit) => hit.id),
+        [reactId],
+      );
+      const general = await runCli(["find", query, "--category", " GeNeRaL ", "--limit", "2", "--json"], { home, fakeBin });
+      assert.deepEqual(general, cli);
+      const generalMcp = await client.callTool({ name: "find_skills", arguments: { task: query, category: " GeNeRaL ", limit: 2 } });
+      assert.deepEqual(generalMcp.structuredContent, result.structuredContent);
+      const plain = await runCli(["find", "--category", "general", query, "--limit", "2"], { home, fakeBin });
       assert.equal(plain.code, 0, plain.stderr);
       assert.ok(plain.stdout.includes(`load: margrave load ${ids[0]}`));
       const weakQuery = "How do I repair a toaster with Docker?";
-      const weak = await client.callTool({ name: "find_skills", arguments: { task: weakQuery, explain: true } });
+      const weak = await client.callTool({ name: "find_skills", arguments: { category: "general", task: weakQuery, explain: true } });
       const weakText = (weak.content as { text: string }[]).map((item) => item.text).join("\n");
-      const cliWeak = await runCli(["find", weakQuery, "--explain"], { home, fakeBin });
+      const cliWeak = await runCli(["find", "--category", "general", weakQuery, "--explain"], { home, fakeBin });
       assert.equal(weakText, cliWeak.stdout.trimEnd());
       assert.match(weakText, /weak match/u);
       assert.doesNotMatch(weakText, /load:/u);

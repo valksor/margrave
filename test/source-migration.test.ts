@@ -97,12 +97,12 @@ test("schema 3 migration rebuilds search and preserves accepted Git records", as
   assert.match(rejected.stderr, /cannot upgrade source/u);
   assert.deepEqual(await readFile(path.join(env.home, "index.db")), oldCatalog);
   await writeFile(skill, accepted);
-  const migrated = await mg(env, ["find", "react-perf"]);
+  const migrated = await mg(env, ["find", "--category", "general", "react-perf"]);
   assert.equal(migrated.code, 0, migrated.stderr);
   assert.match(migrated.stderr, /margrave: store upgraded\. Backup:/u);
   assert.match(migrated.stdout, /react-perf/u);
   assert.deepEqual(await snapshot(env.home), before);
-  assert.match((await mg(env, ["find", "react-perf"])).stdout, /react-perf/u);
+  assert.match((await mg(env, ["find", "--category", "general", "react-perf"])).stdout, /react-perf/u);
 });
 
 test("schema 3 automatic migration retries after termination before publication", async () => {
@@ -125,9 +125,12 @@ const rename = fs.rename;
 fs.rename = function(from, to) { if (to === ${JSON.stringify(path.join(home, "index.db"))}) process.kill(process.pid, "SIGKILL"); return rename.call(this, from, to); };
 syncBuiltinESMExports();\n`,
   );
-  assert.notEqual((await runCli(["find", "react-perf"], { home, fakeBin, nodeArgs: ["--import", preload] })).code, 0);
+  assert.notEqual(
+    (await runCli(["find", "--category", "general", "react-perf"], { home, fakeBin, nodeArgs: ["--import", preload] })).code,
+    0,
+  );
   assert.deepEqual(await readFile(path.join(home, "index.db")), original);
-  const found = await runCli(["find", "react-perf"], { home, fakeBin });
+  const found = await runCli(["find", "--category", "general", "react-perf"], { home, fakeBin });
   assert.equal(found.code, 0, found.stderr);
   assert.match(found.stdout, /react-perf/u);
   const loaded = await runCli(["load", "react-perf"], { home, fakeBin });
@@ -535,7 +538,7 @@ test("released v0.2.1 store remains usable after upgrade", async (t) => {
   const id = `${source}/release-upgrade`;
   const body = "The installed upgrade skill survived.";
   const sources = await readFile(path.join(home, "sources.json"), "utf8");
-  const beforeMigration = await runCli(["find", "release upgrade"], { home });
+  const beforeMigration = await runCli(["find", "--category", "general", "release upgrade"], { home });
   assert.equal(beforeMigration.code, 0, beforeMigration.stderr);
   assert.ok(beforeMigration.stdout.includes(id));
   const marker = JSON.parse(await readFile(path.join(home, "sources.json"), "utf8")) as { kind: string; backup: string };
@@ -561,9 +564,12 @@ test("released v0.2.1 store remains usable after upgrade", async (t) => {
   } finally {
     await chmod(home, 0o755);
   }
-  const found = await runCli(["find", "release upgrade"], { home });
+  const found = await runCli(["find", "release upgrade", "--category", "release"], { home });
   assert.equal(found.code, 0, found.stderr);
   assert.ok(found.stdout.includes(id), found.stdout);
+  const excluded = await runCli(["find", "release upgrade", "--category", "react"], { home });
+  assert.equal(excluded.code, 0, excluded.stderr);
+  assert.match(excluded.stdout, /no match/u);
   const loaded = await runCli(["load", id], { home });
   assert.equal(loaded.code, 0, loaded.stderr);
   assert.ok(loaded.stdout.includes(body), loaded.stdout);
@@ -585,9 +591,12 @@ test("released v0.2.1 store remains usable after upgrade", async (t) => {
   await chmod(home, 0o555);
   try {
     for (const mcp of [client, hosted]) {
-      const result = await call(mcp, "find_skills", { task: "release upgrade" });
+      const result = await call(mcp, "find_skills", { task: "release upgrade", category: "release" });
       assert.equal(result.isError, false, result.text);
       assert.ok(result.text.includes(id), result.text);
+      const miss = await call(mcp, "find_skills", { task: "release upgrade", category: "react" });
+      assert.equal(miss.isError, false, miss.text);
+      assert.match(miss.text, /no match/u);
       const skill = await call(mcp, "load_skill", { id });
       assert.equal(skill.isError, false, skill.text);
       assert.ok(skill.text.includes(body), skill.text);
@@ -638,7 +647,7 @@ test("stdio upgrades an untouched released store before serving", async (t) => {
   }
   await request(1, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } });
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
-  const found = await request(2, "tools/call", { name: "find_skills", arguments: { task: "release upgrade" } });
+  const found = await request(2, "tools/call", { name: "find_skills", arguments: { category: "general", task: "release upgrade" } });
   assert.match(found, /release-upgrade/u);
   const loaded = await request(3, "tools/call", {
     name: "load_skill",
@@ -702,7 +711,10 @@ DatabaseSync.prototype.exec = function(sql) {
     }
     await request(1, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } });
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
-    assert.match(await request(2, "tools/call", { name: "find_skills", arguments: { task: "release upgrade" } }), /release-upgrade/u);
+    assert.match(
+      await request(2, "tools/call", { name: "find_skills", arguments: { category: "general", task: "release upgrade" } }),
+      /release-upgrade/u,
+    );
     assert.match(
       await request(3, "tools/call", { name: "load_skill", arguments: { id: `${original[0]!.id}/release-upgrade` } }),
       /The installed upgrade skill survived/u,
@@ -722,8 +734,8 @@ test("concurrent first use publishes one backup", async (t) => {
   t.after(() => rm(parent, { recursive: true, force: true }));
   await copyLegacyStoreFixture(home);
   const results = await Promise.all([
-    runCli(["find", "release upgrade", "--json"], { home }),
-    runCli(["find", "release upgrade", "--json"], { home }),
+    runCli(["find", "--category", "general", "release upgrade", "--json"], { home }),
+    runCli(["find", "--category", "general", "release upgrade", "--json"], { home }),
   ]);
   for (const result of results) {
     assert.equal(result.code, 0, result.stderr);
@@ -740,9 +752,18 @@ test("usage and setup commands do not upgrade a legacy store", async (t) => {
   await copyLegacyStoreFixture(home);
   const index = await readFile(path.join(home, "index.db"));
   const sources = await readFile(path.join(home, "sources.json"));
-  for (const args of [["--help"], ["version"], ["wrap", "generic"], ["find"], ["update", "source", "--ref", "bad"]]) {
+  for (const args of [
+    ["--help"],
+    ["version"],
+    ["wrap", "generic"],
+    ["find"],
+    ["find", "release upgrade"],
+    ...[" ", "the", "C++"].map((category) => ["find", "release upgrade", "--category", category]),
+    ["update", "source", "--ref", "bad"],
+  ]) {
     const result = await runCli(args, { home });
     assert.equal(result.code, args[0] === "find" || args[0] === "update" ? 2 : 0, result.stderr);
+    if (args[0] === "find") assert.match(result.stderr, /--category/u);
     assert.deepEqual(await readFile(path.join(home, "index.db")), index);
     assert.deepEqual(await readFile(path.join(home, "sources.json")), sources);
   }
