@@ -57,9 +57,9 @@ export function resolveSkill(
   validateRevision(revision);
   const exact = db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE id = ?`).get(input) as IndexEntry | undefined;
   if (exact !== undefined && (allowedSources === undefined || allowedSources.has(exact.source))) return resolveDirectory(db, exact, mcp);
-  const byName = (db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE name = ?`).all(input) as IndexEntry[]).filter(
-    (entry) => allowedSources === undefined || allowedSources.has(entry.source),
-  );
+  const byName = (
+    db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE name_lc = ? AND name = ?`).all(input.toLowerCase(), input) as IndexEntry[]
+  ).filter((entry) => allowedSources === undefined || allowedSources.has(entry.source));
   if (byName.length === 1) return resolveDirectory(db, byName[0]!, mcp);
   if (byName.length !== 0) {
     const ids = byName
@@ -168,8 +168,9 @@ export function findCandidates(db: DatabaseSync, task: string, terms: string[], 
       .all(q, q, q, q, q, q, scopeJson, scopeJson) as Row[];
   } else {
     db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS temp.find_vocab USING fts5vocab(main, fts, instance)");
+    const evidenceScope = scope === undefined ? "" : " AND doc IN (SELECT rowid FROM ranked)";
     const sql = `${FIND_FTS}, ranked AS MATERIALIZED (${FIND_TAIL}), evidence AS MATERIALIZED (
-      SELECT doc, col, term FROM temp.find_vocab WHERE term IN (${terms.map(() => "?").join(",")}) GROUP BY doc, col, term
+      SELECT doc, col, term FROM temp.find_vocab WHERE term IN (${terms.map(() => "?").join(",")})${evidenceScope} GROUP BY doc, col, term
     ) SELECT rowid, id, name, description, revision, exact, score, NULL AS col, NULL AS term, 0 AS kind FROM ranked
       UNION ALL SELECT doc, NULL, NULL, NULL, NULL, 0, 0, col, term, 1 FROM evidence
       ORDER BY kind, exact DESC, score DESC, id, col, term`;

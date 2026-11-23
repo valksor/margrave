@@ -27,6 +27,7 @@ import test, { mock } from "node:test";
 import { MAX_QUERY_TERMS } from "../src/bm25.ts";
 import {
   findSkills,
+  findSkillsWithCount,
   formatFind,
   loadContext,
   NO_SOURCES_MESSAGE,
@@ -218,7 +219,9 @@ test("recommendation evidence and SQL scope use only visible hits", async (t) =>
   const db = await openIndexRead();
   try {
     const scope = new Set(["a"]);
-    const one = findSkills(db, "comet", 10, true, scope);
+    const { hits: one, matchCount, exact } = findSkillsWithCount(db, "comet", 10, true, scope);
+    assert.equal(matchCount, 1);
+    assert.equal(exact, false);
     assert.deepEqual(
       [one[0]?.id, one[0]?.recommended, one[0]?.matchedTerms],
       ["a/one", true, { name: [], description: ["comet"], headings: [], body: [] }],
@@ -461,11 +464,14 @@ test("query text never reaches the SQL: quotes, operators, and FTS syntax are pl
 
 test("resolveSkill answers from SQL: id, bare name, ambiguity, unknown", async (t) => {
   useHome(t, await tmp("mg-home-"));
-  await seedIndex([newEntry("a", "x"), newEntry("b", "x"), newEntry("a", "only")]);
+  await seedIndex([newEntry("a", "x"), newEntry("b", "x"), newEntry("a", "only"), newEntry("a", "Älpha"), newEntry("b", "älpha")]);
   const db = await openIndexRead();
   try {
     assert.equal(resolveSkill(db, "a/x").source, "a");
     assert.equal(resolveSkill(db, "only").id, "a/only");
+    assert.equal(resolveSkill(db, "Älpha").id, "a/Älpha");
+    assert.equal(resolveSkill(db, "älpha").id, "b/älpha");
+    assert.throws(() => resolveSkill(db, "ÄLPHA"), /no skill "ÄLPHA"/u);
     assert.throws(() => resolveSkill(db, "x"), /"x" is ambiguous; use one of these ids:\n {2}a\/x\n {2}b\/x/u);
     assert.throws(() => resolveSkill(db, "%"), /no skill "%"/u, "a LIKE wildcard matches nothing");
   } finally {
