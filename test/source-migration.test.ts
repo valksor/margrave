@@ -97,12 +97,15 @@ test("schema 3 migration rebuilds search and preserves accepted Git records", as
   assert.match(rejected.stderr, /cannot upgrade source/u);
   assert.deepEqual(await readFile(path.join(env.home, "index.db")), oldCatalog);
   await writeFile(skill, accepted);
-  const migrated = await mg(env, ["find", "--category", "general", "react-perf"]);
+  const focusedFind = ["find", "rendering performance", "--category", "react"];
+  const migrated = await mg(env, focusedFind);
   assert.equal(migrated.code, 0, migrated.stderr);
   assert.match(migrated.stderr, /margrave: store upgraded\. Backup:/u);
   assert.match(migrated.stdout, /react-perf/u);
   assert.deepEqual(await snapshot(env.home), before);
-  assert.match((await mg(env, ["find", "--category", "general", "react-perf"])).stdout, /react-perf/u);
+  const current = await mg(env, focusedFind);
+  assert.equal(current.code, 0, current.stderr);
+  assert.match(current.stdout, /react-perf/u);
 });
 
 test("schema 3 automatic migration retries after termination before publication", async () => {
@@ -752,13 +755,14 @@ test("usage and setup commands do not upgrade a legacy store", async (t) => {
   await copyLegacyStoreFixture(home);
   const index = await readFile(path.join(home, "index.db"));
   const sources = await readFile(path.join(home, "sources.json"));
+  const oversizedCategory = Array.from({ length: 33 }, (_, i) => `topic${i}`).join(" ");
   for (const args of [
     ["--help"],
     ["version"],
     ["wrap", "generic"],
     ["find"],
     ["find", "release upgrade"],
-    ...[" ", "the", "C++"].map((category) => ["find", "release upgrade", "--category", category]),
+    ...[" ", "the", "C++", oversizedCategory, "react".padEnd(1025)].map((category) => ["find", "release upgrade", "--category", category]),
     ["update", "source", "--ref", "bad"],
   ]) {
     const result = await runCli(args, { home });

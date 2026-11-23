@@ -1,11 +1,14 @@
-import { MAX_LIMIT, clampLimit, queryTerms } from "./bm25.ts";
+import { MAX_LIMIT, MAX_QUERY_TERMS, clampLimit, tokenize } from "./bm25.ts";
 import { findSkillsWithCount, loadContext } from "./skills.ts";
 import type { Context, FindHit } from "./skills.ts";
 import type { SourceRecord } from "./store.ts";
 import { parseFrontmatter } from "./scan.ts";
 import type { ScanOutcome } from "./safety.ts";
+
+const MAX_CATEGORY_LENGTH = 1024;
+export const FIND_CATEGORY_ERROR = `Use general or enter 1 to ${MAX_QUERY_TERMS} distinct searchable words. Limit the category to ${MAX_CATEGORY_LENGTH} characters.`;
 export const FIND_GUIDANCE =
-  "If no returned skill or suggestion fits the task, check the project for more details. Ask the user a specific question if you need more information. Repeat the search with the new details.";
+  "If a focused search returns no useful results, repeat the same task with general. If no returned skill or suggestion fits the task, check the project for more details. Ask the user a specific question if you need more information. Repeat the search with the new details.";
 
 export type Clarification = { kind: "refine"; question: string; matchCount: number };
 
@@ -120,11 +123,12 @@ interface InstalledSearch {
 
 /** Return the FTS filter, null for general, or undefined for invalid input. */
 export function parseFindCategory(category: string | undefined): string | null | undefined {
-  const name = category?.trim().toLowerCase();
-  if (name === undefined) return undefined;
+  if (category === undefined || category.length > MAX_CATEGORY_LENGTH) return undefined;
+  const name = category.trim().toLowerCase();
   if (name === "general") return null;
-  const terms = queryTerms(name);
-  return terms.length === 0 ? undefined : `{name headings} : (${terms.map((term) => `"${term}"`).join(" AND ")})`;
+  const terms = [...new Set(tokenize(name))];
+  if (terms.length === 0 || terms.length > MAX_QUERY_TERMS) return undefined;
+  return `{name headings} : (${terms.map((term) => `"${term}"`).join(" AND ")})`;
 }
 
 function searchInstalled(

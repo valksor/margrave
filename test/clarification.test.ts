@@ -30,25 +30,49 @@ test("frontend and migration searches use ordinary ranking", async (t) => {
 test("on hosted MCP a category requires evidence in the name or headings", async (t) => {
   await disposableHome(t);
   const joint = newEntry("joint", "frontend-interop", "Frontend work across frameworks");
-  joint.tokens = buildFieldTokens({ ...joint, headings: ["React Native and Vue"], body: "" });
+  const categoryWords = Array.from({ length: 32 }, (_, i) => `topic${i}`);
+  joint.tokens = buildFieldTokens({ ...joint, headings: ["React Native and Vue", ...categoryWords], body: "" });
+  const tokenless = newEntry("three", "of", "Common PHP usage");
+  tokenless.tokens = buildFieldTokens({ ...tokenless, headings: ["PHP"], body: "" });
   await seedIndex([
     newEntry("one", "react-guide", "React frontend work"),
     newEntry("two", "vue-guide", "Vue frontend work. Compare to React."),
+    newEntry("two", "form-practices", "Frontend work on forms", "React"),
     newEntry("three", "php-guide", "PHP frontend work"),
     joint,
+    tokenless,
   ]);
   const client = await connectHosted(t);
   for (const [category, names] of [
-    ["general", ["frontend-interop", "php-guide", "react-guide", "vue-guide"]],
+    ["general", ["form-practices", "frontend-interop", "php-guide", "react-guide", "vue-guide"]],
     ["react", ["frontend-interop", "react-guide"]],
+    ["react".padEnd(1024), ["frontend-interop", "react-guide"]],
     [" React Native ", ["frontend-interop"]],
     ["vue", ["frontend-interop", "vue-guide"]],
     ["php", ["php-guide"]],
     ["rust", []],
+    [[...categoryWords, categoryWords[0]].join(" "), ["frontend-interop"]],
   ] as const) {
     const result = await client.callTool({ name: "find_skills", arguments: { task: "frontend work", category } });
     assert.notEqual(result.isError, true);
     assert.deepEqual((result.structuredContent as { results: { name: string }[] }).results.map((hit) => hit.name).sort(), names);
+  }
+  const tooManyWords = [...categoryWords, "topic32"].join(" ");
+  const overLimit = await client.callTool({ name: "find_skills", arguments: { task: "frontend work", category: tooManyWords } });
+  assert.equal(overLimit.isError, true);
+  assert.match((overLimit.content as { text: string }[])[0]!.text, /1 to 32 distinct searchable words/u);
+  const overLength = await client.callTool({ name: "find_skills", arguments: { task: "frontend work", category: "react".padEnd(1025) } });
+  assert.equal(overLength.isError, true);
+  assert.match((overLength.content as { text: string }[])[0]!.text, /1024 characters/u);
+  for (const [category, ids] of [
+    ["php", ["three/of"]],
+    ["react", []],
+  ] as const) {
+    const exact = await client.callTool({ name: "find_skills", arguments: { task: "of", category } });
+    assert.deepEqual(
+      (exact.structuredContent as { results: { id: string }[] }).results.map((hit) => hit.id),
+      ids,
+    );
   }
   const exactTask = "two/vue-guide";
   const exact = await client.callTool({ name: "find_skills", arguments: { task: exactTask, category: "general" } });

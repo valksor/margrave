@@ -366,7 +366,9 @@ Pass `handleHostedMcp` as the example's `handle` option. Supply bearer tokens fr
 
 Each result includes the indexed skill revision. Pass it with `margrave load <id> --revision <hash>` to verify the selected content.
 
-Use `general` to search across all visible installed skills. A technology category such as `react`, `vue`, or `php` requires every category term to appear in the skill name or headings. The task then determines which of those skills to recommend. Category names are case-insensitive. Values such as `C`, `C++`, and `C#` have no searchable terms. Use a spelling such as `cpp` or `csharp` if it appears in the skill name or headings.
+Use `general` to search across all visible installed skills. A technology category such as `react`, `vue`, or `php` accepts 1 to 32 distinct searchable terms. Every term must appear in the skill name or headings. The task then determines which of those skills to recommend. If a focused search misses, retry the same task with `general`.
+
+Categories are case-insensitive and have a limit of 1,024 characters. Values such as `C`, `C++`, and `C#` have no searchable terms. Use a spelling such as `cpp` or `csharp` if it appears in the skill name or headings.
 
 Margrave ranks results with weighted SQLite FTS5 BM25. Field weights are name 3, description 2, headings 1, and body 0.3. The index uses the first 2,000 body tokens. Margrave normalizes Unicode text, preserves accents, and applies English stemming to ASCII words.
 
@@ -392,7 +394,7 @@ To reclaim space, stop all Margrave readers and writers. Use `margrave list --js
 
 ## Upgrading
 
-Skill search requires a category. Add `--category general` to existing CLI calls and `"category": "general"` to existing MCP arguments to keep the broad search. Run `margrave wrap <agent>` again to refresh previously copied agent instructions. Refresh the tool list in MCP clients that cache tool schemas.
+Skill search requires a category. Add `--category general` to existing CLI calls and `"category": "general"` to existing MCP arguments to keep the broad search. Run `margrave wrap <agent>` to print the new instructions. Replace the previously copied snippet in the agent's instructions. Refresh the tool list in MCP clients that cache tool schemas.
 
 `margrave list --skills --json` now returns source summaries in place of full source records. If you need the old fields, read the full records with `margrave list --json` and join them to skills by `sources[].id` and `skills[].source`.
 

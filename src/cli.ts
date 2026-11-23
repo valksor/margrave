@@ -33,7 +33,7 @@ import {
 import type { Ctx } from "./sources.ts";
 import { MargraveError, RequestError, UsageError } from "./store.ts";
 import { wrap } from "./wrap.ts";
-import { FIND_GUIDANCE, formatClarification, formatSuggestions, parseFindCategory, searchSkills } from "./search.ts";
+import { FIND_CATEGORY_ERROR, FIND_GUIDANCE, formatClarification, formatSuggestions, parseFindCategory, searchSkills } from "./search.ts";
 
 const USAGE = `usage: margrave <command>
 
@@ -46,7 +46,7 @@ const USAGE = `usage: margrave <command>
   list [--skills] [--json]                    list sources, and with --skills every skill
   find "<task>" --category CATEGORY [--limit N] [--json] [--explain] [--browse] [--catalog-query QUERY]
                                               search installed skills by technology or use general
-                                              use --catalog-query for public suggestions
+                                              set MARGRAVE_SKILLS_SH=1 and pass --catalog-query for public suggestions
   load <id> [--json] [--revision <hash>]      print one skill
   load <id> --file <path> [--revision <hash>] print one file inside a skill directory
   reindex                                     rescan all sources
@@ -207,7 +207,7 @@ async function findCommand(rest: string[]): Promise<void> {
   const words = positionals(p, 1, Number.POSITIVE_INFINITY, 'find "<task>" --category CATEGORY');
   const task = words.join(" ");
   const categoryQuery = parseFindCategory(p.values["category"] as string | undefined);
-  if (categoryQuery === undefined) throw new UsageError("Use --category general or specify a technology with searchable words.");
+  if (categoryQuery === undefined) throw new UsageError(`Invalid --category. ${FIND_CATEGORY_ERROR}`);
   await migrateStore();
   const { hits, noSources, suggestions, clarification } = await searchSkills(
     task,

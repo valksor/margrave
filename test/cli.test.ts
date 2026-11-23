@@ -17,7 +17,7 @@ const usage = `usage: margrave <command>
   list [--skills] [--json]                    list sources, and with --skills every skill
   find "<task>" --category CATEGORY [--limit N] [--json] [--explain] [--browse] [--catalog-query QUERY]
                                               search installed skills by technology or use general
-                                              use --catalog-query for public suggestions
+                                              set MARGRAVE_SKILLS_SH=1 and pass --catalog-query for public suggestions
   load <id> [--json] [--revision <hash>]      print one skill
   load <id> --file <path> [--revision <hash>] print one file inside a skill directory
   reindex                                     rescan all sources

@@ -18,6 +18,7 @@ import { RequestError } from "./store.ts";
 import type { IndexEntry } from "./store.ts";
 import { checkId, migrateStore } from "./sources.ts";
 import {
+  FIND_CATEGORY_ERROR,
   FIND_GUIDANCE,
   HOSTED_SUGGESTION_GUIDANCE,
   formatClarification,
@@ -211,7 +212,7 @@ function registerFind(server: McpServer, variant: Variant, allowedSources: Reado
     async ({ task, category, limit, explain, catalogQuery, browse }) => {
       try {
         const categoryQuery = parseFindCategory(category);
-        if (categoryQuery === undefined) throw new RequestError("Use general or specify a technology with searchable words.");
+        if (categoryQuery === undefined) throw new RequestError(FIND_CATEGORY_ERROR);
         const { hits, noSources, suggestions, clarification } = await searchSkills(
           task,
           limit,
