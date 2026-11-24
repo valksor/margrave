@@ -6,6 +6,11 @@ overrides:
   glob: "14.0.6"
   minimatch: "11.0.8"
   "typed-rest-client@2.3.1>qs": "6.17.1"
+# oxlint 1.95 enables a type-aware rule the pinned tsrs backend does not
+# implement; skip it in `pnpm up` until tsrs 7.1.0-beta.tsrs5 is adopted.
+update:
+  ignoreDeps:
+    - oxlint
 minimumReleaseAge: 360
 engineStrict: true
 strictPeerDependencies: true
