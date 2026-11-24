@@ -17,10 +17,6 @@ updates:
     # (Security updates bypass cooldown by design and may still trip the gate.)
     cooldown:
       default-days: 3
-    # oxlint 1.95 enables a type-aware rule the pinned tsrs backend does not
-    # implement; resume bumps once tsrs 7.1.0-beta.tsrs5 is adopted.
-    ignore:
-      - dependency-name: "oxlint"
     labels:
       - "dependencies"
     groups:

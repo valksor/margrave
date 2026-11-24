@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import childProcess from "node:child_process";
-import type { ChildProcess } from "node:child_process";
+import childProcess, { ChildProcess } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -324,7 +323,7 @@ async function withSyntheticGit(
     assert.ok(result, "unexpected git invocation");
     if (result.throws) throw result.throws;
     queueMicrotask(() => callback(result.error ?? null, result.stdout ?? "", result.stderr ?? ""));
-    return {} as ChildProcess;
+    return new ChildProcess();
   }) as typeof childProcess.execFile);
   syncBuiltinESMExports();
   let timer: NodeJS.Timeout | undefined;
