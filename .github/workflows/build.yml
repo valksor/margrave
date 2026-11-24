@@ -260,7 +260,7 @@ jobs:
 
           MARGRAVE_HOME="$RUNNER_TEMP/home-vendored" "$BUNDLE/bin/margrave" install "$SKILLS"
 
-          MARGRAVE_HOME="$RUNNER_TEMP/home-vendored" "$BUNDLE/bin/margrave" find "Say hello" > "$RUNNER_TEMP/find.txt"
+          MARGRAVE_HOME="$RUNNER_TEMP/home-vendored" "$BUNDLE/bin/margrave" find "Say hello" --category general > "$RUNNER_TEMP/find.txt"
           grep -q smoke "$RUNNER_TEMP/find.txt"
 
           # The MCP server answers `server/discover` with the version from the
