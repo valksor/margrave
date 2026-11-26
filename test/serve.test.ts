@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { request } from "node:http";
-import { connect } from "node:net";
+import { connect, createServer } from "node:net";
+import type { AddressInfo } from "node:net";
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { serveHttp } from "../src/serve.ts";
 import {
   call,
   catalogSetup,
@@ -18,6 +20,7 @@ import {
   ROOT,
   runCli,
   sourceId,
+  stdioTestEnv,
   tmp,
   writeSkill,
 } from "./helpers.ts";
@@ -26,11 +29,50 @@ const headers = { "content-type": "application/json", accept: "application/json,
 
 async function raw(port: number, text: string): Promise<string> {
   const socket = connect(port, "127.0.0.1");
+  socket.on("error", () => {});
   socket.setTimeout(5000, () => socket.destroy());
   socket.write(text);
   let result = "";
   for await (const chunk of socket) result += chunk.toString();
   return result;
+}
+
+/** Read only the response head, then close; the connection may stay alive. */
+async function rawHeaders(port: number, text: string): Promise<string> {
+  const socket = connect(port, "127.0.0.1");
+  socket.on("error", () => {});
+  socket.setTimeout(5000, () => socket.destroy());
+  let result = "";
+  try {
+    socket.write(text);
+    for await (const chunk of socket) {
+      result += chunk.toString();
+      if (result.includes("\r\n\r\n")) break;
+    }
+  } finally {
+    socket.destroy();
+  }
+  return result;
+}
+
+async function until<T>(probe: () => Promise<T | undefined> | T | undefined, timeoutMs = 5000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await probe();
+    if (value) return value;
+    if (Date.now() >= deadline) throw new Error("condition timed out");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+async function waitForExit(child: ReturnType<typeof spawn>, timeoutMs = 5000): Promise<[number | null, NodeJS.Signals | null] | null> {
+  return Promise.race([
+    once(child, "exit") as Promise<[number | null, NodeJS.Signals | null]>,
+    new Promise<null>((resolve) => {
+      const timer = setTimeout(() => resolve(null), timeoutMs);
+      timer.unref();
+    }),
+  ]);
 }
 
 async function startServer(
@@ -312,11 +354,15 @@ test("HTTP CLI serves the catalog and enforces its boundary", async (t) => {
       res.resume();
       resolve(res.statusCode!);
     });
-    req.on("error", reject);
+    // The server answers 413 and closes while this write is still in flight.
+    req.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code !== "EPIPE" && err.code !== "ECONNRESET") reject(err);
+    });
     req.write(Buffer.alloc(5 * 1024 * 1024));
   });
   assert.equal(chunked, 413);
   const disconnected = connect(port, "127.0.0.1");
+  disconnected.on("error", () => {});
   disconnected.write(`POST /mcp HTTP/1.1\r\nHost: localhost:${port}\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{`);
   disconnected.destroy();
   assert.equal((await fetch(`${base}/api/health`)).status, 200);
@@ -361,7 +407,11 @@ test("IPv6 loopback admits its default authority", async (t) => {
   });
   assert.match(base, /^http:\/\/\[::1\]:\d+$/u);
   assert.equal((await fetch(`${base}/mcp`)).status, 405);
-  assert.equal((await fetch(`${base}/api/health`)).status, 200);
+  const health = await fetch(`${base}/api/health`);
+  assert.equal(health.status, 200);
+  assert.equal(health.headers.get("content-type"), "application/json");
+  assert.equal(health.headers.get("content-length"), "15");
+  assert.equal(await health.text(), '{"status":"ok"}');
 });
 
 test("incomplete headers and bodies time out", async (t) => {
@@ -375,7 +425,7 @@ test("incomplete headers and bodies time out", async (t) => {
     (socket) =>
       new Promise<string>((resolve, reject) => {
         let response = "";
-        socket.setTimeout(20000, () => socket.destroy(new Error("request deadline timed out")));
+        socket.setTimeout(23000, () => socket.destroy(new Error("request deadline timed out")));
         socket.on("data", (chunk: Buffer) => {
           response += chunk.toString();
         });
@@ -392,27 +442,50 @@ test("incomplete headers and bodies time out", async (t) => {
 test("handler failures and bodyless responses stay contained", async (t) => {
   const abortReady = Promise.withResolvers<void>();
   const errorReady = Promise.withResolvers<void>();
+  const cancelReady = Promise.withResolvers<void>();
+  const nullReady = Promise.withResolvers<void>();
+  let stderr = "";
   const { base } = await startServer(t, { MARGRAVE_ALLOWED_HOSTS: "", MARGRAVE_ALLOWED_ORIGINS: "" }, true, (text) => {
+    stderr = text;
     if (text.includes("ready:abort\n")) abortReady.resolve();
     if (text.includes("ready:abort-error\n")) errorReady.resolve();
+    if (text.includes("ready:abort-cancel\n")) cancelReady.resolve();
+    if (text.includes("ready:abort-null\n")) nullReady.resolve();
   });
   const empty = await fetch(`${base}/mcp`, { method: "POST", headers, body: "{}" });
   assert.equal(empty.status, 202);
   assert.equal(await empty.text(), "");
   const failed = await fetch(`${base}/mcp`, { method: "POST", headers: { ...headers, "x-test-mode": "error" }, body: "{}" });
   assert.equal(failed.status, 500);
+  await until(() => stderr.includes("margrave: HTTP server error"));
+  const markerDir = await tmp("mg-serve-cancel-");
+  t.after(() => rm(markerDir, { recursive: true, force: true }));
+  const marker = path.join(markerDir, "canceled");
   const port = Number(new URL(base).port);
-  for (const [mode, ready] of [
-    ["abort", abortReady.promise],
-    ["abort-error", errorReady.promise],
+  for (const [mode, ready, markerFile] of [
+    ["abort", abortReady.promise, undefined],
+    ["abort-error", errorReady.promise, undefined],
+    ["abort-cancel", cancelReady.promise, marker],
+    ["abort-null", nullReady.promise, undefined],
   ] as const) {
     const socket = connect(port, "127.0.0.1");
     await once(socket, "connect");
-    socket.write(`POST /mcp HTTP/1.1\r\nHost: localhost:${port}\r\nX-Test-Mode: ${mode}\r\nContent-Length: 100\r\n\r\n{`);
+    const extra = markerFile === undefined ? "" : `\r\nX-Test-Marker: ${markerFile}`;
+    socket.write(`POST /mcp HTTP/1.1\r\nHost: localhost:${port}\r\nX-Test-Mode: ${mode}${extra}\r\nContent-Length: 100\r\n\r\n{`);
     await Promise.race([ready, new Promise((_, reject) => setTimeout(() => reject(new Error("handler timed out")), 5000))]);
     socket.destroy();
     await once(socket, "close");
   }
+  assert.equal(
+    await until(async () => {
+      try {
+        return await readFile(marker, "utf8");
+      } catch {
+        return undefined;
+      }
+    }),
+    "canceled",
+  );
   await new Promise<void>((resolve, reject) => {
     const req = request(
       `${base}/mcp`,
@@ -451,4 +524,119 @@ test("shutdown force closes an open response", async (t) => {
     }),
   ]);
   assert.equal(response.complete, false);
+});
+
+test("mapped IPv4 loopback admits its default authority", async (t) => {
+  const { base } = await startServer(t, { MARGRAVE_ALLOWED_HOSTS: "", MARGRAVE_ALLOWED_ORIGINS: "" }, false, undefined, {
+    extraArgs: ["--host", "::ffff:127.0.0.1"],
+  });
+  assert.match(base, /^http:\/\/\[::ffff:7f00:1\]:\d+$/u);
+  const health = await fetch(`${base}/api/health`);
+  assert.equal(health.status, 200);
+  assert.equal(await health.text(), '{"status":"ok"}');
+});
+
+test("a non-loopback bind requires explicit allowed hosts", async (t) => {
+  const child = spawn(
+    process.execPath,
+    ["--import", NO_VENDORED_PRELOAD, "src/cli.ts", "serve", "--http", "--host", "0.0.0.0", "--port", "0"],
+    { cwd: ROOT, env: stdioTestEnv({}), stdio: ["ignore", "ignore", "pipe"] },
+  );
+  t.after(() => child.kill("SIGKILL"));
+  let stderr = "";
+  child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+  const result = await waitForExit(child, 2000);
+  if (result === null) {
+    child.kill("SIGKILL");
+    assert.fail(`serve started without MARGRAVE_ALLOWED_HOSTS: ${stderr}`);
+  }
+  assert.deepEqual(result, [2, null]);
+  assert.match(stderr, /margrave: MARGRAVE_ALLOWED_HOSTS is required for a non-loopback bind/u);
+});
+
+test("loopback detection refuses a host that only contains the mapped prefix", async () => {
+  const previous = process.env["MARGRAVE_ALLOWED_HOSTS"];
+  delete process.env["MARGRAVE_ALLOWED_HOSTS"];
+  try {
+    await assert.rejects(serveHttp("x[::ffff:7f00:1]", 0), {
+      message: "MARGRAVE_ALLOWED_HOSTS is required for a non-loopback bind",
+    });
+  } finally {
+    if (previous === undefined) delete process.env["MARGRAVE_ALLOWED_HOSTS"];
+    else process.env["MARGRAVE_ALLOWED_HOSTS"] = previous;
+  }
+});
+
+test("keep-alive follows request completeness", async (t) => {
+  const { base } = await startServer(t, { MARGRAVE_ALLOWED_HOSTS: "", MARGRAVE_ALLOWED_ORIGINS: "" }, true);
+  const port = Number(new URL(base).port);
+  const incomplete = await rawHeaders(
+    port,
+    `POST /mcp HTTP/1.1\r\nHost: localhost:${port}\r\nContent-Length: 100\r\nConnection: keep-alive\r\n\r\n{`,
+  );
+  assert.match(incomplete, /^HTTP\/1\.1 202 /u);
+  assert.match(incomplete, /connection: close/iu);
+  const complete = await rawHeaders(
+    port,
+    `POST /mcp HTTP/1.1\r\nHost: localhost:${port}\r\nX-Test-Mode: read\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n{}`,
+  );
+  assert.match(complete, /^HTTP\/1\.1 202 /u);
+  assert.doesNotMatch(complete, /connection: close/iu);
+});
+
+test("an error after a consumed body does not force a connection close", async (t) => {
+  const { base } = await startServer(t, { MARGRAVE_ALLOWED_HOSTS: "", MARGRAVE_ALLOWED_ORIGINS: "" }, true);
+  const port = Number(new URL(base).port);
+  const response = await rawHeaders(
+    port,
+    `POST /mcp HTTP/1.1\r\nHost: localhost:${port}\r\nX-Test-Mode: read-error\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n{}`,
+  );
+  assert.match(response, /^HTTP\/1\.1 500 /u);
+  assert.doesNotMatch(response, /connection: close/iu);
+});
+
+test("repeated request headers keep their combined values", async (t) => {
+  let stderr = "";
+  const { base } = await startServer(t, { MARGRAVE_ALLOWED_HOSTS: "", MARGRAVE_ALLOWED_ORIGINS: "" }, true, (text) => (stderr = text));
+  const port = Number(new URL(base).port);
+  const response = await rawHeaders(
+    port,
+    `POST /mcp HTTP/1.1\r\nHost: localhost:${port}\r\nX-Test-Mode: cookies\r\nSet-Cookie: one=1\r\nSet-Cookie: two=2\r\nAccept: application/json\r\nAccept: text/event-stream\r\nCookie: a=1\r\nCookie: b=2\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`,
+  );
+  assert.match(response, /^HTTP\/1\.1 202 /u);
+  const seen: unknown = JSON.parse(await until(() => /headers:(\{.*\})\n/u.exec(stderr)?.[1]));
+  assert.deepEqual(seen, {
+    "set-cookie": "one=1, two=2",
+    accept: "application/json, text/event-stream",
+    cookie: "a=1; b=2",
+  });
+});
+
+test("a bind failure reports through the CLI", async (t) => {
+  const blocker = createServer();
+  await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+  t.after(() => blocker.close());
+  const port = (blocker.address() as AddressInfo).port;
+  const child = spawn(
+    process.execPath,
+    ["--import", NO_VENDORED_PRELOAD, "src/cli.ts", "serve", "--http", "--host", "127.0.0.1", "--port", String(port)],
+    { cwd: ROOT, env: stdioTestEnv({ MARGRAVE_ALLOWED_HOSTS: "" }), stdio: ["ignore", "ignore", "pipe"] },
+  );
+  t.after(() => child.kill("SIGKILL"));
+  let stderr = "";
+  child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+  const result = await waitForExit(child);
+  child.kill("SIGKILL");
+  assert.notEqual(result, null, stderr);
+  assert.deepEqual(result, [1, null]);
+  assert.match(stderr, /margrave: .*EADDRINUSE/u);
+});
+
+test("serve removes its signal listeners when it closes", async (t) => {
+  const sigint = process.listenerCount("SIGINT");
+  const sigterm = process.listenerCount("SIGTERM");
+  t.after(() => process.emit("SIGTERM"));
+  await serveHttp("127.0.0.1", 0);
+  process.emit("SIGTERM");
+  await until(() => process.listenerCount("SIGINT") === sigint && process.listenerCount("SIGTERM") === sigterm);
 });

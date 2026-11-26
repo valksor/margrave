@@ -55,11 +55,11 @@
   "devDependencies": {
     "@modelcontextprotocol/client": "2.4.0",
     "@stryker-mutator/core": "10.1.1",
-    "@types/node": "26.6.6",
+    "@types/node": "26.6.11",
     "c8": "12.0.0",
     "esbuild": "0.28.2",
     "knip": "6.48.0",
-    "lefthook": "2.2.2",
+    "lefthook": "2.2.3",
     "oxlint": "1.95.0",
     "prettier": "3.10.1",
     "tsrs": "7.1.0-beta.tsrs5"

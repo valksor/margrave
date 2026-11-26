@@ -1196,3 +1196,67 @@ test("MCP Skills direct reads exact resources and rejects noncanonical URIs", as
     );
   }
 });
+
+test("MCP server direct honors the skillsSh option, schemas and suggestions", async (t) => {
+  const home = await tmp("mg-direct-options-");
+  useHome(t, home);
+  t.after(() => fsp.rm(home, { recursive: true, force: true }));
+  const disabled = await connectInMemory(t, () => createServer(undefined, { skillsSh: false }));
+  const enabled = await connectInMemory(t, () => createServer(undefined, { skillsSh: true }));
+  const unset = await connectInMemory(t);
+  const findOf = async (client: Client) => (await client.listTools()).tools.find((tool) => tool.name === "find_skills")!;
+  const disabledFind = await findOf(disabled);
+  const enabledFind = await findOf(enabled);
+  assert.equal((await findOf(unset)).description, FIND_DESCRIPTION);
+  assert.equal(disabledFind.description, FIND_DESCRIPTION);
+  assert.equal(
+    enabledFind.description,
+    FIND_DESCRIPTION +
+      " Supply catalogQuery with a short capability description to request public suggestions after a local miss. Do not include task details. " +
+      "Offer catalog suggestions to the user. Wait for an explicit request before installation.",
+  );
+  const output = enabledFind.outputSchema as {
+    properties: {
+      suggestions: { items: { required: string[]; properties: Record<string, unknown> } };
+      clarification: { properties: Record<string, { const?: string }> };
+    };
+  };
+  assert.deepEqual(output.properties.suggestions.items.required, ["id", "source"]);
+  assert.deepEqual(Object.keys(output.properties.suggestions.items.properties).sort(), ["id", "source"]);
+  assert.deepEqual(Object.keys(output.properties.clarification.properties).sort(), ["kind", "matchCount", "question"]);
+  assert.equal(output.properties.clarification.properties.kind?.const, "refine");
+  const category = (enabledFind.inputSchema as unknown as { properties: { category: { description?: string } } }).properties.category;
+  assert.equal(category.description, "Technology for installed skills. Use general for a broad search.");
+
+  await seedIndex(Array.from({ length: 25 }, (_, i) => newEntry("count", `database-task-${i}`, "Database task guidance")));
+  const clarified = await enabled.callTool({ name: "find_skills", arguments: { task: "database task", category: "general" } });
+  assert.notEqual(clarified.isError, true);
+  assert.match((clarified.content as { text: string }[])[0]!.text, /Set browse to true to see ranked results for this task\./u);
+  assert.deepEqual((clarified.structuredContent as { clarification: unknown }).clarification, {
+    kind: "refine",
+    question: "What specific task should the skills cover?",
+    matchCount: 25,
+  });
+
+  const fetchMock = t.mock.method(globalThis, "fetch", (input: string | URL | Request) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    assert.equal(url.origin, "https://skills.sh");
+    assert.equal(url.pathname, "/api/search");
+    assert.equal(url.searchParams.get("q"), "terraform modules");
+    return Promise.resolve(Response.json({ skills: [{ source: "owner/repo", skillId: "skill" }] }));
+  });
+  const missed = await enabled.callTool({
+    name: "find_skills",
+    arguments: { task: "nothing", category: "general", catalogQuery: "terraform modules" },
+  });
+  assert.notEqual(missed.isError, true);
+  assert.match((missed.content as { text: string }[])[0]!.text, /Manual install: margrave install owner\/repo --skill skill/u);
+  assert.deepEqual((missed.structuredContent as { suggestions: unknown }).suggestions, [{ id: "owner/repo/skill", source: "owner/repo" }]);
+  assert.equal(fetchMock.mock.callCount(), 1);
+  const requested = fetchMock.mock.calls[0]?.arguments[0] as string | URL | Request;
+  const requestedUrl = new URL(typeof requested === "string" ? requested : requested instanceof URL ? requested.href : requested.url);
+  assert.equal(requestedUrl.origin, "https://skills.sh");
+  assert.equal(requestedUrl.pathname, "/api/search");
+  assert.equal(requestedUrl.searchParams.get("q"), "terraform modules");
+  fetchMock.mock.restore();
+});

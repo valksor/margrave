@@ -1078,6 +1078,78 @@ test("lock restore direct rejects duplicates discovered by the second scan", asy
   assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
 });
 
+test("lock restore direct propagates a failure from the checked scan", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(async () => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    await rm(home, { recursive: true, force: true });
+  });
+  const fixture = await directRestoreFixture(home, false);
+  const { marker, contents } = await directPending(home, fixture);
+  const error = new Error("checked scan listing");
+  const real = fsp.readdir;
+  let count = 0;
+  mock.method(fsp, "readdir", ((p: string, ...args: unknown[]) => {
+    if (p === fixture.dir && (args[0] as { withFileTypes?: boolean } | undefined)?.withFileTypes === true && ++count === 3)
+      return Promise.reject(error);
+    return (real as (...a: unknown[]) => unknown)(p, ...args);
+  }) as typeof fsp.readdir);
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(
+      restoreLock(fixture.lock, { log: () => {}, allowUnsafe: false }, () => {}),
+      (err) => err === error,
+    );
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+  assert.equal(count, 3);
+  assert.equal(await readFile(marker, "utf8"), contents);
+  assert.equal(existsSync(path.join(home, "index.db")), false);
+  assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+});
+
+test("lock restore direct rejects a skill seen only by the checked scan", async (t) => {
+  const home = await tmp("mg-home-");
+  useHome(t, home);
+  t.after(async () => {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    await rm(home, { recursive: true, force: true });
+  });
+  const fixture = await directRestoreFixture(home, false);
+  await mkdir(path.join(fixture.dir, "z-extra"));
+  await writeFile(path.join(fixture.dir, "z-extra", "SKILL.md"), "---\nname: z-extra\ndescription: An extra skill\n---\n\nContent\n");
+  const { marker, contents } = await directPending(home, fixture);
+  const real = fsp.readdir;
+  let count = 0;
+  mock.method(fsp, "readdir", (async (p: string, ...args: unknown[]) => {
+    const entries = await (real as (...a: unknown[]) => Promise<{ name: string }[]>)(p, ...args);
+    if (p === fixture.dir && (args[0] as { withFileTypes?: boolean } | undefined)?.withFileTypes === true && ++count === 1)
+      return entries.filter((entry) => entry.name !== "z-extra");
+    return entries;
+  }) as typeof fsp.readdir);
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(
+      restoreLock(fixture.lock, { log: () => {}, allowUnsafe: false }, () => {}),
+      {
+        message: `staged skills differ from the lock: ${fixture.record.id}`,
+      },
+    );
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+  assert.equal(count, 4);
+  assert.equal(await readFile(marker, "utf8"), contents);
+  assert.equal(existsSync(path.join(home, "index.db")), false);
+  assert.deepEqual(await fsp.readdir(path.join(home, "staging")), []);
+});
+
 test("lock restore direct rejects empty, wrong revision, and selected snapshot drift", async (t) => {
   const home = await tmp("mg-home-");
   useHome(t, home);

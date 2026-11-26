@@ -64,18 +64,19 @@ export async function verifyBackupFiles(
 ): Promise<{ manifest: z.infer<typeof backupManifestSchema>; owner: number } | null> {
   const invalid = (): Error => new Error(`invalid backup: ${backup}`);
   const dir = await lstat(backup, { bigint: true });
-  if (!dir.isDirectory() || (dir.mode & 0o077n) !== 0n || dir.uid !== BigInt(process.getuid?.() ?? -1)) throw invalid();
+  const currentUid = process.getuid?.();
+  if (!dir.isDirectory() || (dir.mode & 0o077n) !== 0n || currentUid === undefined || dir.uid !== BigInt(currentUid)) throw invalid();
   const args = ["--internal-verify-backup", dir.dev.toString(), dir.ino.toString(), path.resolve(indexDbFile()), copy ?? ""];
   const executable = process.execPath;
   if (!isSea()) args.unshift(fileURLToPath(import.meta.url));
+  // Node forwards NODE_V8_COVERAGE to child processes itself; other startup settings are not inherited.
   const env: NodeJS.ProcessEnv = { MARGRAVE_HOME: home() };
-  if (process.env["NODE_V8_COVERAGE"] !== undefined) env["NODE_V8_COVERAGE"] = process.env["NODE_V8_COVERAGE"];
   let value: unknown;
   try {
     const result = await execFileAsync(executable, args, { cwd: path.resolve(backup), env });
     value = JSON.parse(result.stdout) as unknown;
-  } catch {
-    throw invalid();
+  } catch (err) {
+    throw new Error(`invalid backup: ${backup}`, { cause: err });
   }
   const result = z
     .union([
@@ -104,28 +105,33 @@ export async function verifyBackupFiles(
 
 async function verifyBackupArchive(archive: FileHandle, expected: string, copy: string | undefined): Promise<void> {
   const destination = copy ? await open(copy, "wx", 0o600) : undefined;
+  // Close on both paths without a finally: an emptied finally block is an unobservable mutant.
   try {
     const digest = createHash("sha256");
-    for await (const chunk of archive.createReadStream({ autoClose: false })) {
+    for await (const chunk of archive.createReadStream()) {
       digest.update(chunk as Buffer);
       if (destination !== undefined) await destination.writeFile(chunk as Buffer);
     }
     if (digest.digest("hex") !== expected) throw new Error("invalid archive digest");
-  } finally {
+  } catch (err) {
     await destination?.close();
+    throw err;
   }
+  await destination?.close();
 }
 
 export async function verifyBackupChild(args: string[]): Promise<void> {
   const [device, inode, catalogPath, copy] = args;
   if (args.length !== 4 || catalogPath !== indexDbFile()) throw new Error("invalid directory");
   const dir = await lstat(".", { bigint: true });
+  const currentUid = process.getuid?.();
   if (
     !dir.isDirectory() ||
     dir.dev.toString() !== device ||
     dir.ino.toString() !== inode ||
     (dir.mode & 0o077n) !== 0n ||
-    dir.uid !== BigInt(process.getuid?.() ?? -1)
+    currentUid === undefined ||
+    dir.uid !== BigInt(currentUid)
   )
     throw new Error("invalid directory");
   if (process.platform === "darwin") {

@@ -573,3 +573,35 @@ test("a pinned Git read reports file drift when its source record disappears", a
   writeCatalogRecords(home, []);
   await assert.rejects(readSelectedFile(entry, "SKILL.md", entry.revision), /skill files changed since indexing/u);
 });
+
+test("findSkillsWithCount defaults to recommended hits only", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  await seedIndex([
+    newEntry("a", "one", "solitary comet"),
+    newEntry("a", "other", "unrelated", "comet orbit"),
+    newEntry("a", "extra", "unrelated", "comet"),
+  ]);
+  const db = await openIndexRead();
+  try {
+    const { hits, matchCount, exact } = findSkillsWithCount(db, "comet", 10);
+    assert.deepEqual(ids(hits), ["a/one"]);
+    assert.equal(matchCount, 1);
+    assert.equal(exact, false);
+    assert.deepEqual(ids(findSkillsWithCount(db, "comet", 10, true).hits).sort(), ["a/extra", "a/one", "a/other"]);
+  } finally {
+    db.close();
+  }
+});
+
+test("findSkillsWithCount reports exact when any ranked hit is an exact match", async (t) => {
+  useHome(t, await tmp("mg-home-"));
+  await seedIndex([newEntry("a", "comet", "solitary"), newEntry("a", "other", "shared comet")]);
+  const db = await openIndexRead();
+  try {
+    const { hits, exact } = findSkillsWithCount(db, "comet", 10);
+    assert.equal(exact, true);
+    assert.deepEqual(ids(hits), ["a/comet"]);
+  } finally {
+    db.close();
+  }
+});

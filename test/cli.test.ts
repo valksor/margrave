@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { parseArgs } from "node:util";
+import { FIND_GUIDANCE } from "../src/search.ts";
 import { renderWrap } from "../src/wrap.ts";
-import { copyLegacyStoreFixture, ROOT, runCli, tmp } from "./helpers.ts";
+import { copyLegacyStoreFixture, newEntry, ROOT, runCli, seedIndex, stdioTestEnv, tmp, useHome } from "./helpers.ts";
 
 const usage = `usage: margrave <command>
 
@@ -238,6 +241,81 @@ test("serve argument errors", async (t) => {
       "--port must be an integer from 0 to 65535",
     ]),
     [["serve", "--http", "--host", "0.0.0.0"], "MARGRAVE_ALLOWED_HOSTS is required for a non-loopback bind"],
+    [["serve", "--http", "--host", "0.0.0.0", "--port", "65535"], "MARGRAVE_ALLOWED_HOSTS is required for a non-loopback bind"],
   ] as [string[], string][])
     assert.deepEqual(await runCli(args, { home, extra: { MARGRAVE_ALLOWED_HOSTS: "" } }), usageError(message));
+});
+
+test("CLI direct clarifies broad find results and browses on request", async (t) => {
+  const home = await tmp("mg-cli-find-");
+  useHome(t, home);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await seedIndex(Array.from({ length: 25 }, (_, i) => newEntry("count", `database-task-${i}`, "Database task guidance")));
+  const clarified = await runCli(["find", "--category", "general", "database task", "--json"], { home });
+  assert.equal(clarified.code, 0, clarified.stderr);
+  const clarifiedJson = JSON.parse(clarified.stdout) as { clarification?: unknown; results: unknown[] };
+  assert.deepEqual(clarifiedJson.clarification, {
+    kind: "refine",
+    question: "What specific task should the skills cover?",
+    matchCount: 25,
+  });
+  assert.equal("suggestions" in clarifiedJson, false);
+  const browsed = await runCli(["find", "--category", "general", "database task", "--browse", "--limit", "1", "--json"], { home });
+  assert.equal(browsed.code, 0, browsed.stderr);
+  const browsedJson = JSON.parse(browsed.stdout) as { clarification?: unknown; results: unknown[] };
+  assert.equal(browsedJson.clarification, undefined);
+  assert.equal(browsedJson.results.length, 1);
+  const text = await runCli(["find", "--category", "general", "database task"], { home });
+  assert.equal(text.code, 0, text.stderr);
+  assert.match(text.stdout, /Use --browse to see ranked results for this task\./u);
+  assert.ok(text.stdout.includes(FIND_GUIDANCE));
+});
+
+test("CLI direct dispatches the SEA verifier only for its flag", async (t) => {
+  const home = await tmp("mg-cli-sea-");
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const backup = path.join(home, "backup");
+  const catalog = path.join(home, "index.db");
+  const archive = path.join(backup, "store.tar");
+  const bytes = Buffer.from([0, 255, 2, 128, 17]);
+  await mkdir(backup, { mode: 0o700 });
+  await writeFile(catalog, "live catalog", { mode: 0o600 });
+  await writeFile(archive, bytes, { mode: 0o600 });
+  const fill = "a".repeat(64);
+  await writeFile(
+    path.join(backup, "manifest.json"),
+    JSON.stringify({
+      kind: "margrave-store-backup",
+      version: 1,
+      store: home,
+      from: 2,
+      indexSha256: fill,
+      inventorySha256: fill,
+      archiveSha256: createHash("sha256").update(bytes).digest("hex"),
+      sourcesSha256: fill,
+    }),
+    { mode: 0o600 },
+  );
+  const preload = path.join(home, "sea-preload.mjs");
+  await writeFile(
+    preload,
+    `import { registerHooks } from "node:module"; registerHooks({ resolve(specifier, context, next) { return specifier === "node:sea" ? { url: "data:text/javascript,export%20const%20isSea%20%3D%20()%20%3D%3E%20true", shortCircuit: true } : next(specifier, context); } });\n`,
+    { mode: 0o600 },
+  );
+  const dir = await lstat(backup, { bigint: true });
+  const cli = path.resolve(import.meta.dirname, "../src/cli.ts");
+  const env = stdioTestEnv({ MARGRAVE_HOME: home });
+  const output = execFileSync(
+    process.execPath,
+    ["--import", preload, cli, "--internal-verify-backup", dir.dev.toString(), dir.ino.toString(), catalog, ""],
+    { cwd: backup, env, encoding: "utf8", timeout: 30_000 },
+  );
+  assert.equal((JSON.parse(output) as { kind: string }).kind, "ok");
+  const version = execFileSync(process.execPath, ["--import", preload, cli, "version"], {
+    cwd: home,
+    env,
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  assert.match(version, /\d+\.\d+\.\d+/u);
 });

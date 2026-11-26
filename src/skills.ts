@@ -176,9 +176,8 @@ export function findCandidates(
       .all(...exact, ...filters) as Row[];
   } else {
     db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS temp.find_vocab USING fts5vocab(main, fts, instance)");
-    const evidenceScope = scope === undefined && categoryQuery === null ? "" : " AND doc IN (SELECT rowid FROM ranked)";
     const sql = `${FIND_FTS}, ranked AS MATERIALIZED (${FIND_TAIL}), evidence AS MATERIALIZED (
-      SELECT doc, col, term FROM temp.find_vocab WHERE term IN (${terms.map(() => "?").join(",")})${evidenceScope} GROUP BY doc, col, term
+      SELECT doc, col, term FROM temp.find_vocab WHERE term IN (${terms.map(() => "?").join(",")}) AND doc IN (SELECT rowid FROM ranked) GROUP BY doc, col, term
     ) SELECT rowid, id, name, description, revision, exact, score, NULL AS col, NULL AS term, 0 AS kind FROM ranked
       UNION ALL SELECT doc, NULL, NULL, NULL, NULL, 0, 0, col, term, 1 FROM evidence
       ORDER BY kind, exact DESC, score DESC, id, col, term`;
@@ -197,7 +196,8 @@ export function findCandidates(
         matchedTerms: { name: [], description: [], headings: [], body: [] },
       });
     } else {
-      hits.get(row.rowid)?.matchedTerms[row.col].push(row.term);
+      // The evidence query is restricted to `ranked`, so every evidence row has a hit here.
+      hits.get(row.rowid)!.matchedTerms[row.col].push(row.term);
     }
   }
   return [...hits.values()];

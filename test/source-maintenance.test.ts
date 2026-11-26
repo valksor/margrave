@@ -4,7 +4,7 @@ import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
-import { checkSources, listSources, reindexAll, removeSource } from "../src/source-maintenance.ts";
+import { checkSources, listSkillCatalog, listSources, reindexAll, removeSource } from "../src/source-maintenance.ts";
 import { scanSource } from "../src/scan.ts";
 import { toEntries } from "../src/source-files.ts";
 import { openIndexRead } from "../src/catalog.ts";
@@ -489,13 +489,21 @@ test("source maintenance direct check and list boundaries close catalog connecti
       skills: [alpha, zeta].map(({ id, name, description, source }) => ({ id, name, description, source })),
     },
   );
+  const catalog = await listSkillCatalog();
+  assert.deepEqual(
+    { ...catalog, skills: catalog.skills.map((skill) => ({ ...skill })) },
+    {
+      sources: sources.map(({ id, kind, ref, commit, skillCount }) => ({ id, kind, ref, commit, skillCount })),
+      skills: [alpha, zeta].map(({ id, name, description, source }) => ({ id, name, description, source })),
+    },
+  );
   await assert.rejects(checkSources("missing"), { message: 'no source "missing"; run: margrave list' });
   assert.equal((await checkSources(second.id))[0]?.id, second.id);
   const receivers = prepare.mock.calls
     .filter((call) => call.arguments[0] === "SELECT id, record FROM sources ORDER BY position")
     .map((call) => call.this);
-  assert.equal(receivers.length, 5);
-  assert.equal(new Set(receivers).size, 5);
+  assert.equal(receivers.length, 6);
+  assert.equal(new Set(receivers).size, 6);
   for (const receiver of receivers) assert.equal(close.mock.calls.filter((call) => call.this === receiver).length, 1);
 });
 

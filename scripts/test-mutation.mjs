@@ -10,7 +10,7 @@ const targets = {
   scan: ["test/scan.test.ts"],
   "skill-files": ["test/guard.test.ts"],
   "safety-runner": ["test/safety-runner.test.ts", "test/no-vendored-ripwire.test.ts"],
-  safety: ["test/safety.test.ts"],
+  safety: ["--test-force-exit", "test/safety.test.ts"],
   "catalog-legacy": ["--test-timeout=2000", "--test-name-pattern='^catalog legacy direct '", "test/catalog-legacy.test.ts"],
   catalog: [
     "--test-timeout=2000",
@@ -20,6 +20,7 @@ const targets = {
   ],
   search: ["test/skills-sh.test.ts"],
   skills: ["test/index.test.ts", "test/guard.test.ts", "test/text.test.ts"],
+  serve: ["--test-timeout=60000", "test/serve.test.ts"],
   "lock-format": [
     "--test-name-pattern='^lock (validation|identity|parsing|inventory|export API|verification)'",
     "test/lock-format.test.ts",
@@ -96,7 +97,7 @@ const targets = {
     "test/source-migration-direct.test.ts",
   ],
   mcp: [
-    "--test-name-pattern='^(MCP server direct |MCP smoke|MCP server version|a tool whose work rejects|MCP in-process|stdio source allowlists|stdio serves|hosted tools have|hosted: with no sources|hosted: find, load, read|hosted: a store failure|hosted source options|hosted file reads|CLI, stdio and hosted opt in)'",
+    "--test-name-pattern='^(MCP server direct |MCP smoke|MCP server version|a tool whose work rejects|MCP in-process|stdio source allowlists|stdio serves|hosted tools share|hosted: with no sources|hosted: find, load, read|hosted: a store failure|hosted source options|hosted file reads|CLI, stdio and hosted support catalog opt-in)'",
     "test/mcp.test.ts",
     "test/hosted.test.ts",
     "test/skills-sh.test.ts",
@@ -104,7 +105,8 @@ const targets = {
   "mcp-skills": ["--test-timeout=2000", "--test-name-pattern='^MCP Skills direct '", "test/mcp.test.ts", "test/hosted.test.ts"],
   hosted: ["test/hosted.test.ts"],
   cli: [
-    "--test-name-pattern='^(CLI (direct |output direct |Git direct )|CLI, stdio and hosted opt in|empty stores reject explicit source checks|with no sources: update|wrap adds a build note on stderr|lock export and restore pins|stdio serves a client|reference-only updates change revision|a Git skill at the snapshot root reports drift|usage and setup commands do not upgrade a legacy store|released v0.2.1 store remains)'",
+    "--test-timeout=30000",
+    "--test-name-pattern='^(CLI (direct |output direct |Git direct )|CLI, stdio and hosted support catalog opt-in|serve argument errors|empty stores reject explicit source checks|with no sources: update|wrap adds a build note on stderr|lock export and restore pins|stdio serves a client|reference-only updates change revision|a Git skill at the snapshot root reports drift|usage and setup commands do not upgrade a legacy store|released v0.2.1 store remains)'",
     "test/cli.test.ts",
     "test/cli-output.test.ts",
     "test/cli-git.test.ts",
@@ -154,6 +156,9 @@ async function runAll(options) {
       mutate: [`src/${target}.ts`],
       ...(target === "migration-backup" || target === "source-migration" ? { timeoutMS: 16_000 } : {}),
       ...(target === "migration-recovery" ? { timeoutMS: 75_000 } : {}),
+      ...(target === "cli" ? { timeoutMS: 180_000 } : {}),
+      ...(target === "serve" ? { timeoutMS: 90_000 } : {}),
+      ...(target === "safety" ? { timeoutMS: 60_000 } : {}),
       commandRunner: {
         command: `node scripts/run-mutation-tests.mjs ${testArgs.join(" ")}`,
       },

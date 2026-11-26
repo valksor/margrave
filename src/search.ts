@@ -12,8 +12,10 @@ export const FIND_GUIDANCE =
 
 export type Clarification = { kind: "refine"; question: string; matchCount: number };
 
+const BROWSE_HINT = { cli: "Use --browse", mcp: "Set browse to true" };
+
 export function formatClarification(clarification: Clarification, frontend: "cli" | "mcp"): string {
-  return `${clarification.question}\n${clarification.matchCount} installed skills match.\n${frontend === "cli" ? "Use --browse" : "Set browse to true"} to see ranked results for this task.`;
+  return `${clarification.question}\n${clarification.matchCount} installed skills match.\n${BROWSE_HINT[frontend]} to see ranked results for this task.`;
 }
 
 export interface Recommendation extends FindHit {

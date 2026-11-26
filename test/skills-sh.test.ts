@@ -5,7 +5,14 @@ import { DatabaseSync } from "node:sqlite";
 import test, { mock } from "node:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { FIND_GUIDANCE, formatSuggestions, searchSkills } from "../src/search.ts";
+import {
+  FIND_CATEGORY_ERROR,
+  FIND_GUIDANCE,
+  formatClarification,
+  formatSuggestions,
+  parseFindCategory,
+  searchSkills,
+} from "../src/search.ts";
 import { handleHostedMcp } from "../src/hosted.ts";
 import { CLI, connectHosted, disposableHome, newEntry, runCli, seedIndex, stdioTestEnv, tmp, writeCatalogRecords } from "./helpers.ts";
 
@@ -561,4 +568,60 @@ test("CLI, stdio and hosted support catalog opt-in", async (t) => {
       await hosted.close();
     }
   }
+});
+
+test("clarification text names the frontend browse option", () => {
+  const clarification = { kind: "refine" as const, question: "Which task?", matchCount: 3 };
+  assert.equal(
+    formatClarification(clarification, "cli"),
+    "Which task?\n3 installed skills match.\nUse --browse to see ranked results for this task.",
+  );
+  assert.equal(
+    formatClarification(clarification, "mcp"),
+    "Which task?\n3 installed skills match.\nSet browse to true to see ranked results for this task.",
+  );
+});
+
+test("find categories normalize and return an exact filter", () => {
+  assert.equal(parseFindCategory(undefined), undefined);
+  assert.equal(parseFindCategory(""), undefined);
+  assert.equal(parseFindCategory("   "), undefined);
+  assert.equal(parseFindCategory("general"), null);
+  assert.equal(parseFindCategory(" GENERAL "), null);
+  assert.equal(parseFindCategory("React"), '{name headings} : ("react")');
+  assert.equal(parseFindCategory("React react Alpha"), '{name headings} : ("react" AND "alpha")');
+  assert.ok(parseFindCategory("a".repeat(1024))?.startsWith('{name headings} : ("a'));
+  assert.equal(parseFindCategory("a".repeat(1025)), undefined);
+  const terms32 = Array.from({ length: 32 }, (_, i) => `topic${i}`).join(" ");
+  assert.match(parseFindCategory(terms32) ?? "", /^\{name headings\} : \("topic0" AND /u);
+  const terms33 = Array.from({ length: 33 }, (_, i) => `topic${i}`).join(" ");
+  assert.equal(parseFindCategory(terms33), undefined);
+});
+
+test("the category error names both limits", () => {
+  assert.match(FIND_CATEGORY_ERROR, /1 to 32 distinct searchable words/u);
+  assert.match(FIND_CATEGORY_ERROR, /1024 characters/u);
+});
+
+test("broad installed searches clarify until browse or an exact match", async (t) => {
+  await disposableHome(t);
+  await seedIndex(Array.from({ length: 25 }, (_, i) => newEntry("count", `database-task-${i}`, "Database task guidance")));
+  const clarified = await searchSkills("database task", 1, false, false);
+  assert.deepEqual(clarified.hits, []);
+  assert.deepEqual(clarified.suggestions, []);
+  assert.equal(clarified.noSources, false);
+  assert.deepEqual(clarified.clarification, {
+    kind: "refine",
+    question: "What specific task should the skills cover?",
+    matchCount: 25,
+  });
+  const browsed = await searchSkills("database task", 1, false, false, undefined, undefined, true);
+  assert.equal(browsed.clarification, undefined);
+  assert.equal(browsed.hits.length, 1);
+  const exact = await searchSkills("count/database-task-1", 1, false, false);
+  assert.equal(exact.clarification, undefined);
+  assert.deepEqual(
+    exact.hits.map((hit) => hit.id),
+    ["count/database-task-1"],
+  );
 });

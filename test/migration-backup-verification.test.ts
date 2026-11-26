@@ -74,6 +74,28 @@ async function runVerifierChild(backup: string, catalog: string): Promise<void> 
   }
 }
 
+async function runVerifierChildWith(backup: string, catalog: string, copy: string): Promise<void> {
+  const directory = await lstat(backup, { bigint: true });
+  const cwd = process.cwd();
+  process.chdir(backup);
+  try {
+    await verifyBackupChild([directory.dev.toString(), directory.ino.toString(), catalog, copy]);
+  } finally {
+    process.chdir(cwd);
+  }
+}
+
+/** Run the verifier as its own main module so its stdout can be compared exactly. */
+async function verifierChildOutput(f: { home: string; backup: string; catalog: string }): Promise<string> {
+  const directory = await lstat(f.backup, { bigint: true });
+  const verifier = path.resolve(import.meta.dirname, "../src/migration-backup.ts");
+  return execFileSync(
+    process.execPath,
+    [verifier, "--internal-verify-backup", directory.dev.toString(), directory.ino.toString(), f.catalog, ""],
+    { cwd: f.backup, env: stdioTestEnv({ MARGRAVE_HOME: f.home }), encoding: "utf8" },
+  );
+}
+
 test("migration backup verify direct hashes text, binary, empty and missing files", async (t) => {
   const dir = await tmp("mg-hash-");
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -385,9 +407,16 @@ test("migration backup verifier rejects failed and malformed child results", asy
   const descriptor = Object.getOwnPropertyDescriptor(process, "execPath")!;
   try {
     Object.defineProperty(process, "execPath", { ...descriptor, value: executable });
-    for (const body of ["exit 1", "printf invalid", "printf '{}' "]) {
+    for (const [body, carriesCause] of [
+      ["exit 1", true],
+      ["printf invalid", true],
+      ["printf '{}' ", false],
+    ] as const) {
       await writeFile(executable, `#!/bin/sh\n${body}\n`, { mode: 0o700 });
-      await assert.rejects(verifyBackupFiles(f.backup), { message: `invalid backup: ${f.backup}` });
+      await assert.rejects(verifyBackupFiles(f.backup), (err: unknown) => {
+        const error = err as Error & { cause?: unknown };
+        return error.message === `invalid backup: ${f.backup}` && (carriesCause ? error.cause !== undefined : error.cause === undefined);
+      });
     }
   } finally {
     Object.defineProperty(process, "execPath", descriptor);
@@ -625,4 +654,177 @@ test("migration backup verify direct clears staging ACLs only on macOS", { skip:
       for (const dir of stageAcls) if (existsSync(dir)) execFileSync("/bin/chmod", ["-N", dir]);
     }
   }
+});
+
+test("migration backup verifier reports missing members in process", async (t) => {
+  const f = await fixture(t);
+  await rm(f.manifestFile);
+  assert.equal(await verifierChildOutput(f), '{"kind":"missing"}');
+  await writeFile(f.manifestFile, JSON.stringify(f.manifest), { mode: 0o600 });
+  await rm(f.archive);
+  assert.equal(await verifierChildOutput(f), '{"kind":"error","code":"ENOENT","file":"store.tar"}');
+  await writeFile(f.archive, Buffer.from([0, 255, 2, 128, 17]), { mode: 0o600 });
+  await rm(f.catalog);
+  assert.equal(await verifierChildOutput(f), '{"kind":"catalog-missing"}');
+});
+
+test("migration backup verifier rejects bad member types and modes in process", async (t) => {
+  const f = await fixture(t);
+  await rm(f.manifestFile);
+  await mkdir(f.manifestFile, { mode: 0o700 });
+  await assert.rejects(runVerifierChild(f.backup, f.catalog), { message: "invalid manifest" });
+  await rm(f.manifestFile, { recursive: true });
+  await writeFile(f.manifestFile, JSON.stringify(f.manifest), { mode: 0o600 });
+  await chmod(f.manifestFile, 0o644);
+  await assert.rejects(runVerifierChild(f.backup, f.catalog), { message: "invalid manifest" });
+  await chmod(f.manifestFile, 0o600);
+  await rm(f.archive);
+  await mkdir(f.archive, { mode: 0o700 });
+  await assert.rejects(runVerifierChild(f.backup, f.catalog), { message: "invalid archive" });
+  await rm(f.archive, { recursive: true });
+  await writeFile(f.archive, Buffer.from([0, 255, 2, 128, 17]), { mode: 0o600 });
+  await chmod(f.archive, 0o644);
+  await assert.rejects(runVerifierChild(f.backup, f.catalog), { message: "invalid archive" });
+  await chmod(f.archive, 0o600);
+  await rm(f.manifestFile);
+  await link(f.catalog, f.manifestFile);
+  await assert.rejects(runVerifierChild(f.backup, f.catalog), { message: "invalid manifest" });
+  await rm(f.manifestFile);
+  await writeFile(f.manifestFile, "{", { mode: 0o600 });
+  const syntax = JSON.parse(await verifierChildOutput(f)) as { kind: string; message: string };
+  assert.equal(syntax.kind, "syntax");
+  assert.ok(syntax.message.length > 0);
+  await writeFile(f.manifestFile, "{}", { mode: 0o600 });
+  await assert.rejects(runVerifierChild(f.backup, f.catalog), { message: "invalid manifest" });
+});
+
+test("migration backup verifier validates archive digests, copies and directory identity in process", async (t) => {
+  const f = await fixture(t);
+  const copy = path.join(f.home, "copy.tar");
+  await writeFile(f.manifestFile, JSON.stringify({ ...f.manifest, archiveSha256: digest("other") }), { mode: 0o600 });
+  await assert.rejects(runVerifierChild(f.backup, f.catalog), { message: "invalid archive digest" });
+  await assert.rejects(runVerifierChildWith(f.backup, f.catalog, copy), { message: "invalid archive digest" });
+  assert.equal(existsSync(copy), true);
+  await rm(copy);
+  await writeFile(f.manifestFile, JSON.stringify(f.manifest), { mode: 0o600 });
+  await runVerifierChildWith(f.backup, f.catalog, copy);
+  assert.deepEqual(await fs.readFile(copy), Buffer.from([0, 255, 2, 128, 17]));
+  await assert.rejects(runVerifierChildWith(f.backup, f.catalog, copy), (err: unknown) => (err as NodeJS.ErrnoException).code === "EEXIST");
+  await rm(copy);
+  await chmod(f.backup, 0o755);
+  await assert.rejects(runVerifierChild(f.backup, f.catalog), { message: "invalid directory" });
+  await chmod(f.backup, 0o700);
+  const realLstat = fs.lstat;
+  mock.method(fs, "lstat", (async (...args: Parameters<typeof fs.lstat>) => {
+    const result = await realLstat(...args);
+    if (args[0] === ".") Object.defineProperty(result, "uid", { value: BigInt(process.getuid!() + 1) });
+    return result;
+  }) as typeof fs.lstat);
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(runVerifierChild(f.backup, f.catalog), { message: "invalid directory" });
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
+test("migration backup verify direct checks the parent directory before an accepting child", async (t) => {
+  const f = await fixture(t);
+  const stub = path.join(f.home, "accept");
+  const ok = JSON.stringify({ kind: "ok", manifest: f.manifest, owner: process.getuid!() });
+  await writeFile(stub, `#!/bin/sh\nprintf '%s' '${ok}'\n`, { mode: 0o700 });
+  const descriptor = Object.getOwnPropertyDescriptor(process, "execPath")!;
+  Object.defineProperty(process, "execPath", { ...descriptor, value: stub });
+  try {
+    await chmod(f.backup, 0o755);
+    await assert.rejects(verifyBackupFiles(f.backup), { message: `invalid backup: ${f.backup}` });
+    await chmod(f.backup, 0o700);
+    const realLstat = fs.lstat;
+    mock.method(fs, "lstat", (async (...args: Parameters<typeof fs.lstat>) => {
+      const result = await realLstat(...args);
+      if (args[0] === f.backup) Object.defineProperty(result, "uid", { value: BigInt(process.getuid!() + 1) });
+      return result;
+    }) as typeof fs.lstat);
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(verifyBackupFiles(f.backup), { message: `invalid backup: ${f.backup}` });
+    } finally {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+  } finally {
+    Object.defineProperty(process, "execPath", descriptor);
+  }
+});
+
+test("migration backup verifier propagates non-missing member open errors", async (t) => {
+  const f = await fixture(t);
+  const realOpen = fs.open;
+  for (const member of ["manifest.json", "store.tar"]) {
+    const failure = Object.assign(new Error(`${member} open failed`), { code: "EACCES" });
+    mock.method(fs, "open", (async (...args: Parameters<typeof fs.open>) => {
+      if (args[0] === member) throw failure;
+      return realOpen(...args);
+    }) as typeof fs.open);
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(runVerifierChild(f.backup, f.catalog), (err) => err === failure);
+    } finally {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+  }
+});
+
+test("migration backup verifier guards its command line entry points", async (t) => {
+  const f = await fixture(t);
+  const verifier = path.resolve(import.meta.dirname, "../src/migration-backup.ts");
+  const env = stdioTestEnv({ MARGRAVE_HOME: f.home });
+  // As main with a non-verifier argument: the argv check alone must block verification.
+  assert.equal(execFileSync(process.execPath, [verifier, "not-the-flag"], { cwd: f.home, env, encoding: "utf8" }), "");
+  // Imported (not main) with the verifier argument: the main check alone must block it.
+  const runner = path.join(f.home, "runner.mjs");
+  await writeFile(runner, `import(${JSON.stringify(verifier)});\n`);
+  assert.equal(execFileSync(process.execPath, [runner, "--internal-verify-backup"], { cwd: f.home, env, encoding: "utf8" }), "");
+  // As main with both conditions satisfied, the verifier does run and reports bad arguments.
+  assert.throws(
+    () =>
+      execFileSync(process.execPath, [verifier, "--internal-verify-backup", "bad"], {
+        cwd: f.home,
+        env,
+        encoding: "utf8",
+        stdio: "pipe",
+      }),
+    (err: unknown) => {
+      const failure = err as { status?: number; stderr?: string | Buffer };
+      return failure.status === 1 && /invalid directory/u.test(String(failure.stderr));
+    },
+  );
+});
+
+test("migration backup verifier keeps the script path out of a SEA child", async (t) => {
+  const f = await fixture(t);
+  const verifier = path.resolve(import.meta.dirname, "../src/migration-backup.ts");
+  const preload = path.join(f.home, "sea-preload.mjs");
+  await writeFile(
+    preload,
+    `import { registerHooks } from "node:module"; registerHooks({ resolve(specifier, context, next) { return specifier === "node:sea" ? { url: "data:text/javascript,export%20const%20isSea%20%3D%20()%20%3D%3E%20true", shortCircuit: true } : next(specifier, context); } });\n`,
+  );
+  const argsFile = path.join(f.home, "args");
+  const recorder = path.join(f.home, "recorder");
+  const ok = JSON.stringify({ kind: "ok", manifest: f.manifest, owner: process.getuid!() });
+  await writeFile(recorder, `#!/bin/sh\nprintf '%s\n' "$@" > '${argsFile}'\nprintf '%s' '${ok}'\n`, { mode: 0o700 });
+  const child = path.join(f.home, "sea-child.mjs");
+  await writeFile(
+    child,
+    `import { verifyBackupFiles } from ${JSON.stringify(verifier)};\nconst descriptor = Object.getOwnPropertyDescriptor(process, "execPath");\nObject.defineProperty(process, "execPath", { ...descriptor, value: ${JSON.stringify(recorder)} });\nawait verifyBackupFiles(${JSON.stringify(f.backup)});\n`,
+  );
+  execFileSync(process.execPath, ["--import", preload, child], {
+    cwd: f.home,
+    env: stdioTestEnv({ MARGRAVE_HOME: f.home }),
+    encoding: "utf8",
+  });
+  const args = (await fs.readFile(argsFile, "utf8")).split("\n");
+  assert.equal(args[0], "--internal-verify-backup");
 });

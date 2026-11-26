@@ -211,8 +211,8 @@ export async function recoverMigrationRecord(): Promise<{
       throw invalid();
     const archive = path.join(scratch, "store.tar");
     const checked = await verifyBackupFiles(backup, archive);
-    if (checked === null) throw invalid();
-    const { manifest, owner } = checked;
+    // A missing manifest destructures to a TypeError below, which the catch normalizes to invalidRecovery.
+    const { manifest, owner } = checked!;
     if (
       manifest.store !== store ||
       manifest.from !== 2 ||

@@ -36,7 +36,7 @@ async function respondMcp(req: IncomingMessage, res: ServerResponse): Promise<vo
     const header = value as string | string[];
     headers.set(name, Array.isArray(header) ? header.join(", ") : header);
   }
-  const body = Readable.toWeb(req, { strategy: { highWaterMark: 65536, size: (chunk: Buffer) => chunk.byteLength } });
+  const body = Readable.toWeb(req);
   const init: RequestInit & { duplex: "half" } = {
     method: "POST",
     headers,
@@ -47,7 +47,8 @@ async function respondMcp(req: IncomingMessage, res: ServerResponse): Promise<vo
   const request = new Request("http://localhost/mcp", init);
   const response = await handleHostedMcp(request);
   if (res.destroyed) {
-    await response.body?.cancel();
+    // Cancel the response body so the handler stops producing; a null body has nothing to cancel.
+    await (response.body ?? new ReadableStream()).cancel();
     return;
   }
   if (!req.complete) res.shouldKeepAlive = false;
@@ -62,17 +63,12 @@ async function respond(req: IncomingMessage, res: ServerResponse, hosts: Set<str
     const route = req.url!.split("?", 1)[0];
     if (route === "/api/health") {
       if (req.method !== "GET" && req.method !== "HEAD") return early(req, res, 405, { Allow: "GET, HEAD" });
-      return early(
-        req,
-        res,
-        200,
-        { "Content-Type": "application/json", "Content-Length": "15" },
-        req.method === "HEAD" ? "" : '{"status":"ok"}',
-      );
+      return early(req, res, 200, { "Content-Type": "application/json", "Content-Length": "15" }, '{"status":"ok"}');
     }
     if (route !== "/mcp" && route !== "/skills.json") return early(req, res, 404);
-    const host = req.headersDistinct.host ?? [];
-    if (host.length !== 1 || !host[0] || !hosts.has(host[0].toLowerCase())) return early(req, res, 421);
+    const host = req.headersDistinct.host;
+    const authority = host?.length === 1 ? host[0] : undefined;
+    if (authority === undefined || !hosts.has(authority.toLowerCase())) return early(req, res, 421);
     const origin = req.headersDistinct.origin ?? [];
     if (origin.length > 1 || (origin.length === 1 && !origins.has(origin[0]!))) return early(req, res, 403);
     if (route === "/skills.json") {
@@ -83,7 +79,7 @@ async function respond(req: IncomingMessage, res: ServerResponse, hosts: Set<str
         res,
         200,
         { "Content-Type": "application/json", "Content-Length": String(Buffer.byteLength(body)), "Cache-Control": "no-store" },
-        req.method === "HEAD" ? "" : body,
+        body,
       );
     }
     await respondMcp(req, res);
@@ -107,10 +103,7 @@ export async function serveHttp(host: string, port: number): Promise<void> {
   );
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, host, () => {
-      server.off("error", reject);
-      resolve();
-    });
+    server.listen(port, host, resolve);
   });
   const address = server.address() as AddressInfo;
   const defaults = ["127.0.0.1", "localhost", "[::1]", hostname(host)];
@@ -122,10 +115,7 @@ export async function serveHttp(host: string, port: number): Promise<void> {
           return [authority, new URL(`http://${authority}`).host];
         });
   for (const name of names) hosts.add(name.toLowerCase());
-  let shuttingDown = false;
   const shutdown = (): void => {
-    if (shuttingDown) return;
-    shuttingDown = true;
     server.close();
     setTimeout(() => server.closeAllConnections(), 5000).unref();
   };

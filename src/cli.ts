@@ -178,7 +178,7 @@ async function listCommand(rest: string[]): Promise<void> {
   await migrateStore();
   const withSkills = p.values["skills"] === true;
   if (p.values["json"] === true) {
-    json(withSkills ? await listSkillCatalog() : { sources: (await listSources(false)).sources });
+    json(withSkills ? await listSkillCatalog() : { sources: (await listSources(withSkills)).sources });
     return;
   }
   const { sources, skills } = await listSources(withSkills);
