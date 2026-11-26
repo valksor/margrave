@@ -1,7 +1,8 @@
 import "../test/isolate-store.ts";
-import { globSync } from "node:fs";
-import { sep } from "node:path";
+import { globSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, sep } from "node:path";
 import { Stryker, StrykerCli } from "@stryker-mutator/core";
+import { isUsableReport, readStamp, testInputsFingerprint } from "./mutation-cache.mjs";
 
 const targets = {
   bm25: ["test/bm25.test.ts"],
@@ -151,25 +152,45 @@ async function runAll(options) {
   if (missing.length > 0 || stale.length > 0) process.exit(1);
 
   for (const [target, testArgs] of Object.entries(targets)) {
+    const overrides =
+      target === "migration-backup" || target === "source-migration"
+        ? { timeoutMS: 16_000 }
+        : target === "migration-recovery"
+          ? { timeoutMS: 75_000 }
+          : target === "cli"
+            ? { timeoutMS: 180_000 }
+            : target === "serve"
+              ? { timeoutMS: 90_000 }
+              : target === "safety"
+                ? { timeoutMS: 60_000 }
+                : {};
+    const command = `node scripts/run-mutation-tests.mjs ${testArgs.join(" ")}`;
+    const incrementalFile = `coverage/mutation/${target}.incremental`;
+    const stampFile = `coverage/mutation/${target}.stamp`;
+    const fingerprint = testInputsFingerprint(command, overrides);
+    const force = readStamp(stampFile) !== fingerprint || !isUsableReport(incrementalFile);
+    if (force) rmSync(incrementalFile, { force: true });
     const stryker = new Stryker({
       ...options,
       mutate: [`src/${target}.ts`],
-      ...(target === "migration-backup" || target === "source-migration" ? { timeoutMS: 16_000 } : {}),
-      ...(target === "migration-recovery" ? { timeoutMS: 75_000 } : {}),
-      ...(target === "cli" ? { timeoutMS: 180_000 } : {}),
-      ...(target === "serve" ? { timeoutMS: 90_000 } : {}),
-      ...(target === "safety" ? { timeoutMS: 60_000 } : {}),
-      commandRunner: {
-        command: `node scripts/run-mutation-tests.mjs ${testArgs.join(" ")}`,
-      },
+      ...overrides,
+      commandRunner: { command },
       reporters: ["clear-text", "progress", "html", "json"],
       htmlReporter: { fileName: `coverage/mutation/${target}.html` },
       jsonReporter: { fileName: `coverage/mutation/${target}.json` },
+      incremental: true,
+      incrementalFile,
+      force,
     });
     const mutants = await stryker.runMutationTest();
-    if ((target !== "store" && mutants.length === 0) || mutants.some((mutant) => mutant.status !== "Killed")) {
+    const clean = (target === "store" || mutants.length > 0) && mutants.every((mutant) => mutant.status === "Killed");
+    if (!clean) {
+      rmSync(stampFile, { force: true });
       console.error(`${target}: each generated mutant must be killed by a test`);
       process.exitCode = 1;
+    } else {
+      mkdirSync(dirname(stampFile), { recursive: true });
+      writeFileSync(stampFile, fingerprint);
     }
   }
 }
