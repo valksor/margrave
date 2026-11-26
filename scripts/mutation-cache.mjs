@@ -3,11 +3,12 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
 const INPUT_FILES = [
-  "scripts/run-mutation-tests.mjs",
-  "scripts/ensure-ripwire.mjs",
   "examples/hosted-mcp.mjs",
   "package.json",
   "pnpm-lock.yaml",
+  "scripts/ensure-ripwire.mjs",
+  "scripts/run-mutation-tests.mjs",
+  "stryker.config.json",
 ];
 
 export function testInputsFingerprint(command, overrides, root = process.cwd()) {
@@ -25,6 +26,11 @@ export function testInputsFingerprint(command, overrides, root = process.cwd()) 
   return hash.digest("hex");
 }
 
+export function mutationCacheDecision({ command, overrides, stampFile, incrementalFile, root = process.cwd() }) {
+  const fingerprint = testInputsFingerprint(command, overrides, root);
+  return { fingerprint, force: readStamp(stampFile) !== fingerprint || !isUsableReport(incrementalFile) };
+}
+
 export function readStamp(file) {
   try {
     return readFileSync(file, "utf8").trim();
@@ -36,6 +42,8 @@ export function readStamp(file) {
 
 // Mirrors what Stryker 10.1.1's readIncrementalReport and incremental differ dereference,
 // so a parseable but malformed report is treated as unusable and never read by Stryker.
+// Stryker's writer always emits testFiles (the command runner writes a "" entry), so requiring it
+// fails safe: a report that lacks it forces a full run instead of reaching Stryker's differ.
 export function isUsableReport(file) {
   let report;
   try {
@@ -52,15 +60,17 @@ export function isUsableReport(file) {
       if (typeof mutant !== "object" || mutant === null) return false;
       if (typeof mutant.location !== "object" || mutant.location === null) return false;
       if (typeof mutant.location.start !== "object" || mutant.location.start === null) return false;
+      if (typeof mutant.location.end !== "object" || mutant.location.end === null) return false;
     }
   }
-  if (report.testFiles !== undefined) {
-    if (typeof report.testFiles !== "object" || report.testFiles === null) return false;
-    for (const entry of Object.values(report.testFiles)) {
-      if (typeof entry !== "object" || entry === null || !Array.isArray(entry.tests)) return false;
-      for (const test of entry.tests) {
-        if (typeof test !== "object" || test === null) return false;
-        if (test.location !== undefined && test.location !== null && typeof test.location !== "object") return false;
+  if (typeof report.testFiles !== "object" || report.testFiles === null) return false;
+  for (const entry of Object.values(report.testFiles)) {
+    if (typeof entry !== "object" || entry === null || !Array.isArray(entry.tests)) return false;
+    for (const test of entry.tests) {
+      if (typeof test !== "object" || test === null) return false;
+      if (test.location !== undefined && test.location !== null) {
+        if (typeof test.location !== "object") return false;
+        if (typeof test.location.start !== "object" || test.location.start === null) return false;
       }
     }
   }
@@ -69,7 +79,11 @@ export function isUsableReport(file) {
 
 function inputFiles(root) {
   const tests = readdirSync(join(root, "test"), { recursive: true, withFileTypes: true })
-    .filter((entry) => entry.isFile() || (entry.isSymbolicLink() && statSync(join(entry.parentPath, entry.name)).isFile()))
+    .filter(
+      (entry) =>
+        entry.isFile() ||
+        (entry.isSymbolicLink() && statSync(join(entry.parentPath, entry.name), { throwIfNoEntry: false })?.isFile() === true),
+    )
     .map((entry) => relative(root, join(entry.parentPath, entry.name)).split(sep).join("/"));
   return [...INPUT_FILES, ...tests].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }

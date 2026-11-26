@@ -2,7 +2,7 @@ import "../test/isolate-store.ts";
 import { globSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, sep } from "node:path";
 import { Stryker, StrykerCli } from "@stryker-mutator/core";
-import { isUsableReport, readStamp, testInputsFingerprint } from "./mutation-cache.mjs";
+import { mutationCacheDecision } from "./mutation-cache.mjs";
 
 const targets = {
   bm25: ["test/bm25.test.ts"],
@@ -167,8 +167,8 @@ async function runAll(options) {
     const command = `node scripts/run-mutation-tests.mjs ${testArgs.join(" ")}`;
     const incrementalFile = `coverage/mutation/${target}.incremental`;
     const stampFile = `coverage/mutation/${target}.stamp`;
-    const fingerprint = testInputsFingerprint(command, overrides);
-    const force = readStamp(stampFile) !== fingerprint || !isUsableReport(incrementalFile);
+    const { fingerprint, force } = mutationCacheDecision({ command, overrides, stampFile, incrementalFile });
+    rmSync(stampFile, { force: true });
     if (force) rmSync(incrementalFile, { force: true });
     const stryker = new Stryker({
       ...options,
@@ -185,7 +185,6 @@ async function runAll(options) {
     const mutants = await stryker.runMutationTest();
     const clean = (target === "store" || mutants.length > 0) && mutants.every((mutant) => mutant.status === "Killed");
     if (!clean) {
-      rmSync(stampFile, { force: true });
       console.error(`${target}: each generated mutant must be killed by a test`);
       process.exitCode = 1;
     } else {

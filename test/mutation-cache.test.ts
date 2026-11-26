@@ -4,14 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { TestContext } from "node:test";
-import { isUsableReport, readStamp, testInputsFingerprint } from "../scripts/mutation-cache.mjs";
+import { isUsableReport, mutationCacheDecision, readStamp, testInputsFingerprint } from "../scripts/mutation-cache.mjs";
 
 const INPUT_FILES = [
-  "scripts/run-mutation-tests.mjs",
-  "scripts/ensure-ripwire.mjs",
   "examples/hosted-mcp.mjs",
   "package.json",
   "pnpm-lock.yaml",
+  "scripts/ensure-ripwire.mjs",
+  "scripts/run-mutation-tests.mjs",
+  "stryker.config.json",
 ];
 
 function fixture(t: TestContext) {
@@ -22,9 +23,14 @@ function fixture(t: TestContext) {
     writeFileSync(join(root, file), `content of ${file}\n`);
   }
   mkdirSync(join(root, "test", "fixtures"), { recursive: true });
+  mkdirSync(join(root, "src"), { recursive: true });
+  mkdirSync(join(root, "elsewhere"), { recursive: true });
   writeFileSync(join(root, "test", "a.test.ts"), "one\n");
+  writeFileSync(join(root, "src", "a.ts"), "export const a = 1;\n");
   writeFileSync(join(root, "outside.ts"), "outside\n");
   symlinkSync(join("..", "outside.ts"), join(root, "test", "linked.ts"));
+  symlinkSync(join("..", "elsewhere"), join(root, "test", "dir-link"));
+  symlinkSync(join("..", "does-not-exist.ts"), join(root, "test", "dangling.ts"));
   return root;
 }
 
@@ -54,6 +60,13 @@ test("the fingerprint covers the lockfile", (t) => {
   assert.notEqual(testInputsFingerprint("cmd", {}, root), before);
 });
 
+test("the fingerprint ignores source files, which Stryker diffs per target", (t) => {
+  const root = fixture(t);
+  const before = testInputsFingerprint("cmd", {}, root);
+  writeFileSync(join(root, "src", "a.ts"), "export const a = 2;\n");
+  assert.equal(testInputsFingerprint("cmd", {}, root), before);
+});
+
 test("the fingerprint covers the command and the target overrides", (t) => {
   const root = fixture(t);
   const before = testInputsFingerprint("cmd", {}, root);
@@ -66,6 +79,25 @@ test("readStamp returns undefined for a missing file and the trimmed value other
   assert.equal(readStamp(join(root, "missing.stamp")), undefined);
   writeFileSync(join(root, "b.stamp"), " abc \n");
   assert.equal(readStamp(join(root, "b.stamp")), "abc");
+  assert.throws(() => readStamp(join(root, "test")));
+});
+
+test("mutationCacheDecision forces a full run unless the stamp matches and the report is usable", (t) => {
+  const root = fixture(t);
+  const stampFile = join(root, "target.stamp");
+  const incrementalFile = join(root, "target.incremental");
+  const input = { command: "cmd", overrides: {}, stampFile, incrementalFile, root };
+  const fingerprint = testInputsFingerprint("cmd", {}, root);
+  writeFileSync(incrementalFile, '{"files":{},"testFiles":{}}');
+  writeFileSync(stampFile, fingerprint);
+  assert.deepEqual(mutationCacheDecision(input), { fingerprint, force: false });
+  writeFileSync(stampFile, "stale");
+  assert.equal(mutationCacheDecision(input).force, true);
+  writeFileSync(stampFile, fingerprint);
+  writeFileSync(incrementalFile, '{"files":');
+  assert.equal(mutationCacheDecision(input).force, true);
+  rmSync(stampFile);
+  assert.equal(mutationCacheDecision(input).force, true);
 });
 
 test("isUsableReport rejects a missing or truncated report", (t) => {
@@ -85,7 +117,13 @@ test("isUsableReport rejects parseable reports Stryker would throw on", (t) => {
     ["no-mutants.json", '{"files":{"a.ts":{"source":"x"}}}'],
     ["bad-mutant.json", '{"files":{"a.ts":{"source":"x","mutants":[{}]}}}'],
     ["no-location.json", '{"files":{"a.ts":{"source":"x","mutants":[{"location":null}]}}}'],
+    ["no-location-start.json", '{"files":{"a.ts":{"source":"x","mutants":[{"location":{"end":{"line":1,"column":0}}}]}}}'],
+    ["no-location-end.json", '{"files":{"a.ts":{"source":"x","mutants":[{"location":{"start":{"line":1,"column":0}}}]}}}'],
+    ["null-location-end.json", '{"files":{"a.ts":{"source":"x","mutants":[{"location":{"start":{"line":1,"column":0},"end":null}}]}}}'],
+    ["test-location-no-start.json", '{"files":{},"testFiles":{"a.test.ts":{"tests":[{"location":{}}]}}}'],
+    ["test-location-null-start.json", '{"files":{},"testFiles":{"a.test.ts":{"tests":[{"location":{"start":null}}]}}}'],
     ["bad-test-files.json", '{"files":{},"testFiles":null}'],
+    ["no-test-files.json", '{"files":{}}'],
     ["no-tests.json", '{"files":{},"testFiles":{"a.test.ts":{}}}'],
   ];
   for (const [name, report] of cases) {
@@ -96,7 +134,7 @@ test("isUsableReport rejects parseable reports Stryker would throw on", (t) => {
 
 test("isUsableReport accepts an empty or populated report", (t) => {
   const root = fixture(t);
-  writeFileSync(join(root, "empty.json"), '{"files":{}}');
+  writeFileSync(join(root, "empty.json"), '{"files":{},"testFiles":{}}');
   assert.equal(isUsableReport(join(root, "empty.json")), true);
   const start = { line: 1, column: 0 };
   const populated = {
