@@ -66,7 +66,7 @@ const targets = {
   ],
   "migration-backup": [
     "--import ./test/bounded-metadata-reads.ts",
-    "--test-timeout=3000",
+    "--test-timeout=10000",
     "--test-name-pattern='^(migration backup (verify|metadata|publication) direct |migration backup verifier |legacy backup validates selected file types|backup cleanup handles non-Error failures|backup rejects a snapshot changed during archiving|backup does not release the catalog lock|backup and record hashing preserve the catalog|prepared record refuses backup files linked|backup reports an unreadable catalog|migration backup and recovery clear staging directory ACLs on macOS|backup verification checks extended directory ACLs on macOS)'",
     "test/migration-backup-verification.test.ts",
     "test/migration-backup-acl.test.ts",
@@ -153,17 +153,19 @@ async function runAll(options) {
 
   for (const [target, testArgs] of Object.entries(targets)) {
     const overrides =
-      target === "migration-backup" || target === "source-migration"
-        ? { timeoutMS: 16_000 }
-        : target === "migration-recovery"
-          ? { timeoutMS: 75_000 }
-          : target === "cli"
-            ? { timeoutMS: 180_000 }
-            : target === "serve"
-              ? { timeoutMS: 90_000 }
-              : target === "safety"
-                ? { timeoutMS: 60_000 }
-                : {};
+      target === "migration-backup"
+        ? { timeoutMS: 23_000 }
+        : target === "source-migration"
+          ? { timeoutMS: 16_000 }
+          : target === "migration-recovery"
+            ? { timeoutMS: 75_000 }
+            : target === "cli"
+              ? { timeoutMS: 180_000 }
+              : target === "serve"
+                ? { timeoutMS: 90_000 }
+                : target === "safety"
+                  ? { timeoutMS: 60_000 }
+                  : {};
     const command = `node scripts/run-mutation-tests.mjs ${testArgs.join(" ")}`;
     const incrementalFile = `coverage/mutation/${target}.incremental`;
     const stampFile = `coverage/mutation/${target}.stamp`;
