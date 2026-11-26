@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
 const INPUT_FILES = [
@@ -8,8 +8,12 @@ const INPUT_FILES = [
   "pnpm-lock.yaml",
   "scripts/ensure-ripwire.mjs",
   "scripts/run-mutation-tests.mjs",
-  "stryker.config.json",
 ];
+
+// Stryker 10.1.1 discovers config files in this order (SUPPORTED_CONFIG_FILE_NAMES); re-check on upgrade.
+const CONFIG_FILES = ["", "."].flatMap((prefix) =>
+  [".conf", ".config"].flatMap((suffix) => ["json", "js", "mjs", "cjs"].map((extension) => `${prefix}stryker${suffix}.${extension}`)),
+);
 
 export function testInputsFingerprint(command, overrides, root = process.cwd()) {
   const hash = createHash("sha256");
@@ -29,6 +33,13 @@ export function testInputsFingerprint(command, overrides, root = process.cwd()) 
 export function mutationCacheDecision({ command, overrides, stampFile, incrementalFile, root = process.cwd() }) {
   const fingerprint = testInputsFingerprint(command, overrides, root);
   return { fingerprint, force: readStamp(stampFile) !== fingerprint || !isUsableReport(incrementalFile) };
+}
+
+export function prepareMutationRun({ command, overrides, stampFile, incrementalFile, root = process.cwd() }) {
+  const { fingerprint, force } = mutationCacheDecision({ command, overrides, stampFile, incrementalFile, root });
+  rmSync(stampFile, { force: true });
+  if (force) rmSync(incrementalFile, { force: true });
+  return { fingerprint, force };
 }
 
 export function readStamp(file) {
@@ -78,12 +89,14 @@ export function isUsableReport(file) {
 }
 
 function inputFiles(root) {
+  const configs = CONFIG_FILES.filter((file) => existsSync(join(root, file)));
   const tests = readdirSync(join(root, "test"), { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.name !== ".DS_Store")
     .filter(
       (entry) =>
         entry.isFile() ||
         (entry.isSymbolicLink() && statSync(join(entry.parentPath, entry.name), { throwIfNoEntry: false })?.isFile() === true),
     )
     .map((entry) => relative(root, join(entry.parentPath, entry.name)).split(sep).join("/"));
-  return [...INPUT_FILES, ...tests].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return [...INPUT_FILES, ...configs, ...tests].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }

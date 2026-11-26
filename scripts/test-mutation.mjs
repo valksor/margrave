@@ -1,8 +1,8 @@
 import "../test/isolate-store.ts";
-import { globSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { globSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, sep } from "node:path";
 import { Stryker, StrykerCli } from "@stryker-mutator/core";
-import { mutationCacheDecision } from "./mutation-cache.mjs";
+import { prepareMutationRun } from "./mutation-cache.mjs";
 
 const targets = {
   bm25: ["test/bm25.test.ts"],
@@ -167,9 +167,7 @@ async function runAll(options) {
     const command = `node scripts/run-mutation-tests.mjs ${testArgs.join(" ")}`;
     const incrementalFile = `coverage/mutation/${target}.incremental`;
     const stampFile = `coverage/mutation/${target}.stamp`;
-    const { fingerprint, force } = mutationCacheDecision({ command, overrides, stampFile, incrementalFile });
-    rmSync(stampFile, { force: true });
-    if (force) rmSync(incrementalFile, { force: true });
+    const { fingerprint, force } = prepareMutationRun({ command, overrides, stampFile, incrementalFile });
     const stryker = new Stryker({
       ...options,
       mutate: [`src/${target}.ts`],

@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { TestContext } from "node:test";
-import { isUsableReport, mutationCacheDecision, readStamp, testInputsFingerprint } from "../scripts/mutation-cache.mjs";
+import { isUsableReport, mutationCacheDecision, prepareMutationRun, readStamp, testInputsFingerprint } from "../scripts/mutation-cache.mjs";
 
+// Spec pin: every file the fingerprint must cover, including the repo's config file. Keep it in step
+// with the production INPUT_FILES list; the per-file test below fails if either list drifts.
 const INPUT_FILES = [
   "examples/hosted-mcp.mjs",
   "package.json",
@@ -13,6 +15,25 @@ const INPUT_FILES = [
   "scripts/ensure-ripwire.mjs",
   "scripts/run-mutation-tests.mjs",
   "stryker.config.json",
+];
+
+const CONFIG_FILE_NAMES = [
+  "stryker.conf.json",
+  "stryker.conf.js",
+  "stryker.conf.mjs",
+  "stryker.conf.cjs",
+  "stryker.config.json",
+  "stryker.config.js",
+  "stryker.config.mjs",
+  "stryker.config.cjs",
+  ".stryker.conf.json",
+  ".stryker.conf.js",
+  ".stryker.conf.mjs",
+  ".stryker.conf.cjs",
+  ".stryker.config.json",
+  ".stryker.config.js",
+  ".stryker.config.mjs",
+  ".stryker.config.cjs",
 ];
 
 function fixture(t: TestContext) {
@@ -53,11 +74,29 @@ test("the fingerprint follows symlinked test inputs", (t) => {
   assert.notEqual(testInputsFingerprint("cmd", {}, root), before);
 });
 
-test("the fingerprint covers the lockfile", (t) => {
+test("the fingerprint covers every input file", (t) => {
+  for (const file of INPUT_FILES) {
+    const root = fixture(t);
+    const before = testInputsFingerprint("cmd", {}, root);
+    writeFileSync(join(root, file), "changed\n");
+    assert.notEqual(testInputsFingerprint("cmd", {}, root), before, file);
+  }
+});
+
+test("the fingerprint covers every config filename Stryker discovers", (t) => {
+  for (const name of CONFIG_FILE_NAMES) {
+    const root = fixture(t);
+    const before = testInputsFingerprint("cmd", {}, root);
+    writeFileSync(join(root, name), "{}");
+    assert.notEqual(testInputsFingerprint("cmd", {}, root), before, name);
+  }
+});
+
+test("Finder metadata under test is not a test input", (t) => {
   const root = fixture(t);
   const before = testInputsFingerprint("cmd", {}, root);
-  writeFileSync(join(root, "pnpm-lock.yaml"), "changed\n");
-  assert.notEqual(testInputsFingerprint("cmd", {}, root), before);
+  writeFileSync(join(root, "test", "fixtures", ".DS_Store"), "junk");
+  assert.equal(testInputsFingerprint("cmd", {}, root), before);
 });
 
 test("the fingerprint ignores source files, which Stryker diffs per target", (t) => {
@@ -96,8 +135,37 @@ test("mutationCacheDecision forces a full run unless the stamp matches and the r
   writeFileSync(stampFile, fingerprint);
   writeFileSync(incrementalFile, '{"files":');
   assert.equal(mutationCacheDecision(input).force, true);
+  writeFileSync(incrementalFile, '{"files":{},"testFiles":{}}');
   rmSync(stampFile);
   assert.equal(mutationCacheDecision(input).force, true);
+});
+
+test("prepareMutationRun removes the stamp and only a forced report", (t) => {
+  const root = fixture(t);
+  const stampFile = join(root, "target.stamp");
+  const incrementalFile = join(root, "target.incremental");
+  const input = { command: "cmd", overrides: {}, stampFile, incrementalFile, root };
+  const fingerprint = testInputsFingerprint("cmd", {}, root);
+  writeFileSync(incrementalFile, '{"files":{},"testFiles":{}}');
+  writeFileSync(stampFile, fingerprint);
+  assert.deepEqual(prepareMutationRun(input), { fingerprint, force: false });
+  assert.equal(existsSync(stampFile), false);
+  assert.equal(existsSync(incrementalFile), true);
+  writeFileSync(stampFile, fingerprint);
+  writeFileSync(incrementalFile, '{"files":');
+  assert.deepEqual(prepareMutationRun(input), { fingerprint, force: true });
+  assert.equal(existsSync(stampFile), false);
+  assert.equal(existsSync(incrementalFile), false);
+});
+
+test("prepareMutationRun forces a full run on a fresh checkout without creating files", (t) => {
+  const root = fixture(t);
+  const stampFile = join(root, "target.stamp");
+  const incrementalFile = join(root, "target.incremental");
+  const result = prepareMutationRun({ command: "cmd", overrides: {}, stampFile, incrementalFile, root });
+  assert.equal(result.force, true);
+  assert.equal(existsSync(stampFile), false);
+  assert.equal(existsSync(incrementalFile), false);
 });
 
 test("isUsableReport rejects a missing or truncated report", (t) => {
