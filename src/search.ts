@@ -51,7 +51,10 @@ async function catalog(catalogQuery: string, limit: number, installed: Map<strin
   let body: { skills?: unknown } | null;
   try {
     const query = new URLSearchParams({ q: catalogQuery, limit: String(installed.size > 0 ? MAX_LIMIT : limit) });
-    const response = await fetch(`${SKILLS_SH_ORIGIN}/api/search?${query}`, { signal: AbortSignal.timeout(2500), redirect: "error" });
+    const response = await fetch(`${SKILLS_SH_ORIGIN}/api/search?${query.toString()}`, {
+      signal: AbortSignal.timeout(2500),
+      redirect: "error",
+    });
     if (!response.ok) return [];
     body = (await response.json()) as { skills?: unknown } | null;
   } catch {

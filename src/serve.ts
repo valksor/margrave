@@ -40,7 +40,7 @@ async function respondMcp(req: IncomingMessage, res: ServerResponse): Promise<vo
   const init: RequestInit & { duplex: "half" } = {
     method: "POST",
     headers,
-    body: body as unknown as ReadableStream,
+    body,
     signal: req.signal,
     duplex: "half",
   };
@@ -54,7 +54,7 @@ async function respondMcp(req: IncomingMessage, res: ServerResponse): Promise<vo
   if (!req.complete) res.shouldKeepAlive = false;
   res.writeHead(response.status, Object.fromEntries(response.headers));
   if (response.body === null) res.end();
-  else await pipeline(Readable.fromWeb(response.body as unknown as import("node:stream/web").ReadableStream), res);
+  else await pipeline(Readable.fromWeb(response.body), res);
 }
 
 async function respond(req: IncomingMessage, res: ServerResponse, hosts: Set<string>, origins: Set<string>): Promise<void> {

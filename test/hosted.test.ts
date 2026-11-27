@@ -942,7 +942,7 @@ test("production integration times out an unfinished incoming body", async (t) =
         headers: { host: "test", authorization: "Bearer dummy" },
         body,
         duplex: "half",
-      } as RequestInit),
+      }),
     );
     assert.equal(timeout.mock.callCount(), i + 1);
     assert.deepEqual(timeout.mock.calls[i]?.arguments, [10_000]);
@@ -986,7 +986,7 @@ test("production integration releases admission when an incoming body aborts", a
     body,
     signal: aborter.signal,
     duplex: "half",
-  } as RequestInit);
+  });
   const pending = app(request);
   const reason = new Error("dummy abort");
   aborter.abort(reason);
@@ -1025,7 +1025,7 @@ test("production integration preserves client abort when the body deadline also 
       }),
       signal: client.signal,
       duplex: "half",
-    } as RequestInit),
+    }),
   );
   deadline.abort(new DOMException("deadline", "TimeoutError"));
   const reason = new Error("dummy abort");
