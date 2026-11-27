@@ -138,11 +138,16 @@ new StrykerCli([...process.argv.slice(0, 2), "run", ...process.argv.slice(2)], u
     return [];
   }
 
-  await runAll(options);
+  const failedTargets = new Set();
+  try {
+    await runAll(options, failedTargets);
+  } finally {
+    if (failedTargets.size > 0) console.error(`Failed mutation targets: ${[...failedTargets].join(", ")}`);
+  }
   return [];
 }).run();
 
-async function runAll(options) {
+async function runAll(options, failedTargets) {
   const discovered = new Set(globSync("src/**/*.ts").map((file) => file.replaceAll(sep, "/")));
   const mapped = new Set(Object.keys(targets).map((target) => `src/${target}.ts`));
   const missing = [...discovered].filter((file) => !mapped.has(file)).sort((a, b) => a.localeCompare(b));
@@ -152,6 +157,8 @@ async function runAll(options) {
   if (missing.length > 0 || stale.length > 0) process.exit(1);
 
   for (const [target, testArgs] of Object.entries(targets)) {
+    const sourceFile = `src/${target}.ts`;
+    failedTargets.add(sourceFile);
     const overrides =
       target === "migration-backup"
         ? { timeoutMS: 23_000 }
@@ -172,7 +179,7 @@ async function runAll(options) {
     const { fingerprint, force } = prepareMutationRun({ command, overrides, stampFile, incrementalFile });
     const stryker = new Stryker({
       ...options,
-      mutate: [`src/${target}.ts`],
+      mutate: [sourceFile],
       ...overrides,
       commandRunner: { command },
       reporters: ["clear-text", "progress", "html", "json"],
@@ -190,6 +197,7 @@ async function runAll(options) {
     } else {
       mkdirSync(dirname(stampFile), { recursive: true });
       writeFileSync(stampFile, fingerprint);
+      failedTargets.delete(sourceFile);
     }
   }
 }
