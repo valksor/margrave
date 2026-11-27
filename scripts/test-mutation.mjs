@@ -126,6 +126,8 @@ const targetOverrides = new Map([
   ["serve", { timeoutMS: 90_000 }],
   ["safety", { timeoutMS: 60_000 }],
   ["lock", { timeoutMS: 20_000 }],
+  ["skills", { timeoutMS: 20_000 }],
+  ["mcp-skills", { timeoutMS: 20_000 }],
 ]);
 
 const aggregateOptions = new Set(["concurrency", "maxConcurrentTestRunners", "logLevel", "fileLogLevel", "allowConsoleColors"]);
