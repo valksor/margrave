@@ -118,6 +118,16 @@ const targets = {
   ],
 };
 
+const targetOverrides = new Map([
+  ["migration-backup", { timeoutMS: 23_000 }],
+  ["source-migration", { timeoutMS: 16_000 }],
+  ["migration-recovery", { timeoutMS: 82_000 }],
+  ["cli", { timeoutMS: 180_000 }],
+  ["serve", { timeoutMS: 90_000 }],
+  ["safety", { timeoutMS: 60_000 }],
+  ["lock", { timeoutMS: 20_000 }],
+]);
+
 const aggregateOptions = new Set(["concurrency", "maxConcurrentTestRunners", "logLevel", "fileLogLevel", "allowConsoleColors"]);
 if (process.argv.length === 3 && (process.argv[2] === "--help" || process.argv[2] === "-h")) {
   console.log(
@@ -159,20 +169,7 @@ async function runAll(options, failedTargets) {
   for (const [target, testArgs] of Object.entries(targets)) {
     const sourceFile = `src/${target}.ts`;
     failedTargets.add(sourceFile);
-    const overrides =
-      target === "migration-backup"
-        ? { timeoutMS: 23_000 }
-        : target === "source-migration"
-          ? { timeoutMS: 16_000 }
-          : target === "migration-recovery"
-            ? { timeoutMS: 82_000 }
-            : target === "cli"
-              ? { timeoutMS: 180_000 }
-              : target === "serve"
-                ? { timeoutMS: 90_000 }
-                : target === "safety"
-                  ? { timeoutMS: 60_000 }
-                  : {};
+    const overrides = targetOverrides.get(target) ?? {};
     const command = `node scripts/run-mutation-tests.mjs ${testArgs.join(" ")}`;
     const incrementalFile = `coverage/mutation/${target}.incremental`;
     const stampFile = `coverage/mutation/${target}.stamp`;
