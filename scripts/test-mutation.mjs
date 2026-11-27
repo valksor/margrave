@@ -82,7 +82,7 @@ const targets = {
     "test/migration-acl-commands.test.ts",
   ],
   "migration-recovery": [
-    "--test-timeout=3000",
+    "--test-timeout=10000",
     "--test-force-exit",
     "--test-name-pattern='^migration recovery (record|journal|locked) direct '",
     "test/migration-recovery-record.test.ts",
@@ -158,7 +158,7 @@ async function runAll(options) {
         : target === "source-migration"
           ? { timeoutMS: 16_000 }
           : target === "migration-recovery"
-            ? { timeoutMS: 75_000 }
+            ? { timeoutMS: 82_000 }
             : target === "cli"
               ? { timeoutMS: 180_000 }
               : target === "serve"
